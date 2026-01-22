@@ -22,3 +22,5 @@ docker run --gpus all -it \
     --diarize \
     --language en \
     --hf_token "$HF_TOKEN"
+
+#-v "$(pwd)/.cache":/.cache/torch/hub/checkpoints \

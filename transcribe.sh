@@ -16,9 +16,11 @@ docker run --rm --gpus all \
     # Installs (add --upgrade if you want to suppress "already exists" warnings)
     (python -m pip show whisperx >/dev/null 2>&1 || \
       pip install --no-deps --target="$TARGET" git+https://github.com/m-bain/whisperx.git)
-    pip install --no-deps --target="$TARGET" \
-      ctranslate2 faster_whisper av tokenizers==0.20.3 huggingface_hub transformers==4.45.2 \
-      pyannote.audio==3.1.1 pyannote.core==6.0.1 pyannote.database==6.1.0 pyannote.metrics==4.0.0 pytorch_lightning torchmetrics torchaudio
+      pip install --no-deps --target="$TARGET" \
+        ctranslate2 faster_whisper av tokenizers==0.20.3 transformers==4.45.2 \
+        pyannote.audio==3.1.1 pyannote.core==6.0.1 pyannote.database==6.1.0 pyannote.metrics==4.0.0 \
+        pytorch_lightning torchmetrics torchaudio \
+        huggingface_hub==0.23.2
 
     # Run transcribe.py, honoring .pth in TARGET for namespace packages (pyannote.*)
     python - <<PY "$@"

@@ -4,6 +4,8 @@ import csv
 import sys
 import argparse
 
+import segment_utils
+
 def export_words_to_csv(json_file, fill_gaps=False, min_gap=0.0):
     csv_file = json_file + ".csv"
     # Load Whisper JSON
@@ -11,23 +13,7 @@ def export_words_to_csv(json_file, fill_gaps=False, min_gap=0.0):
         data = json.load(f)
 
     # Collect words in chronological order
-    words = []
-    for segment in data.get("segments", []):
-        for w in segment.get("words", []):
-            try:
-                start = float(w.get("start", 0.0))
-            except Exception:
-                start = 0.0
-            try:
-                end = float(w.get("end", start))
-            except Exception:
-                end = start
-            words.append({
-                "speaker": w.get("speaker", "") if w.get("speaker") is not None else "",
-                "start": start,
-                "end": end,
-                "word": (w.get("word") or "").strip()
-            })
+    words = segment_utils.load_word_segments_from_json(json_file)
 
     # Ensure chronological order by start time
     words.sort(key=lambda x: x["start"])
@@ -37,27 +23,18 @@ def export_words_to_csv(json_file, fill_gaps=False, min_gap=0.0):
         writer = csv.writer(f)
         writer.writerow(["speaker", "start", "end", "word"])  # header row
 
-        prev = None
-        for w in words:
-            if prev is not None and fill_gaps:
-                gap = w["start"] - prev["end"]
-                if gap > float(min_gap):
-                    # Insert a blank word row occupying the gap time.
-                    # Use the previous speaker for the blank row (keeps context of who was speaking before the gap).
-                    writer.writerow([
-                        prev.get("speaker", ""),
-                        "{:.3f}".format(prev["end"]),
-                        "{:.3f}".format(w["start"]),
-                        ""
-                    ])
-            # Write the current word row
-            writer.writerow([
-                w.get("speaker", ""),
-                "{:.3f}".format(w["start"]),
-                "{:.3f}".format(w["end"]),
-                w.get("word", "")
-            ])
-            prev = w
+        export_words = words
+        if fill_gaps:
+            export_words = segment_utils.fill_gaps(words, min_gap=min_gap)
+        for w in export_words:
+            writer.writerow(
+                [
+                    w.get("speaker", ""),
+                    "{:.3f}".format(w.get("start", 0.0)),
+                    "{:.3f}".format(w.get("end", 0.0)),
+                    w.get("word", ""),
+                ]
+            )
 
     print(f"Exported word timings to {csv_file}")
     return csv_file
