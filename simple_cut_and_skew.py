@@ -66,7 +66,7 @@ def frame_has_skin(frame, template, top_rows=25, left_cols=300, max_mean_diff=12
     return float(np.mean(top_diff)) <= max_mean_diff and float(np.mean(left_diff)) <= max_mean_diff
 
 
-def remove_ppt_skin(frame, inset_width=235, inset_height=140, move_x=220, move_y=220):
+def remove_ppt_skin(frame, inset_width=239, inset_height=140, move_x=220, move_y=190):
     """
     Move the top-right inset inward and crop the frame to remove the PPT skin.
     """
@@ -139,6 +139,7 @@ def extract_video_segments(
     temp_codec="XVID",  # Changed from MJPG to XVID for faster writing
     draw_border=False,
     draw_bar=False,
+    bar_alpha=0.6,
 ):
     """
     Extract video segments and stitch them together with text overlay.
@@ -228,12 +229,27 @@ def extract_video_segments(
 
             frame_h, frame_w = frame.shape[:2]
             if draw_bar:
-                baseline_y = frame_h - text_height
+                baseline_y = frame_h - text_height + 10
                 bar_height = max(40, int(round(font_scale * 40)))
                 bar_top = max(0, baseline_y - bar_height)
                 bar_bottom = min(frame_h, baseline_y + int(round(font_scale * 10)))
                 if bar_bottom > bar_top:
-                    cv2.rectangle(frame, (0, bar_top), (frame_w - 1, bar_bottom - 1), (0, 0, 0), -1)
+                    overlay_bar = frame.copy()
+                    cv2.rectangle(
+                        overlay_bar,
+                        (0, bar_top),
+                        (frame_w - 1, bar_bottom - 1),
+                        (0, 0, 0),
+                        -1,
+                    )
+                    alpha = float(bar_alpha)
+                    frame[bar_top:bar_bottom, :] = cv2.addWeighted(
+                        overlay_bar[bar_top:bar_bottom, :],
+                        alpha,
+                        frame[bar_top:bar_bottom, :],
+                        1 - alpha,
+                        0,
+                    )
             cache_key = (frame_h, frame_w, tuple(group_words), active_idx, font_scale, text_height)
             if cache_key in overlay_cache:
                 overlay = overlay_cache[cache_key]
@@ -376,6 +392,11 @@ def main():
         help="Use JSON directly (skip CSV generation)",
     )
     parser.add_argument(
+        "--regen-csv",
+        action="store_true",
+        help="Regenerate CSV from JSON if missing (JSON read only when this is set)",
+    )
+    parser.add_argument(
         "--border",
         action="store_true",
         help="Draw green border when skin crop/copy is applied, red otherwise",
@@ -384,6 +405,12 @@ def main():
         "--bar",
         action="store_true",
         help="Draw black bar behind subtitles across the full width",
+    )
+    parser.add_argument(
+        "--bar-alpha",
+        type=float,
+        default=0.6,
+        help="Opacity of subtitle bar (0.0-1.0, default: 0.6)",
     )
     
     args = parser.parse_args()
@@ -397,7 +424,12 @@ def main():
     if use_csv or args.use_csv:
         csvfilename = jsonfilename + ".csv"
         if not os.path.exists(csvfilename):
-            transcriptJson2csv.export_words_to_csv(jsonfilename)
+            if args.regen_csv:
+                transcriptJson2csv.export_words_to_csv(jsonfilename)
+            else:
+                raise FileNotFoundError(
+                    f"CSV not found: {csvfilename}. Generate it first or use --regen-csv."
+                )
         word_segment_times = simple_cut.load_word_segments_from_csv(csvfilename)
     else:
         word_segment_times = segment_utils.load_word_segments_from_json(jsonfilename)
@@ -455,6 +487,7 @@ def main():
             temp_codec=args.temp_codec,
             draw_border=args.border,
             draw_bar=args.bar,
+            bar_alpha=args.bar_alpha,
         )
     
     # Combine audio and video
