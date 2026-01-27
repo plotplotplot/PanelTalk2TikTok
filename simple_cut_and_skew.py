@@ -4,11 +4,7 @@ Simplified script to extract video and audio segments based on time periods from
 No cropping or face tracking - output is same size as input.
 """
 import argparse
-import csv
-import json
-import math
 import os
-import subprocess
 
 import cv2
 import numpy as np
@@ -16,196 +12,120 @@ from tqdm import tqdm
 
 import extract_audio_segments
 import segment_utils
+import simple_cut
 import transcriptJson2csv
 
 
-def load_word_segments_from_csv(csv_path):
-    """
-    Load word-level segments from a CSV with columns: speaker,start,end,word.
-    """
-    word_segment_times = []
-    with open(csv_path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            try:
-                start = float(row.get("start", 0.0) or 0.0)
-            except Exception:
-                start = 0.0
-            try:
-                end = float(row.get("end", start) or start)
-            except Exception:
-                end = start
-            word_segment_times.append(
-                {
-                    "speaker": row.get("speaker", "") if row.get("speaker") is not None else "",
-                    "start": start,
-                    "end": end,
-                    "word": (row.get("word") or "").strip(),
-                }
-            )
-    return word_segment_times
+SKIN_TEMPLATES = {
+    "supply_chain_security": [
+        "supply_chain_security.png",
+        "supply_chain_security2.png",
+        "supply_chain_security3.png",
+    ],
+}
 
 
-def precompute_segments(word_segment_times, fps, group_size=6):
+def resolve_skin_template(video_file, target_size):
     """
-    Convert word segments to frame-aligned timing.
+    Pick a template image based on the video name and resize to match the frame size.
     """
-    precomputed_segments = []
+    video_base = os.path.basename(video_file).lower()
+    for key, template_paths in SKIN_TEMPLATES.items():
+        if key in video_base:
+            if isinstance(template_paths, str):
+                template_paths = [template_paths]
+            for template_path in template_paths:
+                if not os.path.exists(template_path):
+                    continue
+                template = cv2.imread(template_path)
+                if template is None:
+                    continue
+                if target_size is not None:
+                    target_w, target_h = target_size
+                    if template.shape[1] != target_w or template.shape[0] != target_h:
+                        template = cv2.resize(template, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                return template
+    return None
 
-    total_words = len(word_segment_times)
-    for idx, seg in enumerate(tqdm(word_segment_times, desc="Precomputing segment timings")):
-        start_f = seg["start"] * fps
-        end_f = seg["end"] * fps
-        start_frame = math.floor(start_f)
-        end_frame = math.floor(end_f)
 
-        group_start = (idx // group_size) * group_size
-        group_end = min(group_start + group_size, total_words)
-        group_words = [w.get("word", "") for w in word_segment_times[group_start:group_end]]
-        active_idx = idx - group_start
-
-        precomputed_segments.append({
-            "word": seg["word"],
-            "group_words": group_words,
-            "active_idx": active_idx,
-            "start_frame": start_frame,
-            "end_frame": end_frame,
-            "start_sec": start_frame / fps,
-            "end_sec": end_frame / fps,
-        })
-    
-    return precomputed_segments
-
-def add_text_with_shadow(frame, text, font_scale=1.8, text_height_from_bottom=300):
+def frame_has_skin(frame, template, top_rows=25, left_cols=300, max_mean_diff=12.0):
     """
-    Add text with drop shadow to a frame.
+    Check if the top and left bands match the template closely.
     """
-    if text is None:
-        text = ""
-    elif isinstance(text, float) and (np.isnan(text) or np.isinf(text)):
-        text = ""
-    else:
-        text = str(text)
-    
-    height, width = frame.shape[:2]
-    thickness = int(font_scale * 2)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    
-    # Calculate text size
-    (text_width, text_height), baseline = cv2.getTextSize(
-        text, font, font_scale, thickness
-    )
-    
-    # Position text at bottom center
-    x = (width - text_width) // 2
-    y = height - text_height_from_bottom
-    
-    # Add shadow
-    shadow_offset = 3
-    cv2.putText(
-        frame,
-        text,
-        (x + shadow_offset, y + shadow_offset),
-        font,
-        font_scale,
-        (0, 0, 0),
-        thickness,
-        cv2.LINE_AA,
-    )
-    
-    # Add main text
-    cv2.putText(
-        frame, text, (x, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA
-    )
-    
+    if template is None:
+        return False
+    h, w = frame.shape[:2]
+    top_rows = min(top_rows, h)
+    left_cols = min(left_cols, w)
+    if top_rows <= 0 or left_cols <= 0:
+        return False
+    if template.shape[:2] != (h, w):
+        template = cv2.resize(template, (w, h), interpolation=cv2.INTER_AREA)
+    top_diff = cv2.absdiff(frame[:top_rows, :], template[:top_rows, :])
+    left_diff = cv2.absdiff(frame[:, :left_cols], template[:, :left_cols])
+    return float(np.mean(top_diff)) <= max_mean_diff and float(np.mean(left_diff)) <= max_mean_diff
+
+
+def remove_ppt_skin(frame, inset_width=235, inset_height=140, move_x=220, move_y=220):
+    """
+    Move the top-right inset inward and crop the frame to remove the PPT skin.
+    """
+    h, w = frame.shape[:2]
+    crop_left = 150
+    crop_right = 150
+    crop_top = 120
+    crop_bottom = 60
+
+    if h <= (crop_top + crop_bottom) or w <= (crop_left + crop_right):
+        return frame
+
+    inset_h = min(inset_height, h)
+    inset_w = min(inset_width, w)
+    x1 = w - inset_w
+    y1 = 0
+    x2 = w
+    y2 = inset_h
+
+    inset = frame[y1:y2, x1:x2].copy()
+    new_x1 = max(0, x1 - move_x)
+    new_y1 = min(h - inset_h, y1 + move_y)
+    new_x2 = new_x1 + inset_w
+    new_y2 = new_y1 + inset_h
+
+    if new_x2 <= w and new_y2 <= h:
+        frame[new_y1:new_y2, new_x1:new_x2] = inset
+
+    return frame[crop_top:h - crop_bottom, crop_left:w - crop_right]
+
+
+def fit_frame_to_output(frame, output_size):
+    """
+    Match output size with aspect-preserving resize and padding.
+    """
+    out_w, out_h = output_size
+    h, w = frame.shape[:2]
+
+    if w == 0 or h == 0 or out_w == 0 or out_h == 0:
+        return frame
+
+    scale = min(out_w / w, out_h / h)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    if new_w != w or new_h != h:
+        frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    pad_left = max(0, (out_w - new_w) // 2)
+    pad_right = max(0, out_w - new_w - pad_left)
+    pad_top = max(0, (out_h - new_h) // 2)
+    pad_bottom = max(0, out_h - new_h - pad_top)
+    if pad_left or pad_right or pad_top or pad_bottom:
+        frame = cv2.copyMakeBorder(
+            frame, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_CONSTANT, value=(0, 0, 0)
+        )
+
     return frame
 
-def render_grouped_subtitle_overlay(
-    frame_shape,
-    words,
-    active_idx,
-    font_scale=1.8,
-    text_height_from_bottom=300,
-):
-    """
-    Render grouped subtitle text once and return (overlay, mask).
-    """
-    height, width = frame_shape[:2]
-    thickness = int(font_scale * 2)
-    font = cv2.FONT_HERSHEY_SIMPLEX
 
-    safe_words = []
-    for w in words:
-        if w is None:
-            safe_words.append("")
-        elif isinstance(w, float) and (np.isnan(w) or np.isinf(w)):
-            safe_words.append("")
-        else:
-            safe_words.append(str(w))
-
-    word_sizes = [cv2.getTextSize(w, font, font_scale, thickness)[0] for w in safe_words]
-    space_width = cv2.getTextSize(" ", font, font_scale, thickness)[0][0]
-    total_width = sum(w[0] for w in word_sizes) + space_width * max(0, len(safe_words) - 1)
-
-    x = (width - total_width) // 2
-    y = height - text_height_from_bottom
-
-    overlay = np.zeros((height, width, 3), dtype=np.uint8)
-    mask = np.zeros((height, width), dtype=np.uint8)
-
-    shadow_offset = 3
-    for i, word in enumerate(safe_words):
-        if not word and i != len(safe_words) - 1:
-            x += space_width
-            continue
-        color = (0, 255, 255) if i == active_idx else (255, 255, 255)
-
-        # Shadow
-        cv2.putText(
-            overlay,
-            word,
-            (x + shadow_offset, y + shadow_offset),
-            font,
-            font_scale,
-            (0, 0, 0),
-            thickness,
-            cv2.LINE_AA,
-        )
-        # Text
-        cv2.putText(
-            overlay,
-            word,
-            (x, y),
-            font,
-            font_scale,
-            color,
-            thickness,
-            cv2.LINE_AA,
-        )
-        # Mask for text area (including shadow)
-        cv2.putText(
-            mask,
-            word,
-            (x + shadow_offset, y + shadow_offset),
-            font,
-            font_scale,
-            255,
-            thickness,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            mask,
-            word,
-            (x, y),
-            font,
-            font_scale,
-            255,
-            thickness,
-            cv2.LINE_AA,
-        )
-        x += word_sizes[i][0] + space_width
-
-    return overlay, mask
 
 def extract_video_segments(
     precomputed_segments,
@@ -217,6 +137,8 @@ def extract_video_segments(
     text_height=300,
     visualize=False,
     temp_codec="XVID",  # Changed from MJPG to XVID for faster writing
+    draw_border=False,
+    draw_bar=False,
 ):
     """
     Extract video segments and stitch them together with text overlay.
@@ -236,15 +158,16 @@ def extract_video_segments(
     
     print(f"Input video: {input_width}x{input_height}, {input_fps:.2f} fps")
     print(f"Using codec: {temp_codec} (optimized for speed)")
+
+    skin_template = resolve_skin_template(video_file, (input_width, input_height))
+    if skin_template is not None:
+        print("Skin template match enabled for this video.")
     
-    # Create output video writer with optimized codec
+    # Create output video writer lazily once we know the processed frame size
     fourcc = cv2.VideoWriter_fourcc(*temp_codec)
-    out = cv2.VideoWriter(output_video_file, fourcc, fps, (input_width, input_height))
-    
-    if not out.isOpened():
-        print(f"Warning: Could not open video writer with codec {temp_codec}, falling back to MJPG")
-        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-        out = cv2.VideoWriter(output_video_file, fourcc, fps, (input_width, input_height))
+    out = None
+    output_size = None
+    size_warning_printed = False
     
     if visualize:
         cv2.namedWindow("Video Extraction", cv2.WINDOW_NORMAL)
@@ -262,24 +185,6 @@ def extract_video_segments(
         end_frame = seg["end_frame"]
         group_words = seg.get("group_words") or [seg.get("word", "")]
         active_idx = int(seg.get("active_idx", 0))
-        
-        # Create a cache key for this word group and active index
-        cache_key = (tuple(group_words), active_idx, font_scale, text_height)
-        
-        # Get or create overlay and mask
-        if cache_key in overlay_cache:
-            overlay = overlay_cache[cache_key]
-            mask = mask_cache[cache_key]
-        else:
-            overlay, mask = render_grouped_subtitle_overlay(
-                (input_height, input_width, 3),  # frame shape
-                group_words,
-                active_idx,
-                font_scale=font_scale,
-                text_height_from_bottom=text_height,
-            )
-            overlay_cache[cache_key] = overlay
-            mask_cache[cache_key] = mask
         
         # Optimized seeking: only seek if we're more than 50 frames away
         # (reduces expensive cv2.VideoCapture.set calls)
@@ -301,6 +206,48 @@ def extract_video_segments(
             if not ret:
                 break
             current_frame_idx += 1
+
+            skin_applied = False
+            if skin_template is not None and frame_has_skin(frame, skin_template):
+                frame = remove_ppt_skin(frame)
+                skin_applied = True
+
+            frame_h, frame_w = frame.shape[:2]
+            if out is None:
+                output_size = (frame_w, frame_h)
+                out = cv2.VideoWriter(output_video_file, fourcc, fps, output_size)
+                if not out.isOpened():
+                    print(f"Warning: Could not open video writer with codec {temp_codec}, falling back to MJPG")
+                    fallback_fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+                    out = cv2.VideoWriter(output_video_file, fallback_fourcc, fps, output_size)
+            elif output_size != (frame_w, frame_h):
+                if not size_warning_printed:
+                    print("Warning: Frame size changed after skin removal; cropping/padding to match output size.")
+                    size_warning_printed = True
+                frame = fit_frame_to_output(frame, output_size)
+
+            frame_h, frame_w = frame.shape[:2]
+            if draw_bar:
+                baseline_y = frame_h - text_height
+                bar_height = max(40, int(round(font_scale * 40)))
+                bar_top = max(0, baseline_y - bar_height)
+                bar_bottom = min(frame_h, baseline_y + int(round(font_scale * 10)))
+                if bar_bottom > bar_top:
+                    cv2.rectangle(frame, (0, bar_top), (frame_w - 1, bar_bottom - 1), (0, 0, 0), -1)
+            cache_key = (frame_h, frame_w, tuple(group_words), active_idx, font_scale, text_height)
+            if cache_key in overlay_cache:
+                overlay = overlay_cache[cache_key]
+                mask = mask_cache[cache_key]
+            else:
+                overlay, mask = simple_cut.render_grouped_subtitle_overlay(
+                    (frame_h, frame_w, 3),
+                    group_words,
+                    active_idx,
+                    font_scale=font_scale,
+                    text_height_from_bottom=text_height,
+                )
+                overlay_cache[cache_key] = overlay
+                mask_cache[cache_key] = mask
             
             # Apply text overlay using cached mask
             if mask is not None:
@@ -308,6 +255,10 @@ def extract_video_segments(
                 mask_indices = mask > 0
                 frame[mask_indices] = overlay[mask_indices]
             
+            if draw_border:
+                color = (0, 255, 0) if skin_applied else (0, 0, 255)
+                cv2.rectangle(frame, (0, 0), (frame_w - 1, frame_h - 1), color, 6)
+
             # Write frame to output
             out.write(frame)
             total_frames_processed += 1
@@ -319,7 +270,8 @@ def extract_video_segments(
                     break
     
     cap.release()
-    out.release()
+    if out is not None:
+        out.release()
     
     if visualize:
         cv2.destroyAllWindows()
@@ -333,48 +285,6 @@ def extract_video_segments(
     print(f"Output video has {output_frames} frames")
     
     return True
-
-def combine_video_audio(video_file, audio_file, final_output):
-    """
-    Combine video and audio files using ffmpeg.
-    """
-    cmd = [
-        "ffmpeg",
-        "-i", video_file,
-        "-i", audio_file,
-        "-c:v", "libx264",
-        "-c:a", "aac",
-        "-strict", "experimental",
-        "-y",
-        final_output
-    ]
-    
-    try:
-        subprocess.run(cmd, check=True)
-        print(f"Video and audio combined to: {final_output}")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"Error combining video and audio: {e}")
-        return False
-
-def reencode_video(video_file, final_output):
-    """
-    Re-encode video-only output using a standard codec.
-    """
-    cmd = [
-        "ffmpeg",
-        "-i", video_file,
-        "-c:v", "libx264",
-        "-y",
-        final_output,
-    ]
-    try:
-        subprocess.run(cmd, check=True)
-        print(f"Video re-encoded to: {final_output}")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"Error re-encoding video: {e}")
-        return False
 
 def main():
     parser = argparse.ArgumentParser(
@@ -460,6 +370,21 @@ def main():
         action="store_true",
         help="Use JSON-derived CSV for word timings (create if missing)",
     )
+    parser.add_argument(
+        "--no-csv",
+        action="store_true",
+        help="Use JSON directly (skip CSV generation)",
+    )
+    parser.add_argument(
+        "--border",
+        action="store_true",
+        help="Draw green border when skin crop/copy is applied, red otherwise",
+    )
+    parser.add_argument(
+        "--bar",
+        action="store_true",
+        help="Draw black bar behind subtitles across the full width",
+    )
     
     args = parser.parse_args()
 
@@ -468,11 +393,12 @@ def main():
     basefilename = ''.join(args.video.split('.')[:-1])
     jsonfilename = basefilename+".json"
     audiofilename = basefilename+".wav"
-    if args.use_csv:
+    use_csv = not args.no_csv
+    if use_csv or args.use_csv:
         csvfilename = jsonfilename + ".csv"
         if not os.path.exists(csvfilename):
             transcriptJson2csv.export_words_to_csv(jsonfilename)
-        word_segment_times = load_word_segments_from_csv(csvfilename)
+        word_segment_times = simple_cut.load_word_segments_from_csv(csvfilename)
     else:
         word_segment_times = segment_utils.load_word_segments_from_json(jsonfilename)
     sr = segment_utils.get_audio_sample_rate(audiofilename)
@@ -512,7 +438,7 @@ def main():
         cap.release()
         
         # Precompute segments
-        precomputed_segments = precompute_segments(
+        precomputed_segments = simple_cut.precompute_segments(
             word_segment_times, fps, group_size=args.group_size
         )
         
@@ -527,12 +453,14 @@ def main():
             text_height=args.text_height,
             visualize=args.visualize,
             temp_codec=args.temp_codec,
+            draw_border=args.border,
+            draw_bar=args.bar,
         )
     
     # Combine audio and video
     if not args.skip_audio and not args.skip_video:
         print("\n=== Combining Audio and Video ===")
-        combine_video_audio(temp_video, temp_audio, args.output)
+        simple_cut.combine_video_audio(temp_video, temp_audio, args.output)
         
         # Clean up temporary files
         if os.path.exists(temp_video):
@@ -543,7 +471,7 @@ def main():
         print(f"\nDone! Output saved to: {args.output}")
     elif not args.skip_video:
         # If only video was processed, re-encode temp file to output
-        reencode_video(temp_video, args.output)
+        simple_cut.reencode_video(temp_video, args.output)
         print(f"\nDone! Output saved to: {args.output}")
     elif not args.skip_audio:
         # If only audio was processed, rename temp file to output
