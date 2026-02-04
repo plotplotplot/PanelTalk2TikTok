@@ -4,3 +4,6 @@
 [submodule "SegFormer"]
 	path = SegFormer
 	url = https://github.com/NVlabs/SegFormer
+[submodule "retinaface"]
+	path = retinaface
+	url = https://github.com/juliancoy/retinaface
