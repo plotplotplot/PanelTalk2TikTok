@@ -1,0 +1,3 @@
+[submodule "SegFace"]
+	path = SegFace
+	url = https://github.com/Kartik-3004/SegFace
