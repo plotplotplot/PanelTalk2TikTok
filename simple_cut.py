@@ -13,10 +13,12 @@ import subprocess
 import cv2
 import numpy as np
 from tqdm import tqdm
+from PIL import ImageFont
 
 import extract_audio_segments
 import segment_utils
 import transcriptJson2csv
+import subtitle_render
 
 
 def load_word_segments_from_csv(csv_path):
@@ -41,6 +43,10 @@ def load_word_segments_from_csv(csv_path):
                     "start": start,
                     "end": end,
                     "word": (row.get("word") or "").strip(),
+                    "filename": (row.get("filename") or "").strip(),
+                    "center_x": row.get("center_x"),
+                    "center_y": row.get("center_y"),
+                    "zoom": row.get("zoom"),
                 }
             )
     return word_segment_times
@@ -120,92 +126,7 @@ def add_text_with_shadow(frame, text, font_scale=1.8, text_height_from_bottom=30
     
     return frame
 
-def render_grouped_subtitle_overlay(
-    frame_shape,
-    words,
-    active_idx,
-    font_scale=1.8,
-    text_height_from_bottom=300,
-):
-    """
-    Render grouped subtitle text once and return (overlay, mask).
-    """
-    height, width = frame_shape[:2]
-    thickness = int(font_scale * 2)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-
-    safe_words = []
-    for w in words:
-        if w is None:
-            safe_words.append("")
-        elif isinstance(w, float) and (np.isnan(w) or np.isinf(w)):
-            safe_words.append("")
-        else:
-            safe_words.append(str(w))
-
-    word_sizes = [cv2.getTextSize(w, font, font_scale, thickness)[0] for w in safe_words]
-    space_width = cv2.getTextSize(" ", font, font_scale, thickness)[0][0]
-    total_width = sum(w[0] for w in word_sizes) + space_width * max(0, len(safe_words) - 1)
-
-    x = (width - total_width) // 2
-    y = height - text_height_from_bottom
-
-    overlay = np.zeros((height, width, 3), dtype=np.uint8)
-    mask = np.zeros((height, width), dtype=np.uint8)
-
-    shadow_offset = 3
-    for i, word in enumerate(safe_words):
-        if not word and i != len(safe_words) - 1:
-            x += space_width
-            continue
-        color = (0, 255, 255) if i == active_idx else (255, 255, 255)
-
-        # Shadow
-        cv2.putText(
-            overlay,
-            word,
-            (x + shadow_offset, y + shadow_offset),
-            font,
-            font_scale,
-            (0, 0, 0),
-            thickness,
-            cv2.LINE_AA,
-        )
-        # Text
-        cv2.putText(
-            overlay,
-            word,
-            (x, y),
-            font,
-            font_scale,
-            color,
-            thickness,
-            cv2.LINE_AA,
-        )
-        # Mask for text area (including shadow)
-        cv2.putText(
-            mask,
-            word,
-            (x + shadow_offset, y + shadow_offset),
-            font,
-            font_scale,
-            255,
-            thickness,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            mask,
-            word,
-            (x, y),
-            font,
-            font_scale,
-            255,
-            thickness,
-            cv2.LINE_AA,
-        )
-        x += word_sizes[i][0] + space_width
-
-    return overlay, mask
+ 
 
 def extract_video_segments(
     precomputed_segments,
@@ -215,9 +136,22 @@ def extract_video_segments(
     font_scale=1.8,
     fade_frames=6,
     text_height=300,
+    text_height_2=360,
+    subtitle_lines=1,
     visualize=False,
     temp_codec="XVID",  # Changed from MJPG to XVID for faster writing
     crop_config=None,
+    font_ttf=None,
+    subtitle_bg=False,
+    subtitle_bg_color=(0, 0, 0),
+    subtitle_bg_alpha=0.6,
+    subtitle_bg_pad=8,
+    subtitle_bg_height=0,
+    subtitle_bg_offset_y=0,
+    shadow_size=0,
+    shadow_offset_x=0,
+    shadow_offset_y=0,
+    video_shift_seconds=0.0,
 ):
     """
     Extract video segments and stitch them together with text overlay.
@@ -262,31 +196,69 @@ def extract_video_segments(
     # Cache for overlay/mask per word group to avoid recomputation
     overlay_cache = {}
     mask_cache = {}
+    bg_mask_cache = {}
     
     # Process each segment
+    video_shift_frames = int(round(video_shift_seconds * fps))
     for seg in tqdm(precomputed_segments, desc="Processing video segments"):
-        start_frame = seg["start_frame"]
-        end_frame = seg["end_frame"]
+        start_frame = seg["start_frame"] + video_shift_frames
+        end_frame = seg["end_frame"] + video_shift_frames
+        if end_frame <= 0:
+            continue
+        if start_frame < 0:
+            start_frame = 0
         group_words = seg.get("group_words") or [seg.get("word", "")]
         active_idx = int(seg.get("active_idx", 0))
         
         # Create a cache key for this word group and active index
-        cache_key = (tuple(group_words), active_idx, font_scale, text_height)
+        cache_key = (
+            tuple(group_words),
+            active_idx,
+            font_scale,
+            text_height,
+            text_height_2,
+            subtitle_lines,
+            bool(font_ttf),
+            subtitle_bg,
+            subtitle_bg_color,
+            subtitle_bg_alpha,
+            subtitle_bg_pad,
+            subtitle_bg_height,
+            subtitle_bg_offset_y,
+            shadow_size,
+            shadow_offset_x,
+            shadow_offset_y,
+        )
         
         # Get or create overlay and mask
         if cache_key in overlay_cache:
             overlay = overlay_cache[cache_key]
             mask = mask_cache[cache_key]
+            bg_mask = bg_mask_cache[cache_key]
         else:
-            overlay, mask = render_grouped_subtitle_overlay(
+            overlay, mask, bg_mask = subtitle_render.render_grouped_subtitle_overlay(
                 (output_height, output_width, 3),  # frame shape
                 group_words,
                 active_idx,
                 font_scale=font_scale,
                 text_height_from_bottom=text_height,
+                text_height_from_bottom_2=text_height_2,
+                subtitle_lines=subtitle_lines,
+                font_ttf=font_ttf,
+                subtitle_bg=subtitle_bg,
+                subtitle_bg_color=subtitle_bg_color,
+                subtitle_bg_alpha=subtitle_bg_alpha,
+                subtitle_bg_pad=subtitle_bg_pad,
+                subtitle_bg_full_width=True,
+                subtitle_bg_height=subtitle_bg_height,
+                subtitle_bg_offset_y=subtitle_bg_offset_y,
+                shadow_size=shadow_size,
+                shadow_offset_x=shadow_offset_x,
+                shadow_offset_y=shadow_offset_y,
             )
             overlay_cache[cache_key] = overlay
             mask_cache[cache_key] = mask
+            bg_mask_cache[cache_key] = bg_mask
         
         # Optimized seeking: only seek if we're more than 50 frames away
         # (reduces expensive cv2.VideoCapture.set calls)
@@ -317,6 +289,17 @@ def extract_video_segments(
                 if (x2 - x1) != output_width or (y2 - y1) != output_height:
                     frame = cv2.resize(frame, (output_width, output_height))
             
+            # Apply subtitle background (alpha blend) before text
+            if subtitle_bg and subtitle_bg_alpha > 0 and bg_mask is not None:
+                alpha = max(0.0, min(1.0, subtitle_bg_alpha))
+                ys, xs = np.where(bg_mask > 0)
+                if ys.size:
+                    y1, y2 = ys.min(), ys.max() + 1
+                    x1, x2 = xs.min(), xs.max() + 1
+                    roi = frame[y1:y2, x1:x2]
+                    roi_bg = overlay[y1:y2, x1:x2]
+                    frame[y1:y2, x1:x2] = cv2.addWeighted(roi, 1.0 - alpha, roi_bg, alpha, 0)
+
             # Apply text overlay using cached mask
             if mask is not None:
                 # Use numpy indexing for faster overlay application
@@ -414,6 +397,83 @@ def main():
         help="Height of text from bottom (default: 300)"
     )
     parser.add_argument(
+        "--text-height-2",
+        type=int,
+        default=360,
+        help="Height of top subtitle line from bottom (default: 360)",
+    )
+    parser.add_argument(
+        "--subtitle-lines",
+        type=int,
+        default=1,
+        help="Number of subtitle lines to render (default: 1)",
+    )
+    parser.add_argument(
+        "--font-file",
+        type=str,
+        default="nofile.ttf",
+        help="TTF font file to use for subtitles (default: nofile.ttf)",
+    )
+    parser.add_argument(
+        "--font-size",
+        type=int,
+        default=36,
+        help="TTF font size in pixels (default: 36)",
+    )
+    parser.add_argument(
+        "--subtitle-bg",
+        action="store_true",
+        help="Draw a background rectangle behind subtitles",
+    )
+    parser.add_argument(
+        "--subtitle-bg-color",
+        type=str,
+        default="0,0,0",
+        help="Background color as B,G,R (default: 0,0,0)",
+    )
+    parser.add_argument(
+        "--subtitle-bg-alpha",
+        type=float,
+        default=0.6,
+        help="Background opacity 0-1 (default: 0.6)",
+    )
+    parser.add_argument(
+        "--subtitle-bg-height",
+        type=int,
+        default=0,
+        help="Background height in pixels (default: 0 = auto)",
+    )
+    parser.add_argument(
+        "--subtitle-bg-offset-y",
+        type=int,
+        default=0,
+        help="Background vertical offset in pixels (default: 0)",
+    )
+    parser.add_argument(
+        "--subtitle-bg-pad",
+        type=int,
+        default=8,
+        help="Background padding in pixels (default: 8)",
+    )
+    parser.add_argument(
+        "--shadow-size",
+        type=int,
+        default=0,
+        help="Subtitle shadow offset in pixels (default: 0)",
+    )
+    parser.add_argument(
+        "--shadow-offset-x",
+        type=int,
+        default=0,
+        help="Subtitle shadow X offset in pixels (default: 0). If both offsets are 0, uses --shadow-size.",
+    )
+    parser.add_argument(
+        "--shadow-offset-y",
+        type=int,
+        default=0,
+        help="Subtitle shadow Y offset in pixels (default: 0). If both offsets are 0, uses --shadow-size.",
+    )
+    parser.add_argument(
         "--fade-frames",
         type=int,
         default=6,
@@ -444,6 +504,12 @@ def main():
         help="Shift all word timings by this many seconds (default: 0.15)",
     )
     parser.add_argument(
+        "--video-shift-seconds",
+        type=float,
+        default=0.0,
+        help="Shift video segments by this many seconds relative to audio (default: 0.0)",
+    )
+    parser.add_argument(
         "--extend-ms",
         type=int,
         default=20,
@@ -467,8 +533,8 @@ def main():
     parser.add_argument(
         "--output",
         type=str,
-        default="output.mp4",
-        help="Output video file (default: output.mp4)",
+        default=None,
+        help="Output video file (default: output.mp4, or CSV basename if present)",
     )
     parser.add_argument(
         "--use-csv",
@@ -513,8 +579,28 @@ def main():
         default=1.0,
         help="Zoom factor for crop (default: 1.0). >1 zooms in.",
     )
+    parser.add_argument(
+        "--ig-standard",
+        action="store_true",
+        help="Apply IG standard settings (1080x1920, 2 subtitle lines, bg, etc.)",
+    )
     
     args = parser.parse_args()
+
+    if args.ig_standard:
+        args.width = 1080
+        args.height = 1920
+        args.subtitle_lines = 2
+        args.text_height = 600 + 170
+        args.text_height_2 = 700 + 170
+        args.font_scale = 2
+        args.subtitle_bg = True
+        args.subtitle_bg_height = 300
+        args.subtitle_bg_offset_y = 140
+        args.subtitle_bg_alpha = 0.5
+        args.subtitle_bg_alpha = 1
+        if not args.csv:
+            args.csv = "CLIMATE EVENT BUTTERFLY EFFECT 2025 RAWS/OrtizFull.csv"
 
     # Load CSV/JSON data
     print("Loading segment data...")
@@ -522,13 +608,18 @@ def main():
     jsonfilename = basefilename + ".json"
     audiofilename = basefilename + ".wav"
 
+    csvfilename = jsonfilename + ".csv"
+    used_csv_path = None
     if args.csv:
+        used_csv_path = args.csv
         word_segment_times = load_word_segments_from_csv(args.csv)
-    elif args.use_csv:
-        csvfilename = jsonfilename + ".csv"
-        if not os.path.exists(csvfilename):
-            transcriptJson2csv.export_words_to_csv(jsonfilename)
+    elif os.path.exists(csvfilename):
+        used_csv_path = csvfilename
         word_segment_times = load_word_segments_from_csv(csvfilename)
+    elif os.path.exists(jsonfilename):
+        # Export CSV for next time, then load JSON.
+        transcriptJson2csv.export_words_to_csv(jsonfilename, source_video=args.video)
+        word_segment_times = segment_utils.load_word_segments_from_json(jsonfilename)
     else:
         word_segment_times = segment_utils.load_word_segments_from_json(jsonfilename)
 
@@ -543,9 +634,21 @@ def main():
         word_segment_times, extend_ms=args.extend_ms
     )
     
-    # Create temporary files
-    temp_video = f"{args.video}_temp.mp4"
-    temp_audio = f"{args.video}_temp.wav"
+    # Output naming (prefer CSV basename when available)
+    if used_csv_path:
+        csv_base = os.path.splitext(os.path.basename(used_csv_path))[0]
+        out_dir = os.path.dirname(args.video)
+        if out_dir == "":
+            out_dir = "."
+        if args.output is None:
+            args.output = os.path.join(out_dir, f"{csv_base}.mp4")
+        temp_video = os.path.join(out_dir, f"{csv_base}_temp.mp4")
+        temp_audio = os.path.join(out_dir, f"{csv_base}_temp.wav")
+    else:
+        if args.output is None:
+            args.output = "output.mp4"
+        temp_video = f"{args.video}_temp.mp4"
+        temp_audio = f"{args.video}_temp.wav"
     
     # Process audio
     if not args.skip_audio and os.path.exists(temp_audio):
@@ -622,6 +725,21 @@ def main():
         )
         
         # Extract video segments
+        font_ttf = None
+        if args.font_file:
+            if not os.path.exists(args.font_file):
+                raise FileNotFoundError(f"Font file not found: {args.font_file}")
+            effective_size = max(1, int(round(args.font_size * args.font_scale)))
+            font_ttf = ImageFont.truetype(args.font_file, effective_size)
+
+        try:
+            bg_parts = [int(x) for x in args.subtitle_bg_color.split(",")]
+            if len(bg_parts) != 3:
+                raise ValueError
+            subtitle_bg_color = (bg_parts[0], bg_parts[1], bg_parts[2])
+        except Exception:
+            raise ValueError("--subtitle-bg-color must be in 'B,G,R' format")
+
         extract_video_segments(
             precomputed_segments,
             args.video,
@@ -630,9 +748,22 @@ def main():
             font_scale=args.font_scale,
             fade_frames=args.fade_frames,
             text_height=args.text_height,
+            text_height_2=args.text_height_2,
+            subtitle_lines=args.subtitle_lines,
             visualize=args.visualize,
             temp_codec=args.temp_codec,
             crop_config=crop_config,
+            font_ttf=font_ttf,
+            subtitle_bg=args.subtitle_bg,
+            subtitle_bg_color=subtitle_bg_color,
+            subtitle_bg_alpha=args.subtitle_bg_alpha,
+            subtitle_bg_pad=args.subtitle_bg_pad,
+            subtitle_bg_height=args.subtitle_bg_height,
+            subtitle_bg_offset_y=args.subtitle_bg_offset_y,
+            shadow_size=args.shadow_size,
+            shadow_offset_x=args.shadow_offset_x,
+            shadow_offset_y=args.shadow_offset_y,
+            video_shift_seconds=args.video_shift_seconds,
         )
     
     # Combine audio and video
