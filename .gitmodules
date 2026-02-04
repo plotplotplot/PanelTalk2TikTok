@@ -1,3 +1,6 @@
 [submodule "SegFace"]
 	path = SegFace
 	url = https://github.com/Kartik-3004/SegFace
+[submodule "SegFormer"]
+	path = SegFormer
+	url = https://github.com/NVlabs/SegFormer
