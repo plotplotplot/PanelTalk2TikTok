@@ -217,6 +217,7 @@ def extract_video_segments(
     text_height=300,
     visualize=False,
     temp_codec="XVID",  # Changed from MJPG to XVID for faster writing
+    crop_config=None,
 ):
     """
     Extract video segments and stitch them together with text overlay.
@@ -236,15 +237,21 @@ def extract_video_segments(
     
     print(f"Input video: {input_width}x{input_height}, {input_fps:.2f} fps")
     print(f"Using codec: {temp_codec} (optimized for speed)")
+
+    output_width = input_width
+    output_height = input_height
+    if crop_config is not None:
+        output_width = crop_config["output_width"]
+        output_height = crop_config["output_height"]
     
     # Create output video writer with optimized codec
     fourcc = cv2.VideoWriter_fourcc(*temp_codec)
-    out = cv2.VideoWriter(output_video_file, fourcc, fps, (input_width, input_height))
+    out = cv2.VideoWriter(output_video_file, fourcc, fps, (output_width, output_height))
     
     if not out.isOpened():
         print(f"Warning: Could not open video writer with codec {temp_codec}, falling back to MJPG")
         fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-        out = cv2.VideoWriter(output_video_file, fourcc, fps, (input_width, input_height))
+        out = cv2.VideoWriter(output_video_file, fourcc, fps, (output_width, output_height))
     
     if visualize:
         cv2.namedWindow("Video Extraction", cv2.WINDOW_NORMAL)
@@ -272,7 +279,7 @@ def extract_video_segments(
             mask = mask_cache[cache_key]
         else:
             overlay, mask = render_grouped_subtitle_overlay(
-                (input_height, input_width, 3),  # frame shape
+                (output_height, output_width, 3),  # frame shape
                 group_words,
                 active_idx,
                 font_scale=font_scale,
@@ -301,6 +308,14 @@ def extract_video_segments(
             if not ret:
                 break
             current_frame_idx += 1
+            
+            if crop_config is not None:
+                x1, y1, x2, y2 = crop_config["crop_box"]
+                frame = frame[y1:y2, x1:x2]
+                if frame.size == 0:
+                    continue
+                if (x2 - x1) != output_width or (y2 - y1) != output_height:
+                    frame = cv2.resize(frame, (output_width, output_height))
             
             # Apply text overlay using cached mask
             if mask is not None:
@@ -460,21 +475,63 @@ def main():
         action="store_true",
         help="Use JSON-derived CSV for word timings (create if missing)",
     )
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default="",
+        help="Path to a CSV file with word timings (speaker,start,end,word). Skips JSON.",
+    )
+    parser.add_argument(
+        "--center-x",
+        "--center_x",
+        type=float,
+        default=0.5,
+        help="Crop center X as fraction of width (default: 0.5)",
+    )
+    parser.add_argument(
+        "--center-y",
+        "--center_y",
+        type=float,
+        default=0.5,
+        help="Crop center Y as fraction of height (default: 0.5)",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=0,
+        help="Output width in pixels (enable cropping if > 0)",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=0,
+        help="Output height in pixels (enable cropping if > 0)",
+    )
+    parser.add_argument(
+        "--zoom",
+        type=float,
+        default=1.0,
+        help="Zoom factor for crop (default: 1.0). >1 zooms in.",
+    )
     
     args = parser.parse_args()
 
     # Load CSV/JSON data
     print("Loading segment data...")
     basefilename = ''.join(args.video.split('.')[:-1])
-    jsonfilename = basefilename+".json"
-    audiofilename = basefilename+".wav"
-    if args.use_csv:
+    jsonfilename = basefilename + ".json"
+    audiofilename = basefilename + ".wav"
+
+    if args.csv:
+        word_segment_times = load_word_segments_from_csv(args.csv)
+    elif args.use_csv:
         csvfilename = jsonfilename + ".csv"
         if not os.path.exists(csvfilename):
             transcriptJson2csv.export_words_to_csv(jsonfilename)
         word_segment_times = load_word_segments_from_csv(csvfilename)
     else:
         word_segment_times = segment_utils.load_word_segments_from_json(jsonfilename)
+
     sr = segment_utils.get_audio_sample_rate(audiofilename)
     word_segment_times = segment_utils.align_segments_to_sample_boundaries(
         word_segment_times, sr
@@ -506,10 +563,58 @@ def main():
     if not args.skip_video:
         print("\n=== Processing Video ===")
         
-        # Get video FPS
+        # Get video FPS and size
         cap = cv2.VideoCapture(args.video)
         fps = cap.get(cv2.CAP_PROP_FPS)
+        input_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        input_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         cap.release()
+
+        crop_config = None
+        if args.width > 0 and args.height > 0:
+            if args.zoom <= 0:
+                raise ValueError("--zoom must be > 0")
+
+            center_x = max(0.0, min(1.0, args.center_x))
+            center_y = max(0.0, min(1.0, args.center_y))
+
+            crop_w = max(1, int(round(args.width / args.zoom)))
+            crop_h = max(1, int(round(args.height / args.zoom)))
+
+            cx = int(round(center_x * input_width))
+            cy = int(round(center_y * input_height))
+
+            x1 = int(round(cx - crop_w / 2))
+            y1 = int(round(cy - crop_h / 2))
+            x2 = x1 + crop_w
+            y2 = y1 + crop_h
+
+            if x1 < 0:
+                x2 -= x1
+                x1 = 0
+            if y1 < 0:
+                y2 -= y1
+                y1 = 0
+            if x2 > input_width:
+                x1 -= (x2 - input_width)
+                x2 = input_width
+            if y2 > input_height:
+                y1 -= (y2 - input_height)
+                y2 = input_height
+
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(input_width, x2)
+            y2 = min(input_height, y2)
+
+            if x2 <= x1 or y2 <= y1:
+                raise ValueError("Invalid crop box; check --center-x/--center-y/--width/--height/--zoom")
+
+            crop_config = {
+                "output_width": args.width,
+                "output_height": args.height,
+                "crop_box": (x1, y1, x2, y2),
+            }
         
         # Precompute segments
         precomputed_segments = precompute_segments(
@@ -527,6 +632,7 @@ def main():
             text_height=args.text_height,
             visualize=args.visualize,
             temp_codec=args.temp_codec,
+            crop_config=crop_config,
         )
     
     # Combine audio and video
