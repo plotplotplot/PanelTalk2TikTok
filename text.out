@@ -1,0 +1,101 @@
+[frame 1] last=(2963.01,2138.05) last_frame=0 f=1 radius=200.00
+  candidates:
+    - center=(293.80,1523.31) dist=2739.09
+    - center=(2322.46,1656.81) dist=801.19
+    - center=(2064.15,1075.88) dist=1391.46
+  -> rejected: dist=801.19 > radius=200.00
+  -> miss_count=1
+[frame 2] last=(2963.01,2138.05) last_frame=0 f=2 radius=400.00
+  candidates:
+    - center=(2063.69,1075.13) dist=1392.33
+    - center=(293.01,1523.54) dist=2739.80
+    - center=(2962.90,2138.09) dist=0.12
+    - center=(2321.68,1657.50) dist=801.40
+  -> accepted: dist=0.12 <= radius=400.00
+[frame 3] last=(2962.90,2138.09) last_frame=2 f=1 radius=200.00
+  candidates:
+    - center=(292.48,1523.40) dist=2740.25
+    - center=(2963.04,2137.86) dist=0.27
+    - center=(2321.78,1658.01) dist=800.95
+    - center=(2063.73,1075.37) dist=1392.07
+  -> accepted: dist=0.27 <= radius=200.00
+[frame 4] last=(2963.04,2137.86) last_frame=3 f=1 radius=200.00
+  candidates:
+    - center=(292.97,1522.35) dist=2740.10
+    - center=(2320.70,1656.74) dist=802.55
+    - center=(2062.07,1074.73) dist=1393.56
+  -> rejected: dist=802.55 > radius=200.00
+  -> miss_count=1
+[frame 5] last=(2963.04,2137.86) last_frame=3 f=2 radius=400.00
+  candidates:
+    - center=(291.64,1524.01) dist=2741.02
+    - center=(2320.19,1656.35) dist=803.19
+    - center=(2061.84,1075.46) dist=1393.15
+  -> rejected: dist=803.19 > radius=400.00
+  -> miss_count=2
+[frame 6] last=(2963.04,2137.86) last_frame=3 f=3 radius=600.00
+  candidates:
+    - center=(278.38,1521.57) dist=2754.49
+    - center=(2952.20,2138.27) dist=10.86
+    - center=(2311.83,1649.03) dist=814.27
+    - center=(2054.08,1072.79) dist=1400.21
+  -> accepted: dist=10.86 <= radius=600.00
+[frame 7] last=(2952.20,2138.27) last_frame=6 f=1 radius=200.00
+  candidates:
+    - center=(269.70,1517.49) dist=2753.39
+    - center=(2303.63,1643.49) dist=815.75
+    - center=(2041.74,1067.93) dist=1405.19
+  -> rejected: dist=815.75 > radius=200.00
+  -> miss_count=1
+[frame 8] last=(2952.20,2138.27) last_frame=6 f=2 radius=400.00
+  candidates:
+    - center=(262.50,1509.59) dist=2762.19
+    - center=(2298.58,1641.90) dist=820.73
+    - center=(2025.43,1063.52) dist=1419.15
+  -> rejected: dist=820.73 > radius=400.00
+  -> miss_count=2
+[frame 9] last=(2952.20,2138.27) last_frame=6 f=3 radius=600.00
+  candidates:
+    - center=(255.80,1505.75) dist=2769.60
+    - center=(2930.77,2131.97) dist=22.33
+    - center=(2292.32,1635.98) dist=829.30
+    - center=(2007.00,1064.45) dist=1430.55
+  -> accepted: dist=22.33 <= radius=600.00
+[frame 10] last=(2930.77,2131.97) last_frame=9 f=1 radius=200.00
+  candidates:
+    - center=(246.77,1501.40) dist=2757.08
+    - center=(2279.20,1632.96) dist=820.71
+    - center=(1991.23,1062.36) dist=1423.66
+  -> rejected: dist=820.71 > radius=200.00
+  -> miss_count=1
+[frame 11] last=(2930.77,2131.97) last_frame=9 f=2 radius=400.00
+  candidates:
+    - center=(241.47,1494.84) dist=2763.74
+    - center=(2268.57,1624.44) dist=834.32
+    - center=(1976.66,1060.86) dist=1434.43
+  -> rejected: dist=834.32 > radius=400.00
+  -> miss_count=2
+[frame 12] last=(2930.77,2131.97) last_frame=9 f=3 radius=600.00
+  candidates:
+    - center=(235.87,1494.99) dist=2769.16
+    - center=(1958.08,1061.32) dist=1446.52
+  -> rejected: dist=1446.52 > radius=600.00
+  -> miss_count=3
+[frame 13] last=(2930.77,2131.97) last_frame=9 f=4 radius=800.00
+  candidates:
+    - center=(225.58,1492.78) dist=2779.68
+    - center=(1944.97,1058.49) dist=1457.45
+  -> rejected: dist=1457.45 > radius=800.00
+  -> miss_count=4
+[frame 14] last=(2930.77,2131.97) last_frame=9 f=5 radius=1000.00
+  candidates:
+    - center=(1934.97,1054.05) dist=1467.49
+    - center=(213.88,1489.44) dist=2791.83
+  -> rejected: dist=1467.49 > radius=1000.00
+  -> miss_count=5
+[frame 15] last=(2930.77,2131.97) last_frame=9 f=6 radius=1200.00
+  candidates:
+    - center=(208.46,1485.64) dist=2797.98
+    - center=(1923.94,1047.83) dist=1479.54
+  -> rejected: dist=1479.54 > radius=1200.00
+  -> miss_count=6
