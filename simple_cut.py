@@ -18,7 +18,7 @@ from PIL import ImageFont
 import extract_audio_segments
 import segment_utils
 import transcriptJson2csv
-import subtitle_render
+from extract_video_segements import extract_video_segments
 
 
 def load_word_segments_from_csv(csv_path):
@@ -52,23 +52,93 @@ def load_word_segments_from_csv(csv_path):
     return word_segment_times
 
 
-def precompute_segments(word_segment_times, fps, group_size=6):
+def _line_length(words):
+    total = 0
+    for i, w in enumerate(words):
+        wlen = len(w)
+        total += wlen if i == 0 else wlen + 1
+    return total
+
+
+def _min_max_line_len(words):
+    if len(words) <= 1:
+        return _line_length(words)
+    best = None
+    for split in range(1, len(words)):
+        left = _line_length(words[:split])
+        right = _line_length(words[split:])
+        m = max(left, right)
+        if best is None or m < best:
+            best = m
+    return best if best is not None else 0
+
+
+def _build_word_groups(words, group_size=6, max_chars=None, subtitle_lines=1):
+    groups = []
+    current = []
+    current_len = 0
+    for idx, w in enumerate(words):
+        text = (w.get("word") or "").strip()
+        word_len = len(text)
+        extra = word_len if current_len == 0 else word_len + 1
+        if max_chars is not None and current:
+            if subtitle_lines <= 1:
+                if (current_len + extra) > max_chars:
+                    groups.append(current)
+                    current = []
+                    current_len = 0
+            else:
+                candidate_words = [
+                    (words[i].get("word") or "").strip() for i in (current + [idx])
+                ]
+                if _min_max_line_len(candidate_words) > max_chars:
+                    groups.append(current)
+                    current = []
+                    current_len = 0
+        current.append(idx)
+        current_len += word_len if current_len == 0 else word_len + 1
+        if len(current) >= group_size:
+            groups.append(current)
+            current = []
+            current_len = 0
+            continue
+        if text.endswith((",", ".", "?", "!", ";", ":")):
+            groups.append(current)
+            current = []
+            current_len = 0
+    if current:
+        groups.append(current)
+    return groups
+
+
+def precompute_segments(word_segment_times, fps, group_size=6, max_chars=None, subtitle_lines=1):
     """
     Convert word segments to frame-aligned timing.
     """
     precomputed_segments = []
 
     total_words = len(word_segment_times)
+    groups = _build_word_groups(
+        word_segment_times,
+        group_size=group_size,
+        max_chars=max_chars,
+        subtitle_lines=subtitle_lines,
+    )
+    group_for_idx = {}
+    for gi, g in enumerate(groups):
+        for pos, wi in enumerate(g):
+            group_for_idx[wi] = (gi, pos)
+
     for idx, seg in enumerate(tqdm(word_segment_times, desc="Precomputing segment timings")):
         start_f = seg["start"] * fps
         end_f = seg["end"] * fps
         start_frame = math.floor(start_f)
         end_frame = math.floor(end_f)
 
-        group_start = (idx // group_size) * group_size
-        group_end = min(group_start + group_size, total_words)
-        group_words = [w.get("word", "") for w in word_segment_times[group_start:group_end]]
-        active_idx = idx - group_start
+        gi, pos = group_for_idx.get(idx, (idx // group_size, idx % group_size))
+        group_indices = groups[gi] if gi < len(groups) else [idx]
+        group_words = [word_segment_times[i].get("word", "") for i in group_indices]
+        active_idx = pos
 
         precomputed_segments.append({
             "word": seg["word"],
@@ -128,209 +198,6 @@ def add_text_with_shadow(frame, text, font_scale=1.8, text_height_from_bottom=30
 
  
 
-def extract_video_segments(
-    precomputed_segments,
-    video_file,
-    output_video_file,
-    fps,
-    font_scale=1.8,
-    fade_frames=6,
-    text_height=300,
-    text_height_2=360,
-    subtitle_lines=1,
-    visualize=False,
-    temp_codec="XVID",  # Changed from MJPG to XVID for faster writing
-    crop_config=None,
-    font_ttf=None,
-    subtitle_bg=False,
-    subtitle_bg_color=(0, 0, 0),
-    subtitle_bg_alpha=0.6,
-    subtitle_bg_pad=8,
-    subtitle_bg_height=0,
-    subtitle_bg_offset_y=0,
-    shadow_size=0,
-    shadow_offset_x=0,
-    shadow_offset_y=0,
-    video_shift_seconds=0.0,
-):
-    """
-    Extract video segments and stitch them together with text overlay.
-    Optimized for faster video writing and reduced seeking.
-    """
-    print("Extracting video segments (optimized)...")
-    
-    cap = cv2.VideoCapture(video_file)
-    if not cap.isOpened():
-        print(f"Error: Could not open video file {video_file}")
-        return
-    
-    # Get video properties
-    input_fps = cap.get(cv2.CAP_PROP_FPS)
-    input_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    input_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    print(f"Input video: {input_width}x{input_height}, {input_fps:.2f} fps")
-    print(f"Using codec: {temp_codec} (optimized for speed)")
-
-    output_width = input_width
-    output_height = input_height
-    if crop_config is not None:
-        output_width = crop_config["output_width"]
-        output_height = crop_config["output_height"]
-    
-    # Create output video writer with optimized codec
-    fourcc = cv2.VideoWriter_fourcc(*temp_codec)
-    out = cv2.VideoWriter(output_video_file, fourcc, fps, (output_width, output_height))
-    
-    if not out.isOpened():
-        print(f"Warning: Could not open video writer with codec {temp_codec}, falling back to MJPG")
-        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-        out = cv2.VideoWriter(output_video_file, fourcc, fps, (output_width, output_height))
-    
-    if visualize:
-        cv2.namedWindow("Video Extraction", cv2.WINDOW_NORMAL)
-    
-    total_frames_processed = 0
-    current_frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-    
-    # Cache for overlay/mask per word group to avoid recomputation
-    overlay_cache = {}
-    mask_cache = {}
-    bg_mask_cache = {}
-    
-    # Process each segment
-    video_shift_frames = int(round(video_shift_seconds * fps))
-    for seg in tqdm(precomputed_segments, desc="Processing video segments"):
-        start_frame = seg["start_frame"] + video_shift_frames
-        end_frame = seg["end_frame"] + video_shift_frames
-        if end_frame <= 0:
-            continue
-        if start_frame < 0:
-            start_frame = 0
-        group_words = seg.get("group_words") or [seg.get("word", "")]
-        active_idx = int(seg.get("active_idx", 0))
-        
-        # Create a cache key for this word group and active index
-        cache_key = (
-            tuple(group_words),
-            active_idx,
-            font_scale,
-            text_height,
-            text_height_2,
-            subtitle_lines,
-            bool(font_ttf),
-            subtitle_bg,
-            subtitle_bg_color,
-            subtitle_bg_alpha,
-            subtitle_bg_pad,
-            subtitle_bg_height,
-            subtitle_bg_offset_y,
-            shadow_size,
-            shadow_offset_x,
-            shadow_offset_y,
-        )
-        
-        # Get or create overlay and mask
-        if cache_key in overlay_cache:
-            overlay = overlay_cache[cache_key]
-            mask = mask_cache[cache_key]
-            bg_mask = bg_mask_cache[cache_key]
-        else:
-            overlay, mask, bg_mask = subtitle_render.render_grouped_subtitle_overlay(
-                (output_height, output_width, 3),  # frame shape
-                group_words,
-                active_idx,
-                font_scale=font_scale,
-                text_height_from_bottom=text_height,
-                text_height_from_bottom_2=text_height_2,
-                subtitle_lines=subtitle_lines,
-                font_ttf=font_ttf,
-                subtitle_bg=subtitle_bg,
-                subtitle_bg_color=subtitle_bg_color,
-                subtitle_bg_alpha=subtitle_bg_alpha,
-                subtitle_bg_pad=subtitle_bg_pad,
-                subtitle_bg_full_width=True,
-                subtitle_bg_height=subtitle_bg_height,
-                subtitle_bg_offset_y=subtitle_bg_offset_y,
-                shadow_size=shadow_size,
-                shadow_offset_x=shadow_offset_x,
-                shadow_offset_y=shadow_offset_y,
-            )
-            overlay_cache[cache_key] = overlay
-            mask_cache[cache_key] = mask
-            bg_mask_cache[cache_key] = bg_mask
-        
-        # Optimized seeking: only seek if we're more than 50 frames away
-        # (reduces expensive cv2.VideoCapture.set calls)
-        if start_frame < current_frame_idx or start_frame > current_frame_idx + 50:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-            current_frame_idx = start_frame
-        elif start_frame > current_frame_idx:
-            # Skip frames by reading and discarding (faster than seeking for small gaps)
-            gap = start_frame - current_frame_idx
-            for _ in range(gap):
-                ret, _ = cap.read()
-                if not ret:
-                    break
-                current_frame_idx += 1
-        
-        # Process frames in this segment
-        for frame_idx in range(start_frame, end_frame):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            current_frame_idx += 1
-            
-            if crop_config is not None:
-                x1, y1, x2, y2 = crop_config["crop_box"]
-                frame = frame[y1:y2, x1:x2]
-                if frame.size == 0:
-                    continue
-                if (x2 - x1) != output_width or (y2 - y1) != output_height:
-                    frame = cv2.resize(frame, (output_width, output_height))
-            
-            # Apply subtitle background (alpha blend) before text
-            if subtitle_bg and subtitle_bg_alpha > 0 and bg_mask is not None:
-                alpha = max(0.0, min(1.0, subtitle_bg_alpha))
-                ys, xs = np.where(bg_mask > 0)
-                if ys.size:
-                    y1, y2 = ys.min(), ys.max() + 1
-                    x1, x2 = xs.min(), xs.max() + 1
-                    roi = frame[y1:y2, x1:x2]
-                    roi_bg = overlay[y1:y2, x1:x2]
-                    frame[y1:y2, x1:x2] = cv2.addWeighted(roi, 1.0 - alpha, roi_bg, alpha, 0)
-
-            # Apply text overlay using cached mask
-            if mask is not None:
-                # Use numpy indexing for faster overlay application
-                mask_indices = mask > 0
-                frame[mask_indices] = overlay[mask_indices]
-            
-            # Write frame to output
-            out.write(frame)
-            total_frames_processed += 1
-            
-            # Visualization
-            if visualize:
-                cv2.imshow("Video Extraction", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-    
-    cap.release()
-    out.release()
-    
-    if visualize:
-        cv2.destroyAllWindows()
-    
-    print(f"Video processing complete. Processed {total_frames_processed} frames.")
-    
-    # Verify output
-    verify = cv2.VideoCapture(output_video_file)
-    output_frames = int(verify.get(cv2.CAP_PROP_FRAME_COUNT))
-    verify.release()
-    print(f"Output video has {output_frames} frames")
-    
-    return True
 
 def combine_video_audio(video_file, audio_file, final_output):
     """
@@ -397,12 +264,6 @@ def main():
         help="Height of text from bottom (default: 300)"
     )
     parser.add_argument(
-        "--text-height-2",
-        type=int,
-        default=360,
-        help="Height of top subtitle line from bottom (default: 360)",
-    )
-    parser.add_argument(
         "--subtitle-lines",
         type=int,
         default=1,
@@ -441,7 +302,7 @@ def main():
         "--subtitle-bg-height",
         type=int,
         default=0,
-        help="Background height in pixels (default: 0 = auto)",
+        help="Background height in pixels from bottom (default: 0 = auto)",
     )
     parser.add_argument(
         "--subtitle-bg-offset-y",
@@ -474,6 +335,48 @@ def main():
         help="Subtitle shadow Y offset in pixels (default: 0). If both offsets are 0, uses --shadow-size.",
     )
     parser.add_argument(
+        "--subtitle-dilate",
+        action="store_true",
+        default=True,
+        help="Use dilated outline instead of drop shadow.",
+    )
+    parser.add_argument(
+        "--subtitle-dilate-size",
+        type=int,
+        default=10,
+        help="Dilate pixel radius for subtitle outline (default: 10).",
+    )
+    parser.add_argument(
+        "--subtitle-dilate-color",
+        type=str,
+        default="0,0,0",
+        help="Dilate color as B,G,R (default: 0,0,0).",
+    )
+    parser.add_argument(
+        "--subtitle-text-color",
+        type=str,
+        default="255,255,255",
+        help="Subtitle text color as B,G,R (default: 255,255,255).",
+    )
+    parser.add_argument(
+        "--subtitle-highlight-color",
+        type=str,
+        default="0,255,255",
+        help="Subtitle highlight color as B,G,R (default: 0,255,255).",
+    )
+    parser.add_argument(
+        "--subtitle-shadow-color",
+        type=str,
+        default="0,0,0",
+        help="Subtitle shadow color as B,G,R (default: 0,0,0).",
+    )
+    parser.add_argument(
+        "--brightness-mult",
+        type=str,
+        default="1.0,1.0,1.0",
+        help="Multiply frame brightness per-channel as B,G,R (default: 1.0,1.0,1.0).",
+    )
+    parser.add_argument(
         "--fade-frames",
         type=int,
         default=6,
@@ -482,7 +385,7 @@ def main():
     parser.add_argument(
         "--fade-samples",
         type=int,
-        default=300,
+        default=100,
         help="Crossfade length for audio stitching in samples (default: 3000)"
     )
     parser.add_argument(
@@ -490,6 +393,12 @@ def main():
         type=int,
         default=6,
         help="Number of words per subtitle group (default: 6)",
+    )
+    parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=0,
+        help="Max characters per subtitle line (0 = no limit).",
     )
     parser.add_argument(
         "--temp-codec",
@@ -504,10 +413,15 @@ def main():
         help="Shift all word timings by this many seconds (default: 0.15)",
     )
     parser.add_argument(
-        "--video-shift-seconds",
-        type=float,
-        default=0.0,
-        help="Shift video segments by this many seconds relative to audio (default: 0.0)",
+        "--preserve-word-gaps",
+        action="store_true",
+        help="Disable timing adjustments that reduce gaps between words (sets --shift-seconds 0 and --extend-ms 0)",
+    )
+    parser.add_argument(
+        "--video-shift-frames",
+        type=int,
+        default=0,
+        help="Shift video segments by N frames relative to audio (positive=advance, negative=delay).",
     )
     parser.add_argument(
         "--extend-ms",
@@ -586,13 +500,14 @@ def main():
     )
     
     args = parser.parse_args()
+    text_height_2 = None
 
     if args.ig_standard:
         args.width = 1080
         args.height = 1920
         args.subtitle_lines = 2
         args.text_height = 600 + 170
-        args.text_height_2 = 700 + 170
+        text_height_2 = None
         args.font_scale = 2
         args.subtitle_bg = True
         args.subtitle_bg_height = 300
@@ -624,6 +539,9 @@ def main():
         word_segment_times = segment_utils.load_word_segments_from_json(jsonfilename)
 
     sr = segment_utils.get_audio_sample_rate(audiofilename)
+    if args.preserve_word_gaps:
+        args.shift_seconds = 0.0
+        args.extend_ms = 0
     word_segment_times = segment_utils.align_segments_to_sample_boundaries(
         word_segment_times, sr
     )
@@ -634,21 +552,13 @@ def main():
         word_segment_times, extend_ms=args.extend_ms
     )
     
-    # Output naming (prefer CSV basename when available)
-    if used_csv_path:
-        csv_base = os.path.splitext(os.path.basename(used_csv_path))[0]
-        out_dir = os.path.dirname(args.video)
-        if out_dir == "":
-            out_dir = "."
-        if args.output is None:
-            args.output = os.path.join(out_dir, f"{csv_base}.mp4")
-        temp_video = os.path.join(out_dir, f"{csv_base}_temp.mp4")
-        temp_audio = os.path.join(out_dir, f"{csv_base}_temp.wav")
-    else:
-        if args.output is None:
-            args.output = "output.mp4"
-        temp_video = f"{args.video}_temp.mp4"
-        temp_audio = f"{args.video}_temp.wav"
+    # Output naming: default to {infile}_final.mp4 in same dir as input
+    out_dir = os.path.dirname(args.video) or "."
+    in_base = os.path.splitext(os.path.basename(args.video))[0]
+    if args.output is None:
+        args.output = os.path.join(out_dir, f"{in_base}_final.mp4")
+    temp_video = os.path.join(out_dir, f"{in_base}_temp.mp4")
+    temp_audio = os.path.join(out_dir, f"{in_base}_temp.wav")
     
     # Process audio
     if not args.skip_audio and os.path.exists(temp_audio):
@@ -720,8 +630,13 @@ def main():
             }
         
         # Precompute segments
+        max_chars = args.max_chars if args.max_chars and args.max_chars > 0 else None
         precomputed_segments = precompute_segments(
-            word_segment_times, fps, group_size=args.group_size
+            word_segment_times,
+            fps,
+            group_size=args.group_size,
+            max_chars=max_chars,
+            subtitle_lines=args.subtitle_lines,
         )
         
         # Extract video segments
@@ -740,6 +655,82 @@ def main():
         except Exception:
             raise ValueError("--subtitle-bg-color must be in 'B,G,R' format")
 
+        try:
+            dc_parts = [int(x) for x in args.subtitle_dilate_color.split(",")]
+            if len(dc_parts) != 3:
+                raise ValueError
+            subtitle_dilate_color = (dc_parts[0], dc_parts[1], dc_parts[2])
+        except Exception:
+            raise ValueError("--subtitle-dilate-color must be in 'B,G,R' format")
+
+        try:
+            tc_parts = [int(x) for x in args.subtitle_text_color.split(",")]
+            if len(tc_parts) != 3:
+                raise ValueError
+            subtitle_text_color = (tc_parts[0], tc_parts[1], tc_parts[2])
+        except Exception:
+            raise ValueError("--subtitle-text-color must be in 'B,G,R' format")
+
+        try:
+            hc_parts = [int(x) for x in args.subtitle_highlight_color.split(",")]
+            if len(hc_parts) != 3:
+                raise ValueError
+            subtitle_highlight_color = (hc_parts[0], hc_parts[1], hc_parts[2])
+        except Exception:
+            raise ValueError("--subtitle-highlight-color must be in 'B,G,R' format")
+
+        try:
+            sc_parts = [int(x) for x in args.subtitle_shadow_color.split(",")]
+            if len(sc_parts) != 3:
+                raise ValueError
+            subtitle_shadow_color = (sc_parts[0], sc_parts[1], sc_parts[2])
+        except Exception:
+            raise ValueError("--subtitle-shadow-color must be in 'B,G,R' format")
+
+        try:
+            bm_parts = [float(x) for x in args.brightness_mult.split(",")]
+            if len(bm_parts) != 3:
+                raise ValueError
+            brightness_mult = np.array(bm_parts, dtype=np.float32).reshape(1, 1, 3)
+        except Exception:
+            raise ValueError("--brightness-mult must be in 'B,G,R' float format")
+
+        includes = None
+        includes_path = os.path.splitext(args.video)[0] + "_includes.json"
+        if os.path.exists(includes_path):
+            try:
+                with open(includes_path, "r", encoding="utf-8") as f:
+                    raw_includes = json.load(f)
+                includes = []
+                base_dir = os.path.dirname(includes_path)
+                for rec in raw_includes:
+                    fname = rec.get("filename", "")
+                    if not fname:
+                        continue
+                    img_path = os.path.join(base_dir, fname)
+                    img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+                    if img is None:
+                        continue
+                    h = int(float(rec.get("height", 0)))
+                    if h > 0:
+                        scale = h / img.shape[0]
+                        w = max(1, int(round(img.shape[1] * scale)))
+                        img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+                    pos = rec.get("position", [0.0, 0.0])
+                    x = float(pos[0]) if len(pos) > 0 else 0.0
+                    y = float(pos[1]) if len(pos) > 1 else 0.0
+                    includes.append(
+                        {
+                            "image": img,
+                            "x": x,
+                            "y": y,
+                            "start": float(rec.get("startTime", 0.0)),
+                            "end": float(rec.get("endTime", 0.0)),
+                        }
+                    )
+            except Exception as e:
+                print(f"Warning: failed to load includes: {e}")
+
         extract_video_segments(
             precomputed_segments,
             args.video,
@@ -748,7 +739,7 @@ def main():
             font_scale=args.font_scale,
             fade_frames=args.fade_frames,
             text_height=args.text_height,
-            text_height_2=args.text_height_2,
+            text_height_2=text_height_2,
             subtitle_lines=args.subtitle_lines,
             visualize=args.visualize,
             temp_codec=args.temp_codec,
@@ -763,7 +754,15 @@ def main():
             shadow_size=args.shadow_size,
             shadow_offset_x=args.shadow_offset_x,
             shadow_offset_y=args.shadow_offset_y,
-            video_shift_seconds=args.video_shift_seconds,
+            subtitle_dilate=args.subtitle_dilate,
+            subtitle_dilate_size=args.subtitle_dilate_size,
+            subtitle_dilate_color=subtitle_dilate_color,
+            subtitle_text_color=subtitle_text_color,
+            subtitle_highlight_color=subtitle_highlight_color,
+            subtitle_shadow_color=subtitle_shadow_color,
+            brightness_mult=brightness_mult,
+            video_shift_frames=args.video_shift_frames,
+            includes=includes,
         )
     
     # Combine audio and video

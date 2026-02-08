@@ -5,6 +5,16 @@ import json
 import cv2
 import numpy as np
 
+try:
+    import motive2d_engine as _cg
+except Exception:
+    _cg = None
+if _cg is None:
+    try:
+        import motive2d_color_grading as _cg
+    except Exception:
+        _cg = None
+
 
 def parse_rgb(value: str):
     parts = [p.strip() for p in value.split(",")]
@@ -46,7 +56,19 @@ def apply_grading(
     levels=None,
     brightness=0.0,
     contrast=1.0,
+    saturation=1.0,
 ):
+    if _cg is not None:
+        return _cg.apply_grading(
+            frame_bgr,
+            shadows,
+            midtones,
+            highlights,
+            levels,
+            float(brightness),
+            float(contrast),
+            float(saturation),
+        )
     frame = frame_bgr.astype(np.float32)
     b, g, r = cv2.split(frame)
     # Luma for weighting
@@ -83,6 +105,13 @@ def apply_grading(
     if brightness != 0.0 or contrast != 1.0:
         out = out * float(contrast) + float(brightness) * 255.0
 
+    if saturation != 1.0:
+        hsv = cv2.cvtColor(np.clip(out, 0, 255).astype(np.uint8), cv2.COLOR_BGR2HSV).astype(
+            np.float32
+        )
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * float(saturation), 0, 255)
+        out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
@@ -98,6 +127,7 @@ def process_image(input_path: Path, output_path: Path, args):
         levels=args.levels,
         brightness=args.brightness,
         contrast=args.contrast,
+        saturation=args.saturation,
     )
     if not cv2.imwrite(str(output_path), out):
         raise RuntimeError(f"Failed to write image: {output_path}")
@@ -129,6 +159,7 @@ def process_video(input_path: Path, output_path: Path, args):
             levels=args.levels,
             brightness=args.brightness,
             contrast=args.contrast,
+            saturation=args.saturation,
         )
         writer.write(out)
 
@@ -144,6 +175,7 @@ def load_or_create_grading(json_path: Path):
         "levels": [0.0, 255.0, 1.0, 0.0, 255.0],
         "brightness": 0.0,
         "contrast": 1.0,
+        "saturation": 1.0,
     }
     if not json_path.exists():
         with json_path.open("w", encoding="utf-8") as f:
@@ -190,6 +222,12 @@ def edit_grading(video_path: Path):
     def from_contrast_tb(v):
         return max(0.0, float(v) / 100.0)
 
+    def to_saturation_tb(v):
+        return int(round(float(v) * 100.0))
+
+    def from_saturation_tb(v):
+        return max(0.0, float(v) / 100.0)
+
     def noop(_):
         pass
 
@@ -214,6 +252,7 @@ def edit_grading(video_path: Path):
     # Brightness / contrast
     cv2.createTrackbar("brightness", win, to_tb(data.get("brightness", 0.0)), 200, noop)
     cv2.createTrackbar("contrast", win, to_contrast_tb(data.get("contrast", 1.0)), 300, noop)
+    cv2.createTrackbar("saturation", win, to_saturation_tb(data.get("saturation", 1.0)), 300, noop)
     # Save button
     cv2.createTrackbar("save", win, 0, 1, noop)
 
@@ -243,6 +282,7 @@ def edit_grading(video_path: Path):
         )
         brightness = from_tb(cv2.getTrackbarPos("brightness", win))
         contrast = from_contrast_tb(cv2.getTrackbarPos("contrast", win))
+        saturation = from_saturation_tb(cv2.getTrackbarPos("saturation", win))
 
         preview = apply_grading(
             frame,
@@ -252,6 +292,7 @@ def edit_grading(video_path: Path):
             levels=levels,
             brightness=brightness,
             contrast=contrast,
+            saturation=saturation,
         )
         cv2.imshow(win, preview)
 
@@ -264,6 +305,7 @@ def edit_grading(video_path: Path):
                 "levels": [float(x) for x in levels],
                 "brightness": float(brightness),
                 "contrast": float(contrast),
+                "saturation": float(saturation),
             }
             with grading_path.open("w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
@@ -316,6 +358,12 @@ def main():
         type=float,
         default=1.0,
         help="Contrast multiplier (>=0).",
+    )
+    parser.add_argument(
+        "--saturation",
+        type=float,
+        default=1.0,
+        help="Saturation multiplier (>=0).",
     )
     args = parser.parse_args()
 

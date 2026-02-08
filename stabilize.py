@@ -40,9 +40,75 @@ def load_detections(jsonl_path: Path):
     return detections_by_frame
 
 
+def _normalize_instance_id(instance_id):
+    if isinstance(instance_id, str):
+        s = instance_id.strip()
+        if s.isdigit():
+            try:
+                return int(s)
+            except Exception:
+                return instance_id
+        return instance_id
+    return instance_id
+
+
+def _instance_matches(rec_id, instance_id):
+    if rec_id == instance_id:
+        return True
+    if isinstance(rec_id, str) and isinstance(instance_id, int):
+        return rec_id.strip().isdigit() and int(rec_id.strip()) == instance_id
+    if isinstance(rec_id, int) and isinstance(instance_id, str):
+        return instance_id.strip().isdigit() and int(instance_id.strip()) == rec_id
+    return False
+
+
+def _prompt_for_instance(candidates, frame, last_frame, max_absence):
+    if not candidates:
+        return None, None
+    ids = []
+    for rec in candidates:
+        rec_id = rec.get("instance_id")
+        if rec_id is not None:
+            ids.append(str(rec_id).strip())
+    uniq_ids = sorted(set(ids))
+    print(
+        f"No continuation after {max_absence} frames at frame {frame} "
+        f"(last detection frame {last_frame})."
+    )
+    if uniq_ids:
+        print(f"Available instance_ids at frame {frame}:")
+        rows = []
+        for rec in candidates:
+            rec_id = rec.get("instance_id")
+            rx = rec.get("center_x")
+            ry = rec.get("center_y")
+            if rec_id is None or rx is None or ry is None:
+                continue
+            try:
+                rx_f = float(rx)
+                ry_f = float(ry)
+            except (TypeError, ValueError):
+                continue
+            rows.append((rx_f, str(rec_id).strip(), ry_f))
+        rows.sort(key=lambda r: r[0])
+        for rx_f, rec_id, ry_f in rows:
+            print(f"  - {rec_id}: ({rx_f:.2f}, {ry_f:.2f})")
+    else:
+        print(f"No instance_ids available at frame {frame}.")
+    while True:
+        user_val = input("Enter new instance_id to continue (blank to abort): ").strip()
+        if not user_val:
+            return None, None
+        user_id = _normalize_instance_id(user_val)
+        matches = [rec for rec in candidates if _instance_matches(rec.get("instance_id"), user_id)]
+        if matches:
+            return user_id, matches[0]
+        print(f"instance_id {user_val} not found in frame {frame}. Try again.")
+
+
 def preprocess_continuous(
     jsonl_path: Path,
-    instance_id: int,
+    instance_id,
     out_path: Path,
     max_absence: int = 5,
     radius_per_frame: float = 50.0,
@@ -50,16 +116,31 @@ def preprocess_continuous(
     lowpass_alpha: float = 0.25,
     fix_y: bool = False,
     time_shift: int = 0,
+    start_frame: int | None = None,
+    end_frame: int | None = None,
 ):
     detections_by_frame = load_detections(jsonl_path)
     if not detections_by_frame:
         raise RuntimeError("No detections found in JSONL.")
 
     frames = sorted(detections_by_frame.keys())
-    first_frame = frames[0]
+    if start_frame is None:
+        first_frame = frames[0]
+    else:
+        first_frame = int(start_frame)
+        if first_frame not in detections_by_frame:
+            raise RuntimeError(
+                f"start_frame {first_frame} not found in detections (range {frames[0]}..{frames[-1]})."
+            )
+    if end_frame is not None:
+        end_frame = int(end_frame)
+        if end_frame < first_frame:
+            raise RuntimeError(
+                f"end_frame {end_frame} must be >= start_frame {first_frame}."
+            )
     first_frame_recs = detections_by_frame[first_frame]
     start_candidates = [
-        rec for rec in first_frame_recs if rec.get("instance_id") == instance_id
+        rec for rec in first_frame_recs if _instance_matches(rec.get("instance_id"), instance_id)
     ]
     if not start_candidates:
         raise RuntimeError(
@@ -76,7 +157,12 @@ def preprocess_continuous(
 
     output = [current]
 
-    for frame in frames[1:]:
+    start_idx = frames.index(first_frame)
+    if end_frame is not None:
+        frames_iter = [f for f in frames[start_idx + 1:] if f <= end_frame]
+    else:
+        frames_iter = frames[start_idx + 1:]
+    for frame in frames_iter:
         candidates = detections_by_frame.get(frame, [])
         f = frame - last_frame
         radius = float(radius_per_frame) * float(f)
@@ -130,10 +216,20 @@ def preprocess_continuous(
         miss_count += 1
         print(f"  -> miss_count={miss_count}")
         if miss_count > max_absence:
-            raise RuntimeError(
-                f"No continuation after {max_absence} frames at frame {frame} "
-                f"(last detection frame {last_frame})."
+            new_id, new_rec = _prompt_for_instance(
+                candidates, frame, last_frame, max_absence
             )
+            if new_rec is None:
+                raise RuntimeError(
+                    f"No continuation after {max_absence} frames at frame {frame} "
+                    f"(last detection frame {last_frame})."
+                )
+            instance_id = new_id
+            last_center = (float(new_rec["center_x"]), float(new_rec["center_y"]))
+            last_frame = frame
+            miss_count = 0
+            output.append(new_rec)
+            continue
         output.append(
             {
                 "frame": frame,
@@ -291,6 +387,12 @@ def preprocess_continuous(
 
     with out_path.open("w", encoding="utf-8") as f:
         for rec in smoothed:
+            if end_frame is not None:
+                try:
+                    if int(rec.get("frame", -1)) > end_frame:
+                        break
+                except (TypeError, ValueError):
+                    pass
             out_rec = dict(rec)
             out_rec["instance_id"] = instance_id
             f.write(json.dumps(out_rec) + "\n")
@@ -347,6 +449,7 @@ def load_or_create_grading(json_path: Path):
         "levels": [0.0, 255.0, 1.0, 0.0, 255.0],
         "brightness": 0.0,
         "contrast": 1.0,
+        "saturation": 1.0,
     }
     if not json_path.exists():
         with json_path.open("w", encoding="utf-8") as f:
@@ -383,26 +486,31 @@ def build_tracked_centers(centers_by_frame, max_dist=120.0, max_gap=5):
 def main():
     parser = argparse.ArgumentParser(description="Visualize centerpoints for an instance.")
     parser.add_argument("video", help="Input video (e.g. sankofa.MOV)")
-    parser.add_argument("--instance", type=int, default=1, help="Instance id to visualize.")
+    parser.add_argument(
+        "--instance",
+        type=str,
+        default="3",
+        help="Instance id to visualize (number or string label).",
+    )
     parser.add_argument("--scale", type=float, default=0.5, help="Display scale factor.")
     parser.add_argument("--width", type=int, default=1080, help="Overlay box width in pixels.")
     parser.add_argument("--height", type=int, default=1920, help="Overlay box height in pixels.")
     parser.add_argument(
         "--radius",
         type=float,
-        default=50.0,
+        default=30.0,
         help="Continuation radius per frame (pixels).",
     )
     parser.add_argument(
         "--averageframecount",
         type=int,
-        default=7,
+        default=5,
         help="Centered moving average window size in frames.",
     )
     parser.add_argument(
         "--lowpass-alpha",
         type=float,
-        default=0.25,
+        default=0.45,
         help="Symmetric low-pass alpha (0-1).",
     )
     parser.add_argument(
@@ -413,19 +521,19 @@ def main():
     parser.add_argument(
         "--time-shift",
         type=int,
-        default=0,
+        default=5,
         help="Shift centroid time by N frames (positive = earlier).",
     )
     parser.add_argument(
         "--zoom",
         type=float,
-        default=3.0,
+        default=1.7,
         help="Zoom factor for overlay rectangle (shrinks by this factor).",
     )
     parser.add_argument(
         "--offset-x",
         type=float,
-        default=0.0,
+        default=0,
         help="Horizontal offset (pixels) applied to overlay rectangle center.",
     )
     parser.add_argument(
@@ -440,6 +548,34 @@ def main():
         default="centroid",
         help="Center for overlay box (default: centroid).",
     )
+    parser.add_argument(
+        "--no-grading",
+        action="store_true",
+        help="Disable color grading (use raw frame).",
+    )
+    parser.add_argument(
+        "--start-frame",
+        type=int,
+        default=0,
+        help="Start processing at this frame index (default: 0).",
+    )
+    parser.add_argument(
+        "--end-frame",
+        type=int,
+        default=None,
+        help="Stop processing at this frame index (inclusive).",
+    )
+    vis_group = parser.add_mutually_exclusive_group()
+    vis_group.add_argument(
+        "--visualize",
+        action="store_true",
+        help="Show live preview window (default: on).",
+    )
+    vis_group.add_argument(
+        "--no-visualize",
+        action="store_true",
+        help="Disable live preview window.",
+    )
     args = parser.parse_args()
 
     video_path = Path(args.video)
@@ -449,14 +585,17 @@ def main():
     jsonl_path = video_path.with_suffix(".jsonl")
     grading_path = video_path.with_name(f"{video_path.stem}_grading.json")
     grading = load_or_create_grading(grading_path)
+    instance_id = _normalize_instance_id(args.instance)
     preprocess_continuous(
         jsonl_path,
-        instance_id=args.instance,
+        instance_id=instance_id,
         radius_per_frame=args.radius,
         average_frame_count=args.averageframecount,
         lowpass_alpha=args.lowpass_alpha,
         fix_y=args.fix_y,
         time_shift=args.time_shift,
+        start_frame=args.start_frame,
+        end_frame=args.end_frame,
         out_path=jsonl_path.with_name("input_continuous.jsonl"),
     )
     continuous_path = jsonl_path.with_name("input_continuous.jsonl")
@@ -483,23 +622,36 @@ def main():
             target_h = None
 
     scale = args.scale
-    frame_idx = 0
+    visualize = True if not args.no_visualize else False
+    start_frame = max(0, int(args.start_frame))
+    if start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    frame_idx = start_frame
+    end_frame = int(args.end_frame) if args.end_frame is not None else None
     while True:
         ok, frame = cap.read()
         if not ok:
             break
+        if end_frame is not None and frame_idx > end_frame:
+            break
+        print(f"[frame] {frame_idx}")
         h, w = frame.shape[:2]
-        graded = apply_grading(
-            frame,
-            shadows=tuple(grading.get("shadows", (0.0, 0.0, 0.0))),
-            midtones=tuple(grading.get("midtones", (0.0, 0.0, 0.0))),
-            highlights=tuple(grading.get("highlights", (0.0, 0.0, 0.0))),
-            levels=tuple(grading.get("levels")) if grading.get("levels") is not None else None,
-            brightness=float(grading.get("brightness", 0.0)),
-            contrast=float(grading.get("contrast", 1.0)),
-        )
+        if args.no_grading:
+            graded = frame
+        else:
+            graded = apply_grading(
+                frame,
+                shadows=tuple(grading.get("shadows", (0.0, 0.0, 0.0))),
+                midtones=tuple(grading.get("midtones", (0.0, 0.0, 0.0))),
+                highlights=tuple(grading.get("highlights", (0.0, 0.0, 0.0))),
+                levels=tuple(grading.get("levels")) if grading.get("levels") is not None else None,
+                brightness=float(grading.get("brightness", 0.0)),
+                contrast=float(grading.get("contrast", 1.0)),
+                saturation=float(grading.get("saturation", 1.0)),
+            )
         raw_frame = graded
         frame = graded.copy()
+        chan_count = frame.shape[2] if frame is not None and frame.ndim == 3 else 3
         rec = continuous_by_frame.get(frame_idx, None)
         center = None
         bbox = None
@@ -544,7 +696,7 @@ def main():
                 if out_writer is None:
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                     out_writer = cv2.VideoWriter(str(out_path), fourcc, fps, (target_w, target_h))
-                crop = np.zeros((target_h, target_w, 3), dtype=raw_frame.dtype)
+                crop = np.zeros((target_h, target_w, chan_count), dtype=raw_frame.dtype)
                 if bx2c > bx1c and by2c > by1c:
                     src = raw_frame[by1c:by2c, bx1c:bx2c]
                     dx1 = max(0, -bx1)
@@ -554,6 +706,8 @@ def main():
                     dx2 = dx1 + dw
                     dy2 = dy1 + dh
                     crop[dy1:dy2, dx1:dx2] = src[:dh, :dw]
+                if chan_count == 4:
+                    crop = cv2.cvtColor(crop, cv2.COLOR_BGRA2BGR)
                 out_writer.write(crop)
         else:
             cv2.putText(
@@ -567,16 +721,20 @@ def main():
                 cv2.LINE_AA,
             )
 
-        resized = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-        cv2.imshow("stabilize", resized)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+        if visualize:
+            resized = cv2.resize(
+                frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA
+            )
+            cv2.imshow("stabilize", resized)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
         frame_idx += 1
 
     cap.release()
     if out_writer is not None:
         out_writer.release()
-    cv2.destroyAllWindows()
+    if visualize:
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
