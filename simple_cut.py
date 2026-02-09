@@ -430,6 +430,12 @@ def main():
         help="Extend each segment end by this many ms (default: 20)",
     )
     parser.add_argument(
+        "--prepend-ms",
+        type=int,
+        default=20,
+        help="Extend each segment start earlier by this many ms (default: 20)",
+    )
+    parser.add_argument(
         "--visualize",
         action="store_true",
         help="Show real-time visualization"
@@ -519,29 +525,41 @@ def main():
 
     # Load CSV/JSON data
     print("Loading segment data...")
-    basefilename = ''.join(args.video.split('.')[:-1])
-    jsonfilename = basefilename + ".json"
-    audiofilename = basefilename + ".wav"
+    basefilename = "".join(args.video.split(".")[:-1])
+    def _strip_suffixes(name):
+        for suf in ("_graded", "_stable"):
+            if name.endswith(suf):
+                name = name[: -len(suf)]
+        return name
+
+    json_base = _strip_suffixes(basefilename)
+    jsonfilename = json_base + ".json"
+    audiofilename = json_base + ".wav"
 
     csvfilename = jsonfilename + ".csv"
     used_csv_path = None
     if args.csv:
         used_csv_path = args.csv
+        print(f"Using CSV timings: {args.csv}")
         word_segment_times = load_word_segments_from_csv(args.csv)
     elif os.path.exists(csvfilename):
         used_csv_path = csvfilename
+        print(f"Using CSV timings: {csvfilename}")
         word_segment_times = load_word_segments_from_csv(csvfilename)
     elif os.path.exists(jsonfilename):
+        print(f"Using JSON timings: {jsonfilename}")
         # Export CSV for next time, then load JSON.
         transcriptJson2csv.export_words_to_csv(jsonfilename, source_video=args.video)
         word_segment_times = segment_utils.load_word_segments_from_json(jsonfilename)
     else:
+        print(f"Using JSON timings (missing, attempting anyway): {jsonfilename}")
         word_segment_times = segment_utils.load_word_segments_from_json(jsonfilename)
 
     sr = segment_utils.get_audio_sample_rate(audiofilename)
     if args.preserve_word_gaps:
         args.shift_seconds = 0.0
         args.extend_ms = 0
+        args.prepend_ms = 0
     word_segment_times = segment_utils.align_segments_to_sample_boundaries(
         word_segment_times, sr
     )
@@ -550,6 +568,9 @@ def main():
     )
     word_segment_times = segment_utils.extend_segments(
         word_segment_times, extend_ms=args.extend_ms
+    )
+    word_segment_times = segment_utils.prepend_segments(
+        word_segment_times, prepend_ms=args.prepend_ms
     )
     
     # Output naming: default to {infile}_final.mp4 in same dir as input

@@ -144,6 +144,29 @@ def extend_segments(word_segment_times, extend_ms=20):
     return out
 
 
+def prepend_segments(word_segment_times, prepend_ms=20):
+    """
+    Move each segment start earlier by prepend_ms, capped to the previous segment end (and >= 0).
+    """
+    if not word_segment_times or prepend_ms <= 0:
+        return list(word_segment_times)
+    prepend_sec = float(prepend_ms) / 1000.0
+    out = []
+    prev_end = 0.0
+    for i, seg in enumerate(word_segment_times):
+        curr = dict(seg)
+        start = float(curr.get("start", 0.0))
+        candidate = max(0.0, start - prepend_sec)
+        if i > 0:
+            candidate = max(candidate, prev_end)
+        curr["start"] = min(start, candidate)
+        if curr.get("end", curr["start"]) < curr["start"]:
+            curr["end"] = curr["start"]
+        out.append(curr)
+        prev_end = float(curr.get("end", curr["start"]))
+    return out
+
+
 def fill_gaps(word_segment_times, min_gap=0.0):
     """
     Insert blank word segments for gaps larger than min_gap (seconds).

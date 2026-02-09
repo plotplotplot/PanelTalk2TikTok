@@ -10,6 +10,9 @@ fi
 # read token and strip newline/carriage return
 HF_TOKEN="$(tr -d '\r\n' < hftoken.txt)"
 
+# ensure local cache dir exists (mapped into container)
+mkdir -p .cache
+
 # write outputs alongside the input file
 OUT_DIR="$(dirname "$1")"
 
@@ -19,6 +22,10 @@ docker run --gpus all -it \
   -v "$(pwd)/.cache":/.cache \
   -v "$(pwd)":/app -w /app \
   -e HF_TOKEN="$HF_TOKEN" \
+  -e MPLCONFIGDIR="/.cache/matplotlib" \
+  -e HF_HOME="/.cache/hf" \
+  -e HF_HUB_CACHE="/.cache/hf/hub" \
+  -e TRANSFORMERS_CACHE="/.cache/hf/transformers" \
   ghcr.io/jim60105/whisperx:large-v3-tl-77e20c4 \
   whisperx "$1" \
     --output_dir "$OUT_DIR" \

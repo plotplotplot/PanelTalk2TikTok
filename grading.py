@@ -147,6 +147,9 @@ def process_video(input_path: Path, output_path: Path, args):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
+    if args.visualize:
+        cv2.namedWindow("grading_preview", cv2.WINDOW_NORMAL)
+
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -161,10 +164,18 @@ def process_video(input_path: Path, output_path: Path, args):
             contrast=args.contrast,
             saturation=args.saturation,
         )
+        if out is not None and out.ndim == 3 and out.shape[2] == 4:
+            out = cv2.cvtColor(out, cv2.COLOR_BGRA2BGR)
         writer.write(out)
+        if args.visualize:
+            cv2.imshow("grading_preview", out)
+            if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+                break
 
     cap.release()
     writer.release()
+    if args.visualize:
+        cv2.destroyWindow("grading_preview")
 
 
 def load_or_create_grading(json_path: Path):
@@ -193,16 +204,21 @@ def edit_grading(video_path: Path):
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if total_frames <= 0:
+        total_frames = 1
     ok, frame = cap.read()
-    cap.release()
     if not ok or frame is None:
+        cap.release()
         raise RuntimeError("Failed to read first frame.")
 
     grading_path = video_path.with_name(f"{video_path.stem}_grading.json")
     data = load_or_create_grading(grading_path)
 
-    win = "grading"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    preview_win = "grading_preview"
+    controls_win = "grading_controls"
+    cv2.namedWindow(preview_win, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(controls_win, cv2.WINDOW_NORMAL)
 
     def to_tb(v):
         return int(round((float(v) + 1.0) * 100.0))
@@ -232,71 +248,92 @@ def edit_grading(video_path: Path):
         pass
 
     # Shadows
-    cv2.createTrackbar("shad_r", win, to_tb(data["shadows"][0]), 200, noop)
-    cv2.createTrackbar("shad_g", win, to_tb(data["shadows"][1]), 200, noop)
-    cv2.createTrackbar("shad_b", win, to_tb(data["shadows"][2]), 200, noop)
+    cv2.createTrackbar("shad_r", controls_win, to_tb(data["shadows"][0]), 200, noop)
+    cv2.createTrackbar("shad_g", controls_win, to_tb(data["shadows"][1]), 200, noop)
+    cv2.createTrackbar("shad_b", controls_win, to_tb(data["shadows"][2]), 200, noop)
     # Midtones
-    cv2.createTrackbar("mid_r", win, to_tb(data["midtones"][0]), 200, noop)
-    cv2.createTrackbar("mid_g", win, to_tb(data["midtones"][1]), 200, noop)
-    cv2.createTrackbar("mid_b", win, to_tb(data["midtones"][2]), 200, noop)
+    cv2.createTrackbar("mid_r", controls_win, to_tb(data["midtones"][0]), 200, noop)
+    cv2.createTrackbar("mid_g", controls_win, to_tb(data["midtones"][1]), 200, noop)
+    cv2.createTrackbar("mid_b", controls_win, to_tb(data["midtones"][2]), 200, noop)
     # Highlights
-    cv2.createTrackbar("hi_r", win, to_tb(data["highlights"][0]), 200, noop)
-    cv2.createTrackbar("hi_g", win, to_tb(data["highlights"][1]), 200, noop)
-    cv2.createTrackbar("hi_b", win, to_tb(data["highlights"][2]), 200, noop)
+    cv2.createTrackbar("hi_r", controls_win, to_tb(data["highlights"][0]), 200, noop)
+    cv2.createTrackbar("hi_g", controls_win, to_tb(data["highlights"][1]), 200, noop)
+    cv2.createTrackbar("hi_b", controls_win, to_tb(data["highlights"][2]), 200, noop)
     # Levels
-    cv2.createTrackbar("in_black", win, int(data["levels"][0]), 255, noop)
-    cv2.createTrackbar("in_white", win, int(data["levels"][1]), 255, noop)
-    cv2.createTrackbar("gamma", win, to_gamma_tb(data["levels"][2]), 300, noop)
-    cv2.createTrackbar("out_black", win, int(data["levels"][3]), 255, noop)
-    cv2.createTrackbar("out_white", win, int(data["levels"][4]), 255, noop)
+    cv2.createTrackbar("in_black", controls_win, int(data["levels"][0]), 255, noop)
+    cv2.createTrackbar("in_white", controls_win, int(data["levels"][1]), 255, noop)
+    cv2.createTrackbar("gamma", controls_win, to_gamma_tb(data["levels"][2]), 300, noop)
+    cv2.createTrackbar("out_black", controls_win, int(data["levels"][3]), 255, noop)
+    cv2.createTrackbar("out_white", controls_win, int(data["levels"][4]), 255, noop)
     # Brightness / contrast
-    cv2.createTrackbar("brightness", win, to_tb(data.get("brightness", 0.0)), 200, noop)
-    cv2.createTrackbar("contrast", win, to_contrast_tb(data.get("contrast", 1.0)), 300, noop)
-    cv2.createTrackbar("saturation", win, to_saturation_tb(data.get("saturation", 1.0)), 300, noop)
+    cv2.createTrackbar("brightness", controls_win, to_tb(data.get("brightness", 0.0)), 200, noop)
+    cv2.createTrackbar("contrast", controls_win, to_contrast_tb(data.get("contrast", 1.0)), 300, noop)
+    cv2.createTrackbar("saturation", controls_win, to_saturation_tb(data.get("saturation", 1.0)), 300, noop)
     # Save button
-    cv2.createTrackbar("save", win, 0, 1, noop)
+    cv2.createTrackbar("save", controls_win, 0, 1, noop)
+    # Preview toggle (1 = graded, 0 = original)
+    cv2.createTrackbar("preview", controls_win, 1, 1, noop)
+    # Frame scrubber
+    cv2.createTrackbar("frame", controls_win, 0, max(0, total_frames - 1), noop)
+
+    # Put controls to the right of the preview window
+    cv2.imshow(preview_win, frame)
+    cv2.moveWindow(preview_win, 0, 0)
+    cv2.moveWindow(controls_win, frame.shape[1] + 20, 0)
 
     last_save = 0
+    last_frame_idx = 0
     while True:
+        frame_idx = cv2.getTrackbarPos("frame", controls_win)
+        if frame_idx != last_frame_idx:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, new_frame = cap.read()
+            if ok and new_frame is not None:
+                frame = new_frame
+                last_frame_idx = frame_idx
+
         sh = (
-            from_tb(cv2.getTrackbarPos("shad_r", win)),
-            from_tb(cv2.getTrackbarPos("shad_g", win)),
-            from_tb(cv2.getTrackbarPos("shad_b", win)),
+            from_tb(cv2.getTrackbarPos("shad_r", controls_win)),
+            from_tb(cv2.getTrackbarPos("shad_g", controls_win)),
+            from_tb(cv2.getTrackbarPos("shad_b", controls_win)),
         )
         mi = (
-            from_tb(cv2.getTrackbarPos("mid_r", win)),
-            from_tb(cv2.getTrackbarPos("mid_g", win)),
-            from_tb(cv2.getTrackbarPos("mid_b", win)),
+            from_tb(cv2.getTrackbarPos("mid_r", controls_win)),
+            from_tb(cv2.getTrackbarPos("mid_g", controls_win)),
+            from_tb(cv2.getTrackbarPos("mid_b", controls_win)),
         )
         hi = (
-            from_tb(cv2.getTrackbarPos("hi_r", win)),
-            from_tb(cv2.getTrackbarPos("hi_g", win)),
-            from_tb(cv2.getTrackbarPos("hi_b", win)),
+            from_tb(cv2.getTrackbarPos("hi_r", controls_win)),
+            from_tb(cv2.getTrackbarPos("hi_g", controls_win)),
+            from_tb(cv2.getTrackbarPos("hi_b", controls_win)),
         )
         levels = (
-            float(cv2.getTrackbarPos("in_black", win)),
-            float(max(cv2.getTrackbarPos("in_white", win), 1)),
-            from_gamma_tb(cv2.getTrackbarPos("gamma", win)),
-            float(cv2.getTrackbarPos("out_black", win)),
-            float(cv2.getTrackbarPos("out_white", win)),
+            float(cv2.getTrackbarPos("in_black", controls_win)),
+            float(max(cv2.getTrackbarPos("in_white", controls_win), 1)),
+            from_gamma_tb(cv2.getTrackbarPos("gamma", controls_win)),
+            float(cv2.getTrackbarPos("out_black", controls_win)),
+            float(cv2.getTrackbarPos("out_white", controls_win)),
         )
-        brightness = from_tb(cv2.getTrackbarPos("brightness", win))
-        contrast = from_contrast_tb(cv2.getTrackbarPos("contrast", win))
-        saturation = from_saturation_tb(cv2.getTrackbarPos("saturation", win))
+        brightness = from_tb(cv2.getTrackbarPos("brightness", controls_win))
+        contrast = from_contrast_tb(cv2.getTrackbarPos("contrast", controls_win))
+        saturation = from_saturation_tb(cv2.getTrackbarPos("saturation", controls_win))
 
-        preview = apply_grading(
-            frame,
-            shadows=sh,
-            midtones=mi,
-            highlights=hi,
-            levels=levels,
-            brightness=brightness,
-            contrast=contrast,
-            saturation=saturation,
-        )
-        cv2.imshow(win, preview)
+        if cv2.getTrackbarPos("preview", controls_win) == 1:
+            preview = apply_grading(
+                frame,
+                shadows=sh,
+                midtones=mi,
+                highlights=hi,
+                levels=levels,
+                brightness=brightness,
+                contrast=contrast,
+                saturation=saturation,
+            )
+        else:
+            preview = frame
+        cv2.imshow(preview_win, preview)
 
-        save_pos = cv2.getTrackbarPos("save", win)
+        save_pos = cv2.getTrackbarPos("save", controls_win)
         if save_pos == 1 and last_save == 0:
             payload = {
                 "shadows": [float(x) for x in sh],
@@ -309,13 +346,14 @@ def edit_grading(video_path: Path):
             }
             with grading_path.open("w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
-            cv2.setTrackbarPos("save", win, 0)
+            cv2.setTrackbarPos("save", controls_win, 0)
         last_save = save_pos
 
         key = cv2.waitKey(10) & 0xFF
         if key in (27, ord("q")):
             break
 
+    cap.release()
     cv2.destroyAllWindows()
 
 
@@ -323,6 +361,16 @@ def main():
     parser = argparse.ArgumentParser(description="Simple RGB grading with tonal controls.")
     parser.add_argument("input", help="Input image or video path")
     parser.add_argument("output", nargs="?", help="Output image or video path")
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Open interactive grading GUI on the first frame.",
+    )
+    parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help="Show a live preview while rendering video output.",
+    )
     parser.add_argument(
         "--shadows",
         type=parse_rgb,
@@ -370,6 +418,10 @@ def main():
     input_path = Path(args.input)
     output_path = Path(args.output) if args.output else None
 
+    if args.gui:
+        edit_grading(input_path)
+        return
+
     img = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
     if img is not None:
         if output_path is None:
@@ -377,9 +429,19 @@ def main():
         process_image(input_path, output_path, args)
         return
 
+    grading_path = input_path.with_name(f"{input_path.stem}_grading.json")
+    if grading_path.exists():
+        data = load_or_create_grading(grading_path)
+        args.shadows = tuple(data.get("shadows", (0.0, 0.0, 0.0)))
+        args.midtones = tuple(data.get("midtones", (0.0, 0.0, 0.0)))
+        args.highlights = tuple(data.get("highlights", (0.0, 0.0, 0.0)))
+        args.levels = tuple(data.get("levels")) if data.get("levels") is not None else None
+        args.brightness = float(data.get("brightness", 0.0))
+        args.contrast = float(data.get("contrast", 1.0))
+        args.saturation = float(data.get("saturation", 1.0))
+
     if output_path is None:
-        edit_grading(input_path)
-        return
+        output_path = input_path.with_name(f"{input_path.stem}_graded.mp4")
 
     process_video(input_path, output_path, args)
 

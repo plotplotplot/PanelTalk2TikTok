@@ -528,7 +528,7 @@ def run_video_as_frames(
                             rec = {
                                 "frame": idx - 1,
                                 "time_sec": None,
-                                "instance_id": f"frame_{idx-1}_mask_{i}",
+                                "instance_id": i,
                                 "center_x": ctr[0],
                                 "center_y": ctr[1],
                                 "score": None,
@@ -602,7 +602,7 @@ def run_video_as_frames(
                         rec = {
                             "frame": frame_idx,
                             "time_sec": None,
-                            "instance_id": f"{frame_path.stem}_mask_{i}",
+                            "instance_id": i,
                             "center_x": ctr[0],
                             "center_y": ctr[1],
                             "score": None,

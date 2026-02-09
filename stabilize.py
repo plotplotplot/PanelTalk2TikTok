@@ -106,6 +106,226 @@ def _prompt_for_instance(candidates, frame, last_frame, max_absence):
         print(f"instance_id {user_val} not found in frame {frame}. Try again.")
 
 
+def _processed_frames_dir(video_path: Path) -> Path:
+    return video_path.parent / f"{video_path.stem}_frames_out"
+
+
+def _load_processed_frame(video_path: Path, frame_idx: int):
+    frames_dir = _processed_frames_dir(video_path)
+    if not frames_dir.exists():
+        return None
+    name = f"frame_{frame_idx + 1:06d}"
+    for ext in ("png", "jpg"):
+        path = frames_dir / f"{name}.{ext}"
+        if path.exists():
+            img = cv2.imread(str(path))
+            if img is not None:
+                return img
+    return None
+
+
+def _select_instance_with_click(
+    candidates,
+    video_path: Path,
+    frame_idx: int,
+    default_rec=None,
+    allow_keep: bool = False,
+    last_center=None,
+    current_center=None,
+):
+    img = _load_processed_frame(video_path, frame_idx)
+    if img is None:
+        return None, None
+
+    draw = img.copy()
+    for rec in candidates:
+        rx = rec.get("center_x")
+        ry = rec.get("center_y")
+        rec_id = rec.get("instance_id")
+        if rx is None or ry is None:
+            continue
+        try:
+            rx_f = float(rx)
+            ry_f = float(ry)
+        except (TypeError, ValueError):
+            continue
+        cv2.circle(draw, (int(rx_f), int(ry_f)), 10, (0, 255, 255), 2)
+        cv2.putText(
+            draw,
+            str(rec_id),
+            (int(rx_f) + 12, int(ry_f) - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    display_center = current_center if current_center is not None else last_center
+    if display_center is not None:
+        lx, ly = int(display_center[0]), int(display_center[1])
+        cv2.circle(draw, (lx, ly), 8, (0, 0, 255), -1)
+        cv2.putText(
+            draw,
+            "current",
+            (lx + 10, ly + 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    if default_rec is not None:
+        dx = default_rec.get("center_x")
+        dy = default_rec.get("center_y")
+        if dx is not None and dy is not None:
+            cv2.circle(draw, (int(dx), int(dy)), 14, (255, 0, 0), 2)
+
+    instr = "Click to select instance"
+    if allow_keep:
+        instr += " | Right arrow = keep center"
+    cv2.putText(
+        draw,
+        instr,
+        (20, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    h, w = draw.shape[:2]
+    max_dim = 1280
+    scale = 1.0
+    if max(h, w) > max_dim:
+        scale = max_dim / float(max(h, w))
+    scale *= 3.0
+    if scale != 1.0:
+        disp_w = max(1, int(round(w * scale)))
+        disp_h = max(1, int(round(h * scale)))
+        disp = cv2.resize(draw, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
+    else:
+        disp_w, disp_h = w, h
+        disp = draw
+
+    win = "select instance"
+    selected = {"rec": None}
+
+    def _on_mouse(event, x, y, flags, param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        ox = int(x / scale)
+        oy = int(y / scale)
+        best = None
+        best_dist = None
+        for rec in candidates:
+            rx = rec.get("center_x")
+            ry = rec.get("center_y")
+            if rx is None or ry is None:
+                continue
+            try:
+                rx_f = float(rx)
+                ry_f = float(ry)
+            except (TypeError, ValueError):
+                continue
+            dist = math.hypot(rx_f - ox, ry_f - oy)
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = rec
+        if best is not None:
+            selected["rec"] = best
+
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, disp_w, disp_h)
+    cv2.setMouseCallback(win, _on_mouse)
+    while True:
+        cv2.imshow(win, disp)
+        key = cv2.waitKey(20)
+        if selected["rec"] is not None:
+            cv2.destroyWindow(win)
+            return "select", selected["rec"]
+        if key in (13, 10):  # enter
+            if allow_keep:
+                cv2.destroyWindow(win)
+                return "keep", default_rec
+        if key in (83, 2555904):  # right arrow
+            if allow_keep:
+                cv2.destroyWindow(win)
+                return "keep", default_rec
+        if key in (27, ord("q")):
+            cv2.destroyWindow(win)
+            return "abort", None
+
+
+def apply_lowpass_filter(records, lowpass_alpha: float):
+    # Symmetric low-pass (forward-backward) to avoid phase delay
+    alpha = float(lowpass_alpha)
+    if alpha < 0.0:
+        alpha = 0.0
+    if alpha > 1.0:
+        alpha = 1.0
+    if alpha <= 0.0 or len(records) <= 1:
+        return records
+
+    fwd = []
+    prev_x = None
+    prev_y = None
+    for rec in records:
+        x = rec.get("center_x")
+        y = rec.get("center_y")
+        if x is None or y is None:
+            fwd.append(dict(rec))
+            continue
+        x = float(x)
+        y = float(y)
+        if prev_x is None:
+            fx, fy = x, y
+        else:
+            fx = alpha * x + (1.0 - alpha) * prev_x
+            fy = alpha * y + (1.0 - alpha) * prev_y
+        prev_x, prev_y = fx, fy
+        out_rec = dict(rec)
+        out_rec["center_x"] = fx
+        out_rec["center_y"] = fy
+        fwd.append(out_rec)
+
+    bwd = []
+    prev_x = None
+    prev_y = None
+    for rec in reversed(fwd):
+        x = rec.get("center_x")
+        y = rec.get("center_y")
+        if x is None or y is None:
+            bwd.append(dict(rec))
+            continue
+        x = float(x)
+        y = float(y)
+        if prev_x is None:
+            fx, fy = x, y
+        else:
+            fx = alpha * x + (1.0 - alpha) * prev_x
+            fy = alpha * y + (1.0 - alpha) * prev_y
+        prev_x, prev_y = fx, fy
+        out_rec = dict(rec)
+        out_rec["center_x"] = fx
+        out_rec["center_y"] = fy
+        bwd.append(out_rec)
+    bwd.reverse()
+
+    combined = []
+    for a, b in zip(fwd, bwd):
+        if a.get("center_x") is None or a.get("center_y") is None:
+            combined.append(dict(a))
+            continue
+        out_rec = dict(a)
+        out_rec["center_x"] = (float(a["center_x"]) + float(b["center_x"])) / 2.0
+        out_rec["center_y"] = (float(a["center_y"]) + float(b["center_y"])) / 2.0
+        combined.append(out_rec)
+    return combined
+
+
 def preprocess_continuous(
     jsonl_path: Path,
     instance_id,
@@ -118,6 +338,7 @@ def preprocess_continuous(
     time_shift: int = 0,
     start_frame: int | None = None,
     end_frame: int | None = None,
+    video_path: Path | None = None,
 ):
     detections_by_frame = load_detections(jsonl_path)
     if not detections_by_frame:
@@ -142,11 +363,32 @@ def preprocess_continuous(
     start_candidates = [
         rec for rec in first_frame_recs if _instance_matches(rec.get("instance_id"), instance_id)
     ]
-    if not start_candidates:
-        raise RuntimeError(
-            f"No instance_id {instance_id} found in first frame ({first_frame})."
+    default_rec = start_candidates[0] if start_candidates else None
+    current = None
+    if video_path is not None:
+        action, rec = _select_instance_with_click(
+            first_frame_recs,
+            video_path,
+            first_frame,
+            default_rec=default_rec,
+            allow_keep=default_rec is not None,
+            last_center=(float(default_rec["center_x"]), float(default_rec["center_y"]))
+            if default_rec and default_rec.get("center_x") is not None and default_rec.get("center_y") is not None
+            else None,
         )
-    current = start_candidates[0]
+        if action == "select":
+            current = rec
+            instance_id = _normalize_instance_id(rec.get("instance_id"))
+        elif action == "keep" and default_rec is not None:
+            current = default_rec
+        elif action == "abort":
+            raise RuntimeError("Selection aborted.")
+    if current is None:
+        if not start_candidates:
+            raise RuntimeError(
+                f"No instance_id {instance_id} found in first frame ({first_frame})."
+            )
+        current = start_candidates[0]
     cx = current.get("center_x")
     cy = current.get("center_y")
     if cx is None or cy is None:
@@ -154,6 +396,7 @@ def preprocess_continuous(
     last_center = (float(cx), float(cy))
     last_frame = first_frame
     miss_count = 0
+    frames_since_selection = 0
 
     output = [current]
 
@@ -163,7 +406,61 @@ def preprocess_continuous(
     else:
         frames_iter = frames[start_idx + 1:]
     for frame in frames_iter:
+        frames_since_selection += 1
         candidates = detections_by_frame.get(frame, [])
+
+        best_rec = None
+        best_dist = None
+        for rec in candidates:
+            rx = rec.get("center_x")
+            ry = rec.get("center_y")
+            if rx is None or ry is None:
+                continue
+            dist = math.hypot(float(rx) - last_center[0], float(ry) - last_center[1])
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_rec = rec
+
+        if video_path is not None and frames_since_selection >= 100:
+            action, rec = _select_instance_with_click(
+                candidates=candidates,
+                video_path=video_path,
+                frame_idx=frame,
+                default_rec={
+                    "center_x": last_center[0],
+                    "center_y": last_center[1],
+                    "instance_id": instance_id,
+                },
+                allow_keep=True,
+                last_center=last_center,
+                current_center=(
+                    (float(best_rec["center_x"]), float(best_rec["center_y"]))
+                    if best_rec is not None
+                    else last_center
+                ),
+            )
+            if action == "select" and rec is not None:
+                instance_id = _normalize_instance_id(rec.get("instance_id"))
+                last_center = (float(rec["center_x"]), float(rec["center_y"]))
+                last_frame = frame
+                miss_count = 0
+                frames_since_selection = 0
+            elif action == "keep":
+                output.append(
+                    {
+                        "frame": frame,
+                        "instance_id": instance_id,
+                        "center_x": last_center[0],
+                        "center_y": last_center[1],
+                        "bbox": None,
+                    }
+                )
+                last_frame = frame
+                miss_count = 0
+                frames_since_selection = 0
+                continue
+            elif action == "abort":
+                raise RuntimeError("Selection aborted.")
         f = frame - last_frame
         radius = float(radius_per_frame) * float(f)
         print(
@@ -186,18 +483,6 @@ def preprocess_continuous(
         else:
             print("  candidates: none")
 
-        best_rec = None
-        best_dist = None
-        for rec in candidates:
-            rx = rec.get("center_x")
-            ry = rec.get("center_y")
-            if rx is None or ry is None:
-                continue
-            dist = math.hypot(float(rx) - last_center[0], float(ry) - last_center[1])
-            if best_dist is None or dist < best_dist:
-                best_dist = dist
-                best_rec = rec
-
         if best_rec is not None:
             if best_dist is not None and best_dist <= radius:
                 print(
@@ -216,18 +501,75 @@ def preprocess_continuous(
         miss_count += 1
         print(f"  -> miss_count={miss_count}")
         if miss_count > max_absence:
-            new_id, new_rec = _prompt_for_instance(
-                candidates, frame, last_frame, max_absence
-            )
-            if new_rec is None:
-                raise RuntimeError(
-                    f"No continuation after {max_absence} frames at frame {frame} "
-                    f"(last detection frame {last_frame})."
+            if not candidates:
+                output.append(
+                    {
+                        "frame": frame,
+                        "instance_id": instance_id,
+                        "center_x": last_center[0],
+                        "center_y": last_center[1],
+                        "bbox": None,
+                    }
                 )
+                last_frame = frame
+                miss_count = 0
+                continue
+            new_id = None
+            new_rec = None
+            if video_path is not None:
+                action, rec = _select_instance_with_click(
+                    candidates,
+                    video_path,
+                    frame,
+                    default_rec=None,
+                    allow_keep=True,
+                    last_center=last_center,
+                    current_center=(
+                        (float(best_rec["center_x"]), float(best_rec["center_y"]))
+                        if best_rec is not None
+                        else last_center
+                    ),
+                )
+                if action == "keep":
+                    output.append(
+                        {
+                            "frame": frame,
+                            "instance_id": instance_id,
+                            "center_x": last_center[0],
+                            "center_y": last_center[1],
+                            "bbox": None,
+                        }
+                    )
+                    last_frame = frame
+                    miss_count = 0
+                    continue
+                if action == "select":
+                    new_rec = rec
+                    new_id = _normalize_instance_id(rec.get("instance_id"))
+                if action == "abort":
+                    raise RuntimeError("Selection aborted.")
+            if new_rec is None:
+                new_id, new_rec = _prompt_for_instance(
+                    candidates, frame, last_frame, max_absence
+                )
+            if new_rec is None:
+                output.append(
+                    {
+                        "frame": frame,
+                        "instance_id": instance_id,
+                        "center_x": last_center[0],
+                        "center_y": last_center[1],
+                        "bbox": None,
+                    }
+                )
+                last_frame = frame
+                miss_count = 0
+                continue
             instance_id = new_id
             last_center = (float(new_rec["center_x"]), float(new_rec["center_y"]))
             last_frame = frame
             miss_count = 0
+            frames_since_selection = 0
             output.append(new_rec)
             continue
         output.append(
@@ -274,6 +616,11 @@ def preprocess_continuous(
                 output[i]["center_x"] = xa + (xb - xa) * t
                 output[i]["center_y"] = ya + (yb - ya) * t
 
+    # Preserve un-averaged, un-filtered centers
+    for rec in output:
+        rec["raw_center_x"] = rec.get("center_x")
+        rec["raw_center_y"] = rec.get("center_y")
+
     # Centered moving average of centers (no temporal delay)
     if average_frame_count < 1:
         average_frame_count = 1
@@ -299,68 +646,10 @@ def preprocess_continuous(
             out_rec["center_y"] = sy / count
         smoothed.append(out_rec)
 
-    # Symmetric low-pass (forward-backward) to avoid phase delay
-    alpha = float(lowpass_alpha)
-    if alpha < 0.0:
-        alpha = 0.0
-    if alpha > 1.0:
-        alpha = 1.0
-    if alpha > 0.0 and len(smoothed) > 1:
-        fwd = []
-        prev_x = None
-        prev_y = None
-        for rec in smoothed:
-            x = rec.get("center_x")
-            y = rec.get("center_y")
-            if x is None or y is None:
-                fwd.append(dict(rec))
-                continue
-            x = float(x)
-            y = float(y)
-            if prev_x is None:
-                fx, fy = x, y
-            else:
-                fx = alpha * x + (1.0 - alpha) * prev_x
-                fy = alpha * y + (1.0 - alpha) * prev_y
-            prev_x, prev_y = fx, fy
-            out_rec = dict(rec)
-            out_rec["center_x"] = fx
-            out_rec["center_y"] = fy
-            fwd.append(out_rec)
-
-        bwd = []
-        prev_x = None
-        prev_y = None
-        for rec in reversed(fwd):
-            x = rec.get("center_x")
-            y = rec.get("center_y")
-            if x is None or y is None:
-                bwd.append(dict(rec))
-                continue
-            x = float(x)
-            y = float(y)
-            if prev_x is None:
-                fx, fy = x, y
-            else:
-                fx = alpha * x + (1.0 - alpha) * prev_x
-                fy = alpha * y + (1.0 - alpha) * prev_y
-            prev_x, prev_y = fx, fy
-            out_rec = dict(rec)
-            out_rec["center_x"] = fx
-            out_rec["center_y"] = fy
-            bwd.append(out_rec)
-        bwd.reverse()
-
-        combined = []
-        for a, b in zip(fwd, bwd):
-            if a.get("center_x") is None or a.get("center_y") is None:
-                combined.append(dict(a))
-                continue
-            out_rec = dict(a)
-            out_rec["center_x"] = (float(a["center_x"]) + float(b["center_x"])) / 2.0
-            out_rec["center_y"] = (float(a["center_y"]) + float(b["center_y"])) / 2.0
-            combined.append(out_rec)
-        smoothed = combined
+    # Preserve pre-lowpass (moving-averaged) centers
+    for rec in smoothed:
+        rec["avg_center_x"] = rec.get("center_x")
+        rec["avg_center_y"] = rec.get("center_y")
 
     # Optional: fix Y to average across all frames
     if fix_y and smoothed:
@@ -586,20 +875,32 @@ def main():
     grading_path = video_path.with_name(f"{video_path.stem}_grading.json")
     grading = load_or_create_grading(grading_path)
     instance_id = _normalize_instance_id(args.instance)
-    preprocess_continuous(
-        jsonl_path,
-        instance_id=instance_id,
-        radius_per_frame=args.radius,
-        average_frame_count=args.averageframecount,
-        lowpass_alpha=args.lowpass_alpha,
-        fix_y=args.fix_y,
-        time_shift=args.time_shift,
-        start_frame=args.start_frame,
-        end_frame=args.end_frame,
-        out_path=jsonl_path.with_name("input_continuous.jsonl"),
-    )
-    continuous_path = jsonl_path.with_name("input_continuous.jsonl")
+    continuous_path = jsonl_path.with_name(f"{video_path.stem}_tracking.jsonl")
+    if continuous_path.exists():
+        print(f"[tracking] using existing {continuous_path}")
+    else:
+        preprocess_continuous(
+            jsonl_path,
+            instance_id=instance_id,
+            radius_per_frame=args.radius,
+            average_frame_count=args.averageframecount,
+            lowpass_alpha=args.lowpass_alpha,
+            fix_y=args.fix_y,
+            time_shift=args.time_shift,
+            start_frame=args.start_frame,
+            end_frame=args.end_frame,
+            out_path=continuous_path,
+            video_path=video_path,
+        )
     continuous_by_frame = load_continuous_map(continuous_path)
+    if args.lowpass_alpha and continuous_by_frame:
+        ordered_frames = sorted(continuous_by_frame.keys())
+        ordered_recs = [continuous_by_frame[f] for f in ordered_frames]
+        ordered_recs = apply_lowpass_filter(ordered_recs, args.lowpass_alpha)
+        continuous_by_frame = {
+            int(rec.get("frame", ordered_frames[i])): rec
+            for i, rec in enumerate(ordered_recs)
+        }
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
