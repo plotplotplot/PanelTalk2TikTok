@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import cv2
 import numpy as np
+from tqdm import tqdm
 
 try:
     import motive2d_engine as _cg
@@ -43,9 +44,44 @@ def parse_levels(value: str):
     return ib, iw, gamma, ob, ow
 
 
+def parse_tone_edges(value: str):
+    parts = [p.strip() for p in value.split(",")]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("Tone edges must be in form shadow_end,highlight_start")
+    try:
+        sh_end, hi_start = (float(p) for p in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Tone edges must be numeric")
+    if not (0.0 <= sh_end < hi_start <= 1.0):
+        raise argparse.ArgumentTypeError("Tone edges must satisfy 0 <= shadow_end < highlight_start <= 1")
+    return sh_end, hi_start
+
+
 def smoothstep(edge0, edge1, x):
     t = np.clip((x - edge0) / (edge1 - edge0), 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
+
+
+def apply_tonal_adjustment(frame_bgr, shadows, midtones, highlights, tone_edges):
+    frame = frame_bgr.astype(np.float32)
+    b, g, r = cv2.split(frame)
+    luma = (0.0722 * b + 0.7152 * g + 0.2126 * r) / 255.0
+
+    sh_end, hi_start = tone_edges
+    w_sh = 1.0 - smoothstep(0.0, sh_end, luma)
+    w_hi = smoothstep(hi_start, 1.0, luma)
+    w_mid = 1.0 - (w_sh + w_hi)
+    w_mid = np.clip(w_mid, 0.0, 1.0)
+
+    sh = np.array(shadows, dtype=np.float32) * 255.0
+    mi = np.array(midtones, dtype=np.float32) * 255.0
+    hi = np.array(highlights, dtype=np.float32) * 255.0
+
+    for chan, idx in ((b, 0), (g, 1), (r, 2)):
+        chan += sh[idx] * w_sh + mi[idx] * w_mid + hi[idx] * w_hi
+
+    out = cv2.merge((b, g, r))
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 def apply_grading(
@@ -57,6 +93,7 @@ def apply_grading(
     brightness=0.0,
     contrast=1.0,
     saturation=1.0,
+    tone_edges=None,
 ):
     if _cg is not None:
         return _cg.apply_grading(
@@ -69,6 +106,9 @@ def apply_grading(
             float(contrast),
             float(saturation),
         )
+    raise RuntimeError(
+        "Color grading engine unavailable: motive2d_engine / motive2d_color_grading failed to import."
+    )
     frame = frame_bgr.astype(np.float32)
     b, g, r = cv2.split(frame)
     # Luma for weighting
@@ -128,6 +168,7 @@ def process_image(input_path: Path, output_path: Path, args):
         brightness=args.brightness,
         contrast=args.contrast,
         saturation=args.saturation,
+        tone_edges=args.tone_edges,
     )
     if not cv2.imwrite(str(output_path), out):
         raise RuntimeError(f"Failed to write image: {output_path}")
@@ -150,27 +191,31 @@ def process_video(input_path: Path, output_path: Path, args):
     if args.visualize:
         cv2.namedWindow("grading_preview", cv2.WINDOW_NORMAL)
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        out = apply_grading(
-            frame,
-            shadows=args.shadows,
-            midtones=args.midtones,
-            highlights=args.highlights,
-            levels=args.levels,
-            brightness=args.brightness,
-            contrast=args.contrast,
-            saturation=args.saturation,
-        )
-        if out is not None and out.ndim == 3 and out.shape[2] == 4:
-            out = cv2.cvtColor(out, cv2.COLOR_BGRA2BGR)
-        writer.write(out)
-        if args.visualize:
-            cv2.imshow("grading_preview", out)
-            if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    with tqdm(total=total_frames, desc="Grading video", unit="frame") as pbar:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
                 break
+            out = apply_grading(
+                frame,
+                shadows=args.shadows,
+                midtones=args.midtones,
+                highlights=args.highlights,
+                levels=args.levels,
+                brightness=args.brightness,
+                contrast=args.contrast,
+                saturation=args.saturation,
+                tone_edges=args.tone_edges,
+            )
+            if out is not None and out.ndim == 3 and out.shape[2] == 4:
+                out = cv2.cvtColor(out, cv2.COLOR_BGRA2BGR)
+            writer.write(out)
+            if args.visualize:
+                cv2.imshow("grading_preview", out)
+                if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+                    break
+            pbar.update(1)
 
     cap.release()
     writer.release()
@@ -328,6 +373,7 @@ def edit_grading(video_path: Path):
                 brightness=brightness,
                 contrast=contrast,
                 saturation=saturation,
+                tone_edges=None,
             )
         else:
             preview = frame
@@ -413,7 +459,18 @@ def main():
         default=1.0,
         help="Saturation multiplier (>=0).",
     )
+    parser.add_argument(
+        "--tone-edges",
+        type=parse_tone_edges,
+        default=None,
+        help="Shadow/highlight boundaries (0..1 luma): shadow_end,highlight_start. "
+        "If set, tonal weighting is applied after levels/gamma/brightness/contrast.",
+    )
     args = parser.parse_args()
+    if args.tone_edges is not None:
+        raise RuntimeError(
+            "--tone-edges is not supported in GPU-only mode (motive2d engine only)."
+        )
 
     input_path = Path(args.input)
     output_path = Path(args.output) if args.output else None

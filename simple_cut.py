@@ -527,9 +527,13 @@ def main():
     print("Loading segment data...")
     basefilename = "".join(args.video.split(".")[:-1])
     def _strip_suffixes(name):
-        for suf in ("_graded", "_stable"):
-            if name.endswith(suf):
-                name = name[: -len(suf)]
+        changed = True
+        while changed:
+            changed = False
+            for suf in ("_graded", "_stable"):
+                if name.endswith(suf):
+                    name = name[: -len(suf)]
+                    changed = True
         return name
 
     json_base = _strip_suffixes(basefilename)
@@ -573,9 +577,12 @@ def main():
         word_segment_times, prepend_ms=args.prepend_ms
     )
     
-    # Output naming: default to {infile}_final.mp4 in same dir as input
+    # Output naming: if CSV provided, name after CSV; otherwise default to {infile}_final.mp4
     out_dir = os.path.dirname(args.video) or "."
     in_base = os.path.splitext(os.path.basename(args.video))[0]
+    if args.output is None and used_csv_path:
+        csv_root, _ = os.path.splitext(used_csv_path)
+        args.output = f"{csv_root}.mp4"
     if args.output is None:
         args.output = os.path.join(out_dir, f"{in_base}_final.mp4")
     temp_video = os.path.join(out_dir, f"{in_base}_temp.mp4")
@@ -586,6 +593,7 @@ def main():
         print(f"Temp audio exists, skipping audio processing: {temp_audio}")
     elif not args.skip_audio:
         print("\n=== Processing Audio ===")
+        print(f"Audio source: {audiofilename}")
         extract_audio_segments.extract_audio_segments(
             word_segment_times,
             audiofilename,
