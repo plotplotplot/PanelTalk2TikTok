@@ -124,6 +124,20 @@ def _load_processed_frame(video_path: Path, frame_idx: int):
     return None
 
 
+def _load_frame_from_video(video_path: Path, frame_idx: int):
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return None
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, float(frame_idx))
+        ok, frame = cap.read()
+        if not ok:
+            return None
+        return frame
+    finally:
+        cap.release()
+
+
 def _select_instance_with_click(
     candidates,
     video_path: Path,
@@ -134,6 +148,8 @@ def _select_instance_with_click(
     current_center=None,
 ):
     img = _load_processed_frame(video_path, frame_idx)
+    if img is None:
+        img = _load_frame_from_video(video_path, frame_idx)
     if img is None:
         return None, None
 
@@ -342,6 +358,9 @@ def preprocess_continuous(
 ):
     detections_by_frame = load_detections(jsonl_path)
     if not detections_by_frame:
+        print(
+            f"No detections found. JSONL path checked: {jsonl_path} (exists={jsonl_path.exists()})"
+        )
         raise RuntimeError("No detections found in JSONL.")
 
     frames = sorted(detections_by_frame.keys())
@@ -385,10 +404,24 @@ def preprocess_continuous(
             raise RuntimeError("Selection aborted.")
     if current is None:
         if not start_candidates:
-            raise RuntimeError(
-                f"No instance_id {instance_id} found in first frame ({first_frame})."
-            )
-        current = start_candidates[0]
+            available_ids = []
+            for rec in first_frame_recs:
+                rec_id = rec.get("instance_id")
+                if rec_id not in available_ids:
+                    available_ids.append(rec_id)
+            if len(available_ids) == 1 and first_frame_recs:
+                chosen = first_frame_recs[0]
+                instance_id = _normalize_instance_id(chosen.get("instance_id"))
+                print(
+                    f"instance_id {instance_id} auto-selected (only option in frame {first_frame})."
+                )
+                current = chosen
+            else:
+                raise RuntimeError(
+                    f"No instance_id {instance_id} found in first frame ({first_frame})."
+                )
+        else:
+            current = start_candidates[0]
     cx = current.get("center_x")
     cy = current.get("center_y")
     if cx is None or cy is None:
@@ -872,6 +905,17 @@ def main():
         raise FileNotFoundError(video_path)
 
     jsonl_path = video_path.with_suffix(".jsonl")
+    if not jsonl_path.exists() and video_path.stem.endswith("_graded"):
+        # Fall back to ungraded JSONL if the input video is a graded variant.
+        ungraded_stem = video_path.stem[: -len("_graded")]
+        fallback_jsonl = video_path.with_name(f"{ungraded_stem}.jsonl")
+        if fallback_jsonl.exists():
+            jsonl_path = fallback_jsonl
+
+    if jsonl_path.exists():
+        print(f"Found JSONL: {jsonl_path}")
+    else:
+        print(f"JSONL not found: {jsonl_path}")
     grading_path = video_path.with_name(f"{video_path.stem}_grading.json")
     grading = load_or_create_grading(grading_path)
     instance_id = _normalize_instance_id(args.instance)

@@ -417,9 +417,10 @@ def main():
 
     # Load CSV/JSON data
     print("Loading segment data...")
-    basefilename = ''.join(args.video.split('.')[:-1])
-    jsonfilename = basefilename+".json"
-    audiofilename = basefilename+".wav"
+    basefilename = os.path.splitext(args.video)[0]
+    json_base = simple_cut.strip_standard_suffixes(basefilename)
+    jsonfilename = json_base + ".json"
+    audiofilename = json_base + ".wav"
     use_csv = not args.no_csv
     if use_csv or args.use_csv:
         csvfilename = jsonfilename + ".csv"

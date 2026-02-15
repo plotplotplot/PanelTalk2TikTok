@@ -9,6 +9,7 @@ import json
 import math
 import os
 import subprocess
+import wave
 
 import cv2
 import numpy as np
@@ -152,6 +153,33 @@ def precompute_segments(word_segment_times, fps, group_size=6, max_chars=None, s
     
     return precomputed_segments
 
+def postpend_silence_to_wav(path, seconds):
+    """
+    Append silence to a WAV file in-place using a temp file.
+    """
+    if seconds <= 0:
+        return False
+    tmp_path = path + ".silence.tmp"
+    with wave.open(path, "rb") as rf:
+        params = rf.getparams()
+        nchannels = params.nchannels
+        sampwidth = params.sampwidth
+        framerate = params.framerate
+        silence_frames = int(round(seconds * framerate))
+        if silence_frames <= 0:
+            return False
+        with wave.open(tmp_path, "wb") as wf:
+            wf.setparams(params)
+            while True:
+                data = rf.readframes(16384)
+                if not data:
+                    break
+                wf.writeframes(data)
+            silence_byte = b"\x80" if sampwidth == 1 else b"\x00"
+            wf.writeframes(silence_byte * silence_frames * nchannels * sampwidth)
+    os.replace(tmp_path, path)
+    return True
+
 def add_text_with_shadow(frame, text, font_scale=1.8, text_height_from_bottom=300):
     """
     Add text with drop shadow to a frame.
@@ -241,6 +269,20 @@ def reencode_video(video_file, final_output):
         print(f"Error re-encoding video: {e}")
         return False
 
+STANDARD_VIDEO_SUFFIXES = ("_graded", "_stable", "_trimmed", "_trim")
+
+
+def strip_standard_suffixes(name: str) -> str:
+    changed = True
+    while changed:
+        changed = False
+        for suf in STANDARD_VIDEO_SUFFIXES:
+            if name.endswith(suf):
+                name = name[: -len(suf)]
+                changed = True
+    return name
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract video and audio segments based on CSV time periods"
@@ -260,7 +302,7 @@ def main():
     parser.add_argument(
         "--text-height",
         type=int,
-        default=300,
+        default=650,
         help="Height of text from bottom (default: 300)"
     )
     parser.add_argument(
@@ -278,7 +320,7 @@ def main():
     parser.add_argument(
         "--font-size",
         type=int,
-        default=36,
+        default=50,
         help="TTF font size in pixels (default: 36)",
     )
     parser.add_argument(
@@ -389,6 +431,25 @@ def main():
         help="Crossfade length for audio stitching in samples (default: 3000)"
     )
     parser.add_argument(
+        "--postpend-silence-seconds",
+        type=float,
+        default=0.5,
+        help="Seconds of silence to postpend to temp audio (default: 0.5)",
+    )
+    parser.add_argument(
+        "--postpend-silence",
+        dest="postpend_silence",
+        action="store_true",
+        default=True,
+        help="Postpend silence to the temp audio file (default: on)",
+    )
+    parser.add_argument(
+        "--no-postpend-silence",
+        dest="postpend_silence",
+        action="store_false",
+        help="Disable postpending silence to the temp audio file",
+    )
+    parser.add_argument(
         "--group-size",
         type=int,
         default=6,
@@ -428,6 +489,12 @@ def main():
         type=int,
         default=20,
         help="Extend each segment end by this many ms (default: 20)",
+    )
+    parser.add_argument(
+        "--audio-delay-ms",
+        type=float,
+        default=0.0,
+        help="Shift all audio + subtitle timings by this many ms (positive=delay, negative=advance).",
     )
     parser.add_argument(
         "--prepend-ms",
@@ -484,13 +551,13 @@ def main():
     parser.add_argument(
         "--width",
         type=int,
-        default=0,
+        default=1080,
         help="Output width in pixels (enable cropping if > 0)",
     )
     parser.add_argument(
         "--height",
         type=int,
-        default=0,
+        default=1920,
         help="Output height in pixels (enable cropping if > 0)",
     )
     parser.add_argument(
@@ -525,18 +592,8 @@ def main():
 
     # Load CSV/JSON data
     print("Loading segment data...")
-    basefilename = "".join(args.video.split(".")[:-1])
-    def _strip_suffixes(name):
-        changed = True
-        while changed:
-            changed = False
-            for suf in ("_graded", "_stable"):
-                if name.endswith(suf):
-                    name = name[: -len(suf)]
-                    changed = True
-        return name
-
-    json_base = _strip_suffixes(basefilename)
+    basefilename = os.path.splitext(args.video)[0]
+    json_base = strip_standard_suffixes(basefilename)
     jsonfilename = json_base + ".json"
     audiofilename = json_base + ".wav"
 
@@ -576,6 +633,24 @@ def main():
     word_segment_times = segment_utils.prepend_segments(
         word_segment_times, prepend_ms=args.prepend_ms
     )
+    if args.audio_delay_ms:
+        delay_sec = float(args.audio_delay_ms) / 1000.0
+        shifted = []
+        for seg in word_segment_times:
+            curr = dict(seg)
+            start = float(curr.get("start", 0.0)) + delay_sec
+            end = float(curr.get("end", start)) + delay_sec
+            if end <= 0:
+                continue
+            if start < 0:
+                start = 0.0
+            curr["start"] = start
+            curr["end"] = max(start, end)
+            shifted.append(curr)
+        word_segment_times = segment_utils.align_segments_to_sample_boundaries(
+            shifted, sr
+        )
+        print(f"Applied audio delay: {args.audio_delay_ms:.1f} ms")
     
     # Output naming: if CSV provided, name after CSV; otherwise default to {infile}_final.mp4
     out_dir = os.path.dirname(args.video) or "."
@@ -600,6 +675,14 @@ def main():
             temp_audio,
             fade_samples=args.fade_samples
         )
+        if args.postpend_silence and args.postpend_silence_seconds > 0:
+            try:
+                if postpend_silence_to_wav(temp_audio, args.postpend_silence_seconds):
+                    print(
+                        f"Postpended {args.postpend_silence_seconds:.3f}s of silence to: {temp_audio}"
+                    )
+            except Exception as e:
+                print(f"Warning: failed to postpend silence to temp audio: {e}")
     
     # Process video
     if not args.skip_video:
@@ -725,17 +808,51 @@ def main():
             raise ValueError("--brightness-mult must be in 'B,G,R' float format")
 
         includes = None
-        includes_path = os.path.splitext(args.video)[0] + "_includes.json"
-        if os.path.exists(includes_path):
+        includes_candidates = []
+        includes_base = strip_standard_suffixes(os.path.splitext(args.video)[0])
+        includes_candidates.append(includes_base + "_includes.json")
+        if used_csv_path:
+            csv_base = strip_standard_suffixes(os.path.splitext(used_csv_path)[0])
+            includes_candidates.append(csv_base + "_includes.json")
+
+        includes_path = next((p for p in includes_candidates if os.path.exists(p)), None)
+        if includes_path:
+            print(f"Includes found: {includes_path}")
             try:
                 with open(includes_path, "r", encoding="utf-8") as f:
                     raw_includes = json.load(f)
                 includes = []
                 base_dir = os.path.dirname(includes_path)
                 for rec in raw_includes:
+                    text = rec.get("text", "")
                     fname = rec.get("filename", "")
-                    if not fname:
+                    if not fname and not text:
                         continue
+                    pos = rec.get("position", [0.0, 0.0])
+                    x = float(pos[0]) if len(pos) > 0 else 0.0
+                    y = float(pos[1]) if len(pos) > 1 else 0.0
+                    base_rec = {
+                        "x": x,
+                        "y": y,
+                        "start": float(rec.get("startTime", 0.0)),
+                        "end": float(rec.get("endTime", 0.0)),
+                        "fade": float(rec.get("fade", 1.0)) if rec.get("fade") is not None else 1.0,
+                        "fade_in": float(rec.get("fadeIn", 0.0)) if rec.get("fadeIn") is not None else 0.0,
+                        "fade_out": float(rec.get("fadeOut", 0.0)) if rec.get("fadeOut") is not None else 0.0,
+                    }
+                    if text:
+                        color = rec.get("color", [255, 255, 255])
+                        height = float(rec.get("height", 120))
+                        includes.append(
+                            {
+                                **base_rec,
+                                "text": str(text),
+                                "color": color,
+                                "height": height,
+                            }
+                        )
+                        continue
+
                     img_path = os.path.join(base_dir, fname)
                     img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
                     if img is None:
@@ -745,20 +862,32 @@ def main():
                         scale = h / img.shape[0]
                         w = max(1, int(round(img.shape[1] * scale)))
                         img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
-                    pos = rec.get("position", [0.0, 0.0])
-                    x = float(pos[0]) if len(pos) > 0 else 0.0
-                    y = float(pos[1]) if len(pos) > 1 else 0.0
                     includes.append(
                         {
+                            **base_rec,
                             "image": img,
-                            "x": x,
-                            "y": y,
-                            "start": float(rec.get("startTime", 0.0)),
-                            "end": float(rec.get("endTime", 0.0)),
                         }
                     )
             except Exception as e:
                 print(f"Warning: failed to load includes: {e}")
+        else:
+            print(f"Includes not found: {', '.join(includes_candidates)}")
+
+        if includes:
+            print(f"Includes loaded: {len(includes)}")
+            for inc in includes:
+                inc_type = "text" if inc.get("text") else "image"
+                summary = [
+                    f"type={inc_type}",
+                    f"start={inc.get('start')}",
+                    f"end={inc.get('end')}",
+                    f"pos=({inc.get('x')},{inc.get('y')})",
+                ]
+                if inc_type == "text":
+                    summary.append(f"text={inc.get('text')!r}")
+                    summary.append(f"color={inc.get('color')}")
+                    summary.append(f"height={inc.get('height')}")
+                print("Include: " + " ".join(summary))
 
         extract_video_segments(
             precomputed_segments,

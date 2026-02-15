@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 from tqdm import tqdm
-from collections import deque
 
 import subtitle_render
 
@@ -87,7 +86,35 @@ def extract_video_segments(
     # Process each segment
     video_shift_frames = int(video_shift_frames)
     fade_frames = max(0, int(fade_frames))
-    fade_queue = deque(maxlen=fade_frames)
+    # output_history removed; fades are now per-include only
+    total_output_frames = sum(
+        max(0, seg["end_frame"] - seg["start_frame"]) for seg in precomputed_segments
+    )
+    output_duration_s = total_output_frames / fps if fps else 0.0
+    if includes and output_duration_s > 0:
+        for inc in includes:
+            try:
+                start = float(inc.get("start", 0.0))
+            except Exception:
+                start = 0.0
+            try:
+                end = float(inc.get("end", 0.0))
+            except Exception:
+                end = 0.0
+            if start < 0:
+                start = output_duration_s + start
+            if end < 0:
+                end = output_duration_s + end
+            start = max(0.0, min(output_duration_s, start))
+            end = max(0.0, min(output_duration_s, end))
+            if start > end:
+                print(
+                    f"Warning: include start > end after normalization "
+                    f"({start:.3f}s > {end:.3f}s). Swapping."
+                )
+                start, end = end, start
+            inc["start"] = start
+            inc["end"] = end
 
     def _prepare_frame(frame, frame_idx):
         if crop_config is not None:
@@ -102,52 +129,148 @@ def extract_video_segments(
             mult = brightness_mult
             frame = np.clip(frame.astype(np.float32) * mult, 0, 255).astype(frame.dtype)
 
-        # Apply includes (image overlays) before subtitles
-        if includes:
-            t = frame_idx / fps
-            for inc in includes:
-                if t < inc["start"] or t > inc["end"]:
-                    continue
-                fade_dur = 1.0
-                alpha_mult = 1.0
+        return frame
+
+    def _apply_includes(frame, out_frame_idx):
+        if not includes:
+            return frame
+        t = out_frame_idx / fps if fps else 0.0
+        for inc in includes:
+            if t < inc["start"] or t > inc["end"]:
+                continue
+            fade_dur = 1.0
+            alpha_mult = 1.0
+            fade_override = None
+            if inc.get("fade") is not None:
+                try:
+                    fade_override = max(0.0, float(inc.get("fade", 0.0)))
+                except Exception:
+                    fade_override = None
+            fade_in = None
+            fade_out = None
+            if inc.get("fade_in") is not None:
+                try:
+                    fade_in = max(0.0, float(inc.get("fade_in", 0.0)))
+                except Exception:
+                    fade_in = None
+            if inc.get("fade_out") is not None:
+                try:
+                    fade_out = max(0.0, float(inc.get("fade_out", 0.0)))
+                except Exception:
+                    fade_out = None
+            if fade_override is not None and fade_override >= 0:
+                fade_in = fade_out = fade_override
+            use_custom_fade = (fade_in is not None) or (fade_out is not None)
+            if not use_custom_fade:
                 if t < inc["start"] + fade_dur:
                     alpha_mult = max(0.0, min(1.0, (t - inc["start"]) / fade_dur))
                 elif t > inc["end"] - fade_dur:
                     alpha_mult = max(0.0, min(1.0, (inc["end"] - t) / fade_dur))
-                img = inc["image"]
+            else:
+                if fade_in and fade_in > 0:
+                    if t < inc["start"] + fade_in:
+                        alpha_mult = max(0.0, min(1.0, (t - inc["start"]) / fade_in))
+                if fade_out and fade_out > 0:
+                    if t > inc["end"] - fade_out:
+                        alpha_mult = max(0.0, min(1.0, (inc["end"] - t) / fade_out))
+            if inc.get("text"):
+                # Lazy-render text include once per output size.
+                if "text_overlay" not in inc:
+                    text = str(inc.get("text", ""))
+                    words = text.splitlines() if text else [""]
+                    color = inc.get("color", [255, 255, 255])
+                    if isinstance(color, (list, tuple)) and len(color) >= 3:
+                        r, g, b = int(color[0]), int(color[1]), int(color[2])
+                    else:
+                        r, g, b = 255, 255, 255
+                    # Render via the same subtitle renderer for consistent font/style.
+                    overlay_full, mask_full, _ = subtitle_render.render_grouped_subtitle_overlay(
+                        frame_shape=(output_height, output_width, 3),
+                        words=words,
+                        active_idx=-1,
+                        font_scale=font_scale,
+                        text_height_from_bottom=int(round(output_height / 2)),
+                        text_height_from_bottom_2=None,
+                        subtitle_lines=1,
+                        font_ttf=font_ttf,
+                        subtitle_bg=False,
+                        subtitle_bg_color=(0, 0, 0),
+                        subtitle_bg_alpha=0.0,
+                        subtitle_bg_pad=0,
+                        subtitle_bg_full_width=False,
+                        subtitle_bg_height=0,
+                        subtitle_bg_offset_y=0,
+                        shadow_size=0,
+                        shadow_offset_x=0,
+                        shadow_offset_y=0,
+                        dilate_size=subtitle_dilate_size,
+                        dilate_color=subtitle_dilate_color,
+                        text_color=(b, g, r),
+                        highlight_color=(b, g, r),
+                        shadow_color=(0, 0, 0),
+                    )
+                    ys, xs = np.where(mask_full > 0)
+                    if ys.size == 0 or xs.size == 0:
+                        inc["text_overlay"] = None
+                        inc["text_mask"] = None
+                    else:
+                        y1, y2 = ys.min(), ys.max() + 1
+                        x1, x2 = xs.min(), xs.max() + 1
+                        inc["text_overlay"] = overlay_full[y1:y2, x1:x2]
+                        inc["text_mask"] = mask_full[y1:y2, x1:x2]
+
+                img = inc.get("text_overlay")
+                mask = inc.get("text_mask")
+                if img is None or mask is None:
+                    continue
+                ih, iw = img.shape[:2]
+            else:
+                img = inc.get("image")
                 if img is None:
                     continue
                 ih, iw = img.shape[:2]
-                x = int(round(inc["x"] * output_width - iw / 2.0))
-                y = int(round(inc["y"] * output_height - ih / 2.0))
-                x2 = min(output_width, x + iw)
-                y2 = min(output_height, y + ih)
-                if x2 <= 0 or y2 <= 0 or x >= output_width or y >= output_height:
-                    continue
-                sx1 = max(0, -x)
-                sy1 = max(0, -y)
-                sx2 = sx1 + (x2 - max(0, x))
-                sy2 = sy1 + (y2 - max(0, y))
-                dx1 = max(0, x)
-                dy1 = max(0, y)
-                dx2 = dx1 + (sx2 - sx1)
-                dy2 = dy1 + (sy2 - sy1)
-                inc_overlay = img[sy1:sy2, sx1:sx2]
-                if inc_overlay.shape[2] == 4:
-                    alpha = (inc_overlay[:, :, 3:4] / 255.0) * alpha_mult
+
+            x = int(round(inc["x"] * output_width - iw / 2.0))
+            y = int(round(inc["y"] * output_height - ih / 2.0))
+            x2 = min(output_width, x + iw)
+            y2 = min(output_height, y + ih)
+            if x2 <= 0 or y2 <= 0 or x >= output_width or y >= output_height:
+                continue
+            sx1 = max(0, -x)
+            sy1 = max(0, -y)
+            sx2 = sx1 + (x2 - max(0, x))
+            sy2 = sy1 + (y2 - max(0, y))
+            dx1 = max(0, x)
+            dy1 = max(0, y)
+            dx2 = dx1 + (sx2 - sx1)
+            dy2 = dy1 + (sy2 - sy1)
+            inc_overlay = img[sy1:sy2, sx1:sx2]
+
+            if inc.get("text"):
+                inc_mask = mask[sy1:sy2, sx1:sx2]
+                if inc_mask.ndim == 2:
+                    inc_mask = inc_mask[:, :, None] / 255.0
+                alpha = inc_mask * alpha_mult
+                base = frame[dy1:dy2, dx1:dx2]
+                frame[dy1:dy2, dx1:dx2] = (
+                    alpha * inc_overlay + (1 - alpha) * base
+                ).astype(base.dtype)
+                continue
+
+            if inc_overlay.shape[2] == 4:
+                alpha = (inc_overlay[:, :, 3:4] / 255.0) * alpha_mult
+                base = frame[dy1:dy2, dx1:dx2]
+                frame[dy1:dy2, dx1:dx2] = (
+                    alpha * inc_overlay[:, :, :3] + (1 - alpha) * base
+                ).astype(base.dtype)
+            else:
+                if alpha_mult >= 0.999:
+                    frame[dy1:dy2, dx1:dx2] = inc_overlay
+                else:
                     base = frame[dy1:dy2, dx1:dx2]
                     frame[dy1:dy2, dx1:dx2] = (
-                        alpha * inc_overlay[:, :, :3] + (1 - alpha) * base
+                        alpha_mult * inc_overlay + (1 - alpha_mult) * base
                     ).astype(base.dtype)
-                else:
-                    if alpha_mult >= 0.999:
-                        frame[dy1:dy2, dx1:dx2] = inc_overlay
-                    else:
-                        base = frame[dy1:dy2, dx1:dx2]
-                        frame[dy1:dy2, dx1:dx2] = (
-                            alpha_mult * inc_overlay + (1 - alpha_mult) * base
-                        ).astype(base.dtype)
-
         return frame
 
     for seg in tqdm(precomputed_segments, desc="Processing video segments"):
@@ -226,7 +349,7 @@ def extract_video_segments(
         if start_frame < current_frame_idx or start_frame > current_frame_idx + 50:
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
             current_frame_idx = start_frame
-            fade_queue.clear()
+            # Segment jump
         elif start_frame > current_frame_idx:
             # Skip frames by reading and discarding (faster than seeking for small gaps)
             gap = start_frame - current_frame_idx
@@ -234,18 +357,13 @@ def extract_video_segments(
                 ret, skipped = cap.read()
                 if not ret:
                     break
-                if fade_frames > 0:
-                    pre = _prepare_frame(skipped, current_frame_idx)
-                    if pre is not None:
-                        fade_queue.append(pre)
                 current_frame_idx += 1
 
         seg_len = max(0, end_frame - start_frame)
         if seg_len == 0:
             continue
 
-        fade_len = min(len(fade_queue), fade_frames, seg_len)
-        fade_list = list(fade_queue)[-fade_len:] if fade_len > 0 else []
+        # No global/segment fade; include fades handled in _apply_includes
 
         # Process frames in this segment
         for frame_idx in range(start_frame, end_frame):
@@ -257,12 +375,6 @@ def extract_video_segments(
             frame = _prepare_frame(frame, frame_idx)
             if frame is None:
                 continue
-
-            local_idx = frame_idx - start_frame
-            if fade_len > 0 and local_idx < fade_len:
-                alpha = (local_idx + 1) / (fade_len + 1)
-                prev = fade_list[local_idx]
-                frame = cv2.addWeighted(prev, 1.0 - alpha, frame, alpha, 0.0)
 
             # Apply subtitle background (alpha blend) before text
             if subtitle_bg and subtitle_bg_alpha > 0 and bg_mask is not None:
@@ -281,8 +393,10 @@ def extract_video_segments(
             if mask is not None:
                 mask_indices = mask > 0
                 frame[mask_indices] = overlay[mask_indices]
+            frame = _apply_includes(frame, total_frames_processed)
             out.write(frame)
             total_frames_processed += 1
+            # No global/segment fade history
 
             # Visualization
             if visualize:
@@ -290,7 +404,7 @@ def extract_video_segments(
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
-        fade_queue.clear()
+        # Keep output history across segments for consistent output-timeline fades
 
     cap.release()
     out.release()
