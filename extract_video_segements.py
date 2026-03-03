@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from tqdm import tqdm
+from PIL import ImageFont
 
 import subtitle_render
 
@@ -177,7 +178,26 @@ def extract_video_segments(
                 # Lazy-render text include once per output size.
                 if "text_overlay" not in inc:
                     text = str(inc.get("text", ""))
-                    words = text.splitlines() if text else [""]
+                    text_lines = inc.get("text_lines")
+                    if not text_lines:
+                        text_lines = [text] if text else [""]
+                    if len(text_lines) > 2:
+                        text_lines = [text_lines[0], " ".join(text_lines[1:])]
+                    inc_subtitle_lines = 2 if len(text_lines) > 1 else 1
+                    include_font_ttf = None
+                    include_font_file = inc.get("font_file")
+                    if include_font_file:
+                        if "font_ttf" not in inc:
+                            try:
+                                include_font_size = int(inc.get("font_size") or 0)
+                                if include_font_size <= 0:
+                                    include_font_size = 50
+                                inc["font_ttf"] = ImageFont.truetype(
+                                    include_font_file, include_font_size
+                                )
+                            except Exception:
+                                inc["font_ttf"] = None
+                        include_font_ttf = inc.get("font_ttf")
                     color = inc.get("color", [255, 255, 255])
                     if isinstance(color, (list, tuple)) and len(color) >= 3:
                         r, g, b = int(color[0]), int(color[1]), int(color[2])
@@ -186,13 +206,13 @@ def extract_video_segments(
                     # Render via the same subtitle renderer for consistent font/style.
                     overlay_full, mask_full, _ = subtitle_render.render_grouped_subtitle_overlay(
                         frame_shape=(output_height, output_width, 3),
-                        words=words,
+                        words=text_lines,
                         active_idx=-1,
                         font_scale=font_scale,
                         text_height_from_bottom=int(round(output_height / 2)),
                         text_height_from_bottom_2=None,
-                        subtitle_lines=1,
-                        font_ttf=font_ttf,
+                        subtitle_lines=inc_subtitle_lines,
+                        font_ttf=include_font_ttf or font_ttf,
                         subtitle_bg=False,
                         subtitle_bg_color=(0, 0, 0),
                         subtitle_bg_alpha=0.0,

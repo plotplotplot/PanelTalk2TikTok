@@ -12,7 +12,8 @@ usage() {
 Usage:
   ./sam3.sh <input_path> --prompt "text" [--out /path/to/output] [--max-frames N]
   ./sam3.sh <input_path> --prompt "text" [--out /path/to/output] [--max-frames N] --shell
-  ./sam3.sh <input_path> --prompt "text" [--extract-frames] [--scale-width N]
+  ./sam3.sh <input_path> --prompt "text" [--extract-frames] [--scale-width N] [--prescale-width N]
+  ./sam3.sh <input_path> --prompt "text" [--backend sam3|sam2|mobilesam]
 EOF
 }
 

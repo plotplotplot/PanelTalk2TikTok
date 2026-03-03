@@ -146,6 +146,8 @@ def _select_instance_with_click(
     allow_keep: bool = False,
     last_center=None,
     current_center=None,
+    click_max_dist: float = 30.0,
+    manual_hold_frames: int = 100,
 ):
     img = _load_processed_frame(video_path, frame_idx)
     if img is None:
@@ -198,7 +200,7 @@ def _select_instance_with_click(
         if dx is not None and dy is not None:
             cv2.circle(draw, (int(dx), int(dy)), 14, (255, 0, 0), 2)
 
-    instr = "Click to select instance"
+    instr = "Click to select instance (or empty space to track point)"
     if allow_keep:
         instr += " | Right arrow = keep center"
     cv2.putText(
@@ -250,8 +252,16 @@ def _select_instance_with_click(
             if best_dist is None or dist < best_dist:
                 best_dist = dist
                 best = rec
-        if best is not None:
+        if best is not None and best_dist is not None and best_dist <= float(click_max_dist):
             selected["rec"] = best
+        else:
+            selected["rec"] = {
+                "center_x": float(ox),
+                "center_y": float(oy),
+                "instance_id": "manual",
+                "_manual": True,
+                "_manual_frames": int(manual_hold_frames),
+            }
 
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, disp_w, disp_h)
@@ -354,6 +364,9 @@ def preprocess_continuous(
     time_shift: int = 0,
     start_frame: int | None = None,
     end_frame: int | None = None,
+    select_interval: int = 300,
+    manual_hold_frames: int = 100,
+    click_max_dist: float = 30.0,
     video_path: Path | None = None,
 ):
     detections_by_frame = load_detections(jsonl_path)
@@ -394,6 +407,8 @@ def preprocess_continuous(
             last_center=(float(default_rec["center_x"]), float(default_rec["center_y"]))
             if default_rec and default_rec.get("center_x") is not None and default_rec.get("center_y") is not None
             else None,
+            click_max_dist=click_max_dist,
+            manual_hold_frames=manual_hold_frames,
         )
         if action == "select":
             current = rec
@@ -430,6 +445,7 @@ def preprocess_continuous(
     last_frame = first_frame
     miss_count = 0
     frames_since_selection = 0
+    manual_left = int(current.get("_manual_frames", 0)) if isinstance(current, dict) else 0
 
     output = [current]
 
@@ -441,6 +457,22 @@ def preprocess_continuous(
     for frame in frames_iter:
         frames_since_selection += 1
         candidates = detections_by_frame.get(frame, [])
+
+        if manual_left > 0:
+            output.append(
+                {
+                    "frame": frame,
+                    "instance_id": current.get("instance_id", instance_id),
+                    "center_x": last_center[0],
+                    "center_y": last_center[1],
+                    "bbox": None,
+                }
+            )
+            last_frame = frame
+            miss_count = 0
+            frames_since_selection = 0
+            manual_left -= 1
+            continue
 
         best_rec = None
         best_dist = None
@@ -454,7 +486,7 @@ def preprocess_continuous(
                 best_dist = dist
                 best_rec = rec
 
-        if video_path is not None and frames_since_selection >= 100:
+        if video_path is not None and frames_since_selection >= int(select_interval):
             action, rec = _select_instance_with_click(
                 candidates=candidates,
                 video_path=video_path,
@@ -471,13 +503,27 @@ def preprocess_continuous(
                     if best_rec is not None
                     else last_center
                 ),
+                click_max_dist=click_max_dist,
+                manual_hold_frames=manual_hold_frames,
             )
             if action == "select" and rec is not None:
                 instance_id = _normalize_instance_id(rec.get("instance_id"))
+                current = rec
                 last_center = (float(rec["center_x"]), float(rec["center_y"]))
                 last_frame = frame
                 miss_count = 0
                 frames_since_selection = 0
+                manual_left = int(rec.get("_manual_frames", 0)) if isinstance(rec, dict) else 0
+                output.append(
+                    {
+                        "frame": frame,
+                        "instance_id": instance_id,
+                        "center_x": last_center[0],
+                        "center_y": last_center[1],
+                        "bbox": rec.get("bbox") if isinstance(rec, dict) else None,
+                    }
+                )
+                continue
             elif action == "keep":
                 output.append(
                     {
@@ -562,6 +608,8 @@ def preprocess_continuous(
                         if best_rec is not None
                         else last_center
                     ),
+                    click_max_dist=click_max_dist,
+                    manual_hold_frames=manual_hold_frames,
                 )
                 if action == "keep":
                     output.append(
@@ -599,10 +647,12 @@ def preprocess_continuous(
                 miss_count = 0
                 continue
             instance_id = new_id
+            current = new_rec
             last_center = (float(new_rec["center_x"]), float(new_rec["center_y"]))
             last_frame = frame
             miss_count = 0
             frames_since_selection = 0
+            manual_left = int(new_rec.get("_manual_frames", 0)) if isinstance(new_rec, dict) else 0
             output.append(new_rec)
             continue
         output.append(
@@ -830,6 +880,12 @@ def main():
         help="Centered moving average window size in frames.",
     )
     parser.add_argument(
+        "--select-interval",
+        type=int,
+        default=300,
+        help="Frames between interactive re-selection prompts (default: 300).",
+    )
+    parser.add_argument(
         "--lowpass-alpha",
         type=float,
         default=0.45,
@@ -933,6 +989,7 @@ def main():
             time_shift=args.time_shift,
             start_frame=args.start_frame,
             end_frame=args.end_frame,
+            select_interval=args.select_interval,
             out_path=continuous_path,
             video_path=video_path,
         )

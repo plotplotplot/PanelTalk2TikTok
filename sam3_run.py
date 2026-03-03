@@ -12,6 +12,10 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - optional
+    tqdm = None
 
 from huggingface_hub import login as hf_login
 from sam3.model_builder import build_sam3_image_model, build_sam3_video_predictor
@@ -376,10 +380,15 @@ def extract_frames(
         "-y",
         "-i",
         str(input_path),
+        "-vsync",
+        "0",
         "-vf",
         vf_arg,
         str(frames_dir / f"frame_%06d.{ext}"),
     ]
+    print(f"[frames] source fps: {fps}")
+    if extract_fps is not None and extract_fps > 0:
+        print(f"[frames] target extract fps: {extract_fps}")
     print("[frames] extract cmd:", " ".join(cmd))
     subprocess.check_call(cmd)
 
@@ -411,6 +420,42 @@ def extract_frames(
     return fps
 
 
+def prescale_video(input_path: Path, prescale_width: int) -> Path:
+    if prescale_width <= 0:
+        return input_path
+    out_path = input_path.with_name(f"{input_path.stem}_prescale{prescale_width}.mp4")
+    if out_path.exists():
+        print(f"[prescale] skipping; exists: {out_path}")
+        return out_path
+    scale_cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vsync",
+        "0",
+        "-vf",
+        f"scale={prescale_width}:-2",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        str(out_path),
+    ]
+    print("[prescale] cmd:", " ".join(scale_cmd))
+    subprocess.check_call(scale_cmd)
+    return out_path
+
+
 def run_video_as_frames(
     input_path: Path,
     prompt: str,
@@ -425,10 +470,13 @@ def run_video_as_frames(
     centers_method: str,
     smooth_alpha: float | None,
     add_center: bool,
+    base_stem: str | None = None,
+    use_tqdm: bool = True,
 ):
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    frames_dir = frames_dir or (out_path.parent / f"{input_path.stem}_frames")
-    out_frames_dir = out_path.parent / f"{input_path.stem}_frames_out"
+    stem = base_stem or input_path.stem
+    frames_dir = frames_dir or (out_path.parent / f"{stem}_frames")
+    out_frames_dir = out_path.parent / f"{stem}_frames_out"
     frames_dir.mkdir(parents=True, exist_ok=True)
     out_frames_dir.mkdir(parents=True, exist_ok=True)
 
@@ -452,6 +500,31 @@ def run_video_as_frames(
         centers_f = centers_path.open("a", encoding="utf-8")
 
     if stream_extract:
+        total_frames = None
+        if use_tqdm:
+            try:
+                probe = subprocess.run(
+                    [
+                        "ffprobe",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-select_streams",
+                        "v:0",
+                        "-show_entries",
+                        "stream=nb_frames",
+                        "-of",
+                        "default=nokey=1:noprint_wrappers=1",
+                        str(input_path),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if probe.stdout.strip().isdigit():
+                    total_frames = int(probe.stdout.strip())
+            except Exception:
+                total_frames = None
         vf = []
         if scale_width is not None and scale_width > 0:
             vf.append(f"scale={scale_width}:-2")
@@ -466,10 +539,41 @@ def run_video_as_frames(
             "-y",
             "-i",
             str(input_path),
+            "-vsync",
+            "0",
             "-vf",
             vf_arg,
             str(frames_dir / f"frame_%06d.{ext}"),
         ]
+        # Report intended fps without modifying it (unless --extract-fps is used).
+        fps = None
+        try:
+            probe = subprocess.run(
+                [
+                    "ffprobe",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=avg_frame_rate",
+                    "-of",
+                    "default=nokey=1:noprint_wrappers=1",
+                    str(input_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if probe.stdout.strip():
+                num, den = probe.stdout.strip().split("/")
+                fps = float(num) / float(den)
+        except Exception:
+            fps = None
+        print(f"[frames] source fps: {fps}")
+        if extract_fps is not None and extract_fps > 0:
+            print(f"[frames] target extract fps: {extract_fps}")
         existing = list(frames_dir.glob(f"frame_*.{ext}"))
         if existing:
             print(f"[frames] skipping extract; found {len(existing)} frames in {frames_dir}")
@@ -479,15 +583,20 @@ def run_video_as_frames(
             proc = subprocess.Popen(cmd)
 
         idx = 1
+        pbar = None
+        if use_tqdm and tqdm is not None:
+            pbar = tqdm(total=total_frames, desc="frames", unit="frame")
         while True:
             frame_path = frames_dir / f"frame_{idx:06d}.{ext}"
             if frame_path.exists():
                 frame_idx = idx - 1
                 if frame_idx in existing_frames and not produce_output_video:
-                    print(f"[frames] skipping recorded {frame_path.name}")
+                    if not (use_tqdm and tqdm is not None):
+                        print(f"[frames] skipping recorded {frame_path.name}")
                     idx += 1
                     continue
-                print(f"[frames] processing {frame_path.name}")
+                if not (use_tqdm and tqdm is not None):
+                    print(f"[frames] processing {frame_path.name}")
                 # wait for file size to stabilize
                 last_size = -1
                 for _ in range(5):
@@ -552,6 +661,8 @@ def run_video_as_frames(
                                 + "\n"
                             )
                 idx += 1
+                if pbar is not None:
+                    pbar.update(1)
                 continue
 
             if proc is None:
@@ -560,17 +671,23 @@ def run_video_as_frames(
             elif proc.poll() is not None:
                 break
             time.sleep(0.05)
+        if pbar is not None:
+            pbar.close()
     else:
         fps = extract_frames(input_path, frames_dir, scale_width, frames_format, extract_fps)
         frame_files = sorted(frames_dir.glob(f"frame_*.{ext}"))
         if not frame_files:
             raise RuntimeError("No frames extracted.")
 
-        for frame_path in frame_files:
+        iterator = frame_files
+        if use_tqdm and tqdm is not None:
+            iterator = tqdm(frame_files, desc="frames", unit="frame")
+        for frame_path in iterator:
             frame_idx = int(frame_path.stem.split("_")[-1]) - 1
             if frame_idx in existing_frames and not produce_output_video:
                 continue
-            print(f"[frames] processing {frame_path.name}")
+            if not (use_tqdm and tqdm is not None):
+                print(f"[frames] processing {frame_path.name}")
             image = Image.open(frame_path).convert("RGB")
             state = processor.set_image(image)
             state = processor.set_text_prompt(prompt=prompt, state=state)
@@ -931,6 +1048,28 @@ def main():
         help="Resize input video/image to this width before processing.",
     )
     parser.add_argument(
+        "--prescale-width",
+        type=int,
+        default=None,
+        help="Pre-scale input video to this width before processing (one-time ffmpeg scale).",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["sam3", "sam2", "mobilesam"],
+        default="sam3",
+        help="Segmentation backend to use (default: sam3).",
+    )
+    parser.add_argument(
+        "--sam2-checkpoint",
+        default=None,
+        help="Path to SAM2 checkpoint (if using --backend sam2).",
+    )
+    parser.add_argument(
+        "--mobilesam-checkpoint",
+        default=None,
+        help="Path to MobileSAM checkpoint (if using --backend mobilesam).",
+    )
+    parser.add_argument(
         "--extract-frames",
         action="store_true",
         help="Extract video to frames and run image model per frame (no tracking).",
@@ -991,6 +1130,13 @@ def main():
         help="Draw centerpoints on output frames/video.",
     )
     parser.add_argument(
+        "--no-tqdm",
+        dest="tqdm",
+        action="store_false",
+        help="Disable tqdm progress bar when processing frames.",
+    )
+    parser.set_defaults(tqdm=True)
+    parser.add_argument(
         "--no-keep-chunks",
         dest="keep_chunks",
         action="store_false",
@@ -1020,6 +1166,27 @@ def main():
     if not input_path.exists():
         raise FileNotFoundError(f"Input not found: {input_path}")
 
+    orig_input_path = input_path
+
+    if args.backend != "sam3":
+        if is_video(input_path):
+            raise RuntimeError(
+                f"--backend {args.backend} is not supported for video in this script."
+            )
+        raise RuntimeError(
+            f"--backend {args.backend} is not wired for text prompts in this script."
+        )
+
+    prescaled_path = None
+    if is_video(input_path) and args.prescale_width is not None and args.prescale_width > 0:
+        if args.scale_width is not None and args.scale_width > 0:
+            print(
+                "[prescale] --prescale-width set; ignoring --scale-width to avoid double scaling"
+            )
+            args.scale_width = None
+        prescaled_path = prescale_video(input_path, args.prescale_width)
+        input_path = prescaled_path
+
     if is_image(input_path):
         out_path = resolve_output_path(input_path, args.output, is_vid=False)
         centers_path = (
@@ -1041,11 +1208,11 @@ def main():
         )
         print(f"[image] {input_path} -> {out_path}")
     elif is_video(input_path):
-        out_path = resolve_output_path(input_path, args.output, is_vid=True)
+        out_path = resolve_output_path(orig_input_path, args.output, is_vid=True)
         centers_path = (
             Path(args.centers_json)
             if args.centers_json
-            else (input_path.with_suffix(".jsonl"))
+            else (orig_input_path.with_suffix(".jsonl"))
         )
         if args.produce_output_video and out_path.exists() and centers_path.exists():
             print(f"[skip] output exists: {out_path}")
@@ -1067,6 +1234,8 @@ def main():
                 args.centers_method,
                 args.smooth_alpha,
                 args.add_center,
+                base_stem=orig_input_path.stem,
+                use_tqdm=args.tqdm,
             )
         elif args.chunk_seconds is not None and not args.child_run:
             chunks_dir = Path(args.chunks_dir) if args.chunks_dir else None
@@ -1100,6 +1269,7 @@ def main():
         print(f"[video] {input_path} -> {out_path}")
     else:
         raise ValueError(f"Unsupported input type: {input_path}")
+
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from PIL import ImageFont
 import extract_audio_segments
 import segment_utils
 import transcriptJson2csv
+from subtitles import build_word_groups
 from extract_video_segements import extract_video_segments
 
 
@@ -53,65 +54,6 @@ def load_word_segments_from_csv(csv_path):
     return word_segment_times
 
 
-def _line_length(words):
-    total = 0
-    for i, w in enumerate(words):
-        wlen = len(w)
-        total += wlen if i == 0 else wlen + 1
-    return total
-
-
-def _min_max_line_len(words):
-    if len(words) <= 1:
-        return _line_length(words)
-    best = None
-    for split in range(1, len(words)):
-        left = _line_length(words[:split])
-        right = _line_length(words[split:])
-        m = max(left, right)
-        if best is None or m < best:
-            best = m
-    return best if best is not None else 0
-
-
-def _build_word_groups(words, group_size=6, max_chars=None, subtitle_lines=1):
-    groups = []
-    current = []
-    current_len = 0
-    for idx, w in enumerate(words):
-        text = (w.get("word") or "").strip()
-        word_len = len(text)
-        extra = word_len if current_len == 0 else word_len + 1
-        if max_chars is not None and current:
-            if subtitle_lines <= 1:
-                if (current_len + extra) > max_chars:
-                    groups.append(current)
-                    current = []
-                    current_len = 0
-            else:
-                candidate_words = [
-                    (words[i].get("word") or "").strip() for i in (current + [idx])
-                ]
-                if _min_max_line_len(candidate_words) > max_chars:
-                    groups.append(current)
-                    current = []
-                    current_len = 0
-        current.append(idx)
-        current_len += word_len if current_len == 0 else word_len + 1
-        if len(current) >= group_size:
-            groups.append(current)
-            current = []
-            current_len = 0
-            continue
-        if text.endswith((",", ".", "?", "!", ";", ":")):
-            groups.append(current)
-            current = []
-            current_len = 0
-    if current:
-        groups.append(current)
-    return groups
-
-
 def precompute_segments(word_segment_times, fps, group_size=6, max_chars=None, subtitle_lines=1):
     """
     Convert word segments to frame-aligned timing.
@@ -119,7 +61,7 @@ def precompute_segments(word_segment_times, fps, group_size=6, max_chars=None, s
     precomputed_segments = []
 
     total_words = len(word_segment_times)
-    groups = _build_word_groups(
+    groups = build_word_groups(
         word_segment_times,
         group_size=group_size,
         max_chars=max_chars,
@@ -231,11 +173,32 @@ def combine_video_audio(video_file, audio_file, final_output):
     """
     Combine video and audio files using ffmpeg.
     """
+    video_codec = None
+    probe_cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name",
+        "-of", "default=nw=1:nk=1",
+        video_file,
+    ]
+    try:
+        probed = subprocess.run(
+            probe_cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        video_codec = (probed.stdout or "").strip().lower()
+    except Exception:
+        video_codec = None
+
+    video_copy = video_codec == "h264"
     cmd = [
         "ffmpeg",
         "-i", video_file,
         "-i", audio_file,
-        "-c:v", "libx264",
+        "-c:v", "copy" if video_copy else "libx264",
         "-c:a", "aac",
         "-strict", "experimental",
         "-y",
@@ -281,6 +244,33 @@ def strip_standard_suffixes(name: str) -> str:
                 name = name[: -len(suf)]
                 changed = True
     return name
+
+
+def resolve_font_file(font_value: str, base_dir: str) -> str | None:
+    if not font_value:
+        return None
+    font_value = str(font_value).strip()
+    if not font_value:
+        return None
+    if os.path.isabs(font_value):
+        return font_value if os.path.exists(font_value) else None
+    candidate = os.path.join(base_dir, font_value)
+    if os.path.exists(candidate):
+        return candidate
+    try:
+        result = subprocess.run(
+            ["fc-match", "-f", "%{file}\n", font_value],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.stdout:
+            path = result.stdout.strip().splitlines()[0].strip()
+            if path and os.path.exists(path):
+                return path
+    except Exception:
+        return None
+    return None
 
 
 def main():
@@ -841,12 +831,54 @@ def main():
                         "fade_out": float(rec.get("fadeOut", 0.0)) if rec.get("fadeOut") is not None else 0.0,
                     }
                     if text:
+                        max_chars = rec.get("maxChars")
+                        if max_chars is None:
+                            max_chars = rec.get("max_chars")
+                        try:
+                            max_chars = int(max_chars) if max_chars is not None else None
+                        except Exception:
+                            max_chars = None
+                        font_value = rec.get("font")
+                        font_file = resolve_font_file(font_value, base_dir)
+                        if font_value and not font_file:
+                            print(f"Warning: include font not found: {font_value!r}")
+                        text_lines = None
+                        if max_chars and max_chars > 0:
+                            words = [{"word": w} for w in str(text).split()]
+                            if words:
+                                groups = build_word_groups(
+                                    words,
+                                    group_size=len(words),
+                                    max_chars=max_chars,
+                                    subtitle_lines=1,
+                                )
+                                text_lines = [" ".join(words[i]["word"] for i in g) for g in groups]
+                            else:
+                                text_lines = [""]
+                            if len(text_lines) > 2:
+                                text_lines = [text_lines[0], " ".join(text_lines[1:])]
                         color = rec.get("color", [255, 255, 255])
                         height = float(rec.get("height", 120))
+                        size_value = rec.get("size")
+                        if size_value is None:
+                            size_value = rec.get("fontSize")
+                        try:
+                            size_value = int(size_value) if size_value is not None else None
+                        except Exception:
+                            size_value = None
+                        if size_value and size_value > 0:
+                            inc_font_size = size_value
+                        else:
+                            inc_font_size = max(1, int(round(args.font_size * args.font_scale)))
                         includes.append(
                             {
                                 **base_rec,
                                 "text": str(text),
+                                "text_lines": text_lines,
+                                "subtitle_lines": 2 if text_lines and len(text_lines) > 1 else 1,
+                                "max_chars": max_chars,
+                                "font_file": font_file,
+                                "font_size": inc_font_size,
                                 "color": color,
                                 "height": height,
                             }

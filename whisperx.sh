@@ -20,12 +20,15 @@ OUT_DIR="$(dirname "$1")"
 # (here we set it with -e so it is available inside the container)
 docker run --gpus all -it \
   -v "$(pwd)/.cache":/.cache \
+  -v "$(pwd)/.cache":/root/.cache \
   -v "$(pwd)":/app -w /app \
+  -e HOME="/root" \
   -e HF_TOKEN="$HF_TOKEN" \
-  -e MPLCONFIGDIR="/.cache/matplotlib" \
-  -e HF_HOME="/.cache/hf" \
-  -e HF_HUB_CACHE="/.cache/hf/hub" \
-  -e TRANSFORMERS_CACHE="/.cache/hf/transformers" \
+  -e MPLCONFIGDIR="/root/.cache/matplotlib" \
+  -e HF_HOME="/root/.cache/huggingface" \
+  -e HF_HUB_CACHE="/root/.cache/huggingface/hub" \
+  -e TRANSFORMERS_CACHE="/root/.cache/huggingface/transformers" \
+  -e TORCH_HOME="/root/.cache/torch" \
   ghcr.io/jim60105/whisperx:large-v3-tl-77e20c4 \
   whisperx "$1" \
     --output_dir "$OUT_DIR" \
