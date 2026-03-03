@@ -449,6 +449,57 @@ def merge_short_segments(word_segment_times, min_segment_seconds):
     return merged
 
 
+def adjust_subtitles_for_fades(word_segment_times_for_subs, cut_segments, fps, fade_frames, fade_mode):
+    if not word_segment_times_for_subs or not cut_segments or not fps or fade_frames <= 0:
+        return word_segment_times_for_subs
+    fade_mode = (fade_mode or "sequence").lower()
+    if fade_mode not in ("sequence", "hold", "split"):
+        fade_mode = "sequence"
+    boundaries = []
+    cumulative_time = 0.0
+    for i in range(len(cut_segments) - 1):
+        seg = cut_segments[i]
+        nxt = cut_segments[i + 1]
+        seg_start = float(seg.get("start", 0.0))
+        seg_end = float(seg.get("end", seg_start))
+        next_start = float(nxt.get("start", seg_end))
+        seg_dur = max(0.0, seg_end - seg_start)
+        next_dur = max(0.0, float(nxt.get("end", next_start)) - next_start)
+        cumulative_time += seg_dur
+        gap = next_start - seg_end
+        if gap <= 0 or seg_dur <= 0 or next_dur <= 0:
+            continue
+        prev_len_frames = min(int(round(seg_dur * fps)), int(fade_frames))
+        next_len_frames = min(int(round(next_dur * fps)), int(fade_frames))
+        if prev_len_frames <= 0 or next_len_frames <= 0:
+            continue
+        if fade_mode == "split":
+            prev_len = min(int(fade_frames // 2), prev_len_frames)
+            next_len = min(int(fade_frames - prev_len), next_len_frames)
+            drop_frames = next_len
+        else:
+            drop_frames = min(prev_len_frames, next_len_frames, int(fade_frames))
+        if drop_frames <= 0:
+            continue
+        boundaries.append((cumulative_time, float(drop_frames) / float(fps)))
+    if not boundaries:
+        return word_segment_times_for_subs
+    adjusted = []
+    drop_idx = 0
+    cumulative_drop = 0.0
+    for seg in word_segment_times_for_subs:
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", start))
+        while drop_idx < len(boundaries) and start >= boundaries[drop_idx][0]:
+            cumulative_drop += boundaries[drop_idx][1]
+            drop_idx += 1
+        curr = dict(seg)
+        curr["start"] = max(0.0, start - cumulative_drop)
+        curr["end"] = max(curr["start"], end - cumulative_drop)
+        adjusted.append(curr)
+    return adjusted
+
+
 def close_small_gaps(word_segment_times, max_gap_seconds):
     if not word_segment_times or max_gap_seconds is None:
         return word_segment_times

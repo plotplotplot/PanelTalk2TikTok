@@ -4,7 +4,11 @@ from pydub import AudioSegment
 from tqdm import tqdm
 
 def extract_audio_segments(
-    word_segment_times, audio_file, output_audio_file, fade_samples: int = 3000
+    word_segment_times,
+    audio_file,
+    output_audio_file,
+    fade_samples: int = 3000,
+    fade_mode: str = "sequence",
 ):
     """
     Faster version of extract_audio_segments().
@@ -24,9 +28,20 @@ def extract_audio_segments(
     raw = np.frombuffer(audio.raw_data, dtype=dtype)
     frames = raw.reshape((-1, ch)).astype(np.float32) / full_scale
 
+    fade_samples = max(0, int(fade_samples or 0))
+    fade_mode = (fade_mode or "sequence").lower()
+    if fade_mode not in ("sequence", "hold", "split"):
+        fade_mode = "sequence"
+    if fade_mode == "split" and fade_samples > 1:
+        # Keep split fades symmetric so head/tail trim match.
+        fade_samples = (fade_samples // 2) * 2
+
     # Precompute crossfade windows (expanded to match channel count)
-    # t has shape (fade_samples, 1). We compute 1-D fades then expand to (fade_samples, ch)
-    t = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)[:, None]
+    # t has shape (fade_len, 1). We compute 1-D fades then expand to (fade_len, ch)
+    fade_len = fade_samples
+    if fade_mode == "split":
+        fade_len = fade_samples // 2
+    t = np.linspace(0.0, 1.0, max(1, fade_len), dtype=np.float32)[:, None]
     fade_out_1d = np.cos(t * np.pi / 2.0)
     fade_in_1d = np.sin(t * np.pi / 2.0)
     # Expand fades to match number of channels so operations broadcast correctly
@@ -54,9 +69,15 @@ def extract_audio_segments(
         if segments:
             prev = segments[-1]
 
-        if len(prev) > fade_samples:
-            overlap_in = frames[start - fade_samples : start] * fade_in
-            prev[-fade_samples:] = prev[-fade_samples:] * fade_out + overlap_in
+        if fade_len > 0 and len(prev) > fade_len and start >= fade_len:
+            overlap_in = frames[start - fade_len : start] * fade_in
+            prev[-fade_len:] = prev[-fade_len:] * fade_out + overlap_in
+            # Trim the head of the new segment to match the overlap length.
+            trim_len = fade_len
+            if fade_mode == "split":
+                trim_len = fade_samples // 2
+            if len(seg) > trim_len:
+                seg = seg[trim_len:]
 
         segments.append(seg.copy())
 

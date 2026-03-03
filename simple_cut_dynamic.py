@@ -24,6 +24,7 @@ from cut_dynamic_helpers import (
     SubtitleRenderer,
     apply_bounded_prepend_extend,
     merge_short_segments,
+    adjust_subtitles_for_fades,
     precompute_segments_basic,
     prepend_silence_to_wav,
     trim_leading_audio_wav,
@@ -934,7 +935,7 @@ def extract_video_segments_dynamic(
     pbar = tqdm(total=total_frames, desc="Writing frames")
 
     fade_frames = max(0, int(fade_frames))
-    prev_tail_frames = []
+    pending_tail_frames = []
 
     prev_end_frame = None
     prev_segment_center = None
@@ -970,8 +971,8 @@ def extract_video_segments_dynamic(
                 gap_frames = 0
         if gap_frames is not None and gap_frames < 0:
             gap_frames = 0
-        do_fade = fade_frames > 0 and prev_tail_frames and (gap_frames is None or gap_frames > 0)
-        prev_tail_snapshot = list(prev_tail_frames) if do_fade else []
+        do_fade = fade_frames > 0 and pending_tail_frames and (gap_frames is None or gap_frames > 0)
+        prev_tail_snapshot = list(pending_tail_frames) if pending_tail_frames else []
         if debug_timeline:
             seg_len = max(0, int(seg["end_frame"]) - int(seg["start_frame"]))
             out_time = (out_frame_idx + seg_frame_idx) / fps if fps else 0.0
@@ -1194,124 +1195,130 @@ def extract_video_segments_dynamic(
             seg_frame_idx += 1
             prev_segment_center = last_center
 
-        # Determine which frames to write from this segment
-        # For the first segment, write all frames (no previous tail to fade with)
-        # For subsequent segments with fade, we need to handle the crossfade properly
-        
-        if fade_frames > 0 and prev_tail_snapshot:
-            # We have a previous segment's tail to fade with
-            head = seg_frames[:fade_frames]
-            
-            if fade_mode == "split":
-                # Split fade: use half of fade frames from tail, half from head
-                prev_len = max(1, fade_frames // 2)
-                prev_len = min(prev_len, len(prev_tail_snapshot))
-                next_len = max(1, fade_frames - prev_len)
-                next_len = min(next_len, len(head))
-                prev_seq = prev_tail_snapshot[-prev_len:]
-                head_seq = head[:next_len]
-                blend_count = min(fade_frames, prev_len + next_len)
-                
-                # Write blended frames for the transition
-                # These replace the last prev_len frames of previous segment
-                # and the first next_len frames of current segment
-                for i in range(blend_count):
-                    alpha = (i + 1) / float(blend_count + 1)
-                    alpha = alpha * alpha * (3.0 - 2.0 * alpha)  # smoothstep
-                    
-                    # Map blend index to appropriate frames in tail and head sequences
-                    if prev_len > 1:
-                        prev_idx = int(round(i * (prev_len - 1) / max(1, blend_count - 1)))
-                    else:
-                        prev_idx = 0
-                    if next_len > 1:
-                        next_idx = int(round(i * (next_len - 1) / max(1, blend_count - 1)))
-                    else:
-                        next_idx = 0
-                    
-                    prev_payload = prev_seq[prev_idx]
-                    next_payload = head_seq[next_idx]
-                    blended_frame = cv2.addWeighted(
-                        prev_payload["frame"], 1.0 - alpha, next_payload["frame"], alpha, 0
-                    )
-                    # Interpolate zoom parameters during fade for smooth transition
-                    interp_center = _blend_centers(prev_payload["center"], next_payload["center"], alpha)
-                    interp_zoom = lerp_scalar(prev_payload["zoom"], next_payload["zoom"], alpha)
-                    interp_rotate = lerp_scalar(prev_payload["rotate"], next_payload["rotate"], alpha)
-                    blended_payload = {
-                        "frame": blended_frame,
-                        "center": interp_center,
-                        "zoom": interp_zoom,
-                        "rotate": interp_rotate,
-                    }
-                    blended = _apply_zoom_payload(blended_payload)
-                    if blended is None:
-                        continue
-                    if debug_fade and i == 0:
-                        print(f"[fade] seg={seg_idx} blending alpha={alpha:.3f}")
-                    if debug_timeline and i == 0:
-                        t_out = out_frame_idx / fps if fps else 0.0
-                        print(
-                            f"[timeline] seg={seg_idx} fade_blend_count={blend_count} "
-                            f"blend_start_out_idx={out_frame_idx} out_t={t_out:.3f}"
+        # Handle buffered tail from previous segment
+        start_idx = 0
+        if prev_tail_snapshot:
+            if do_fade:
+                head = seg_frames[:fade_frames]
+                if fade_mode == "split":
+                    prev_len = max(1, fade_frames // 2)
+                    prev_len = min(prev_len, len(prev_tail_snapshot))
+                    next_len = max(1, fade_frames - prev_len)
+                    next_len = min(next_len, len(head))
+                    # Flush non-overlapped tail frames first
+                    tail_prefix = prev_tail_snapshot[:-prev_len] if prev_len > 0 else prev_tail_snapshot
+                    for payload in tail_prefix:
+                        cropped = _apply_zoom_payload(payload)
+                        if cropped is None:
+                            continue
+                        out.write(_render_subtitles_after_zoom(cropped))
+                        out_frame_idx += 1
+                        pbar.update(1)
+                    prev_seq = prev_tail_snapshot[-prev_len:] if prev_len > 0 else []
+                    head_seq = head[:next_len]
+                    blend_count = min(fade_frames, prev_len + next_len)
+                    for i in range(blend_count):
+                        alpha = (i + 1) / float(blend_count + 1)
+                        alpha = alpha * alpha * (3.0 - 2.0 * alpha)  # smoothstep
+                        if prev_len > 1:
+                            prev_idx = int(round(i * (prev_len - 1) / max(1, blend_count - 1)))
+                        else:
+                            prev_idx = 0
+                        if next_len > 1:
+                            next_idx = int(round(i * (next_len - 1) / max(1, blend_count - 1)))
+                        else:
+                            next_idx = 0
+                        prev_payload = prev_seq[prev_idx] if prev_seq else None
+                        next_payload = head_seq[next_idx] if head_seq else None
+                        if prev_payload is None or next_payload is None:
+                            continue
+                        blended_frame = cv2.addWeighted(
+                            prev_payload["frame"], 1.0 - alpha, next_payload["frame"], alpha, 0
                         )
-                    out.write(_render_subtitles_after_zoom(blended))
-                    out_frame_idx += 1
-                    pbar.update(1)
-                # Skip the head frames that were used in the blend
-                start_idx = next_len
+                        interp_center = _blend_centers(prev_payload["center"], next_payload["center"], alpha)
+                        interp_zoom = lerp_scalar(prev_payload["zoom"], next_payload["zoom"], alpha)
+                        interp_rotate = lerp_scalar(prev_payload["rotate"], next_payload["rotate"], alpha)
+                        blended_payload = {
+                            "frame": blended_frame,
+                            "center": interp_center,
+                            "zoom": interp_zoom,
+                            "rotate": interp_rotate,
+                        }
+                        blended = _apply_zoom_payload(blended_payload)
+                        if blended is None:
+                            continue
+                        if debug_fade and i == 0:
+                            print(f"[fade] seg={seg_idx} blending alpha={alpha:.3f}")
+                        if debug_timeline and i == 0:
+                            t_out = out_frame_idx / fps if fps else 0.0
+                            print(
+                                f"[timeline] seg={seg_idx} fade_blend_count={blend_count} "
+                                f"blend_start_out_idx={out_frame_idx} out_t={t_out:.3f}"
+                            )
+                        out.write(_render_subtitles_after_zoom(blended))
+                        out_frame_idx += 1
+                        pbar.update(1)
+                    start_idx = next_len
+                else:
+                    blend_count = min(len(prev_tail_snapshot), len(head), fade_frames)
+                    tail_prefix = prev_tail_snapshot[:-blend_count] if blend_count > 0 else prev_tail_snapshot
+                    for payload in tail_prefix:
+                        cropped = _apply_zoom_payload(payload)
+                        if cropped is None:
+                            continue
+                        out.write(_render_subtitles_after_zoom(cropped))
+                        out_frame_idx += 1
+                        pbar.update(1)
+                    tail_overlap = prev_tail_snapshot[-blend_count:] if blend_count > 0 else []
+                    for i in range(blend_count):
+                        alpha = (i + 1) / float(blend_count + 1)
+                        alpha = alpha * alpha * (3.0 - 2.0 * alpha)  # smoothstep
+                        if fade_mode == "hold":
+                            prev_payload = tail_overlap[-1]
+                            next_payload = head[0]
+                        else:
+                            prev_payload = tail_overlap[i]
+                            next_payload = head[i]
+                        blended_frame = cv2.addWeighted(
+                            prev_payload["frame"], 1.0 - alpha, next_payload["frame"], alpha, 0
+                        )
+                        interp_center = _blend_centers(prev_payload["center"], next_payload["center"], alpha)
+                        interp_zoom = lerp_scalar(prev_payload["zoom"], next_payload["zoom"], alpha)
+                        interp_rotate = lerp_scalar(prev_payload["rotate"], next_payload["rotate"], alpha)
+                        blended_payload = {
+                            "frame": blended_frame,
+                            "center": interp_center,
+                            "zoom": interp_zoom,
+                            "rotate": interp_rotate,
+                        }
+                        blended = _apply_zoom_payload(blended_payload)
+                        if blended is None:
+                            continue
+                        if debug_fade and i == 0:
+                            print(f"[fade] seg={seg_idx} blending alpha={alpha:.3f}")
+                        if debug_timeline and i == 0:
+                            t_out = out_frame_idx / fps if fps else 0.0
+                            print(
+                                f"[timeline] seg={seg_idx} fade_blend_count={blend_count} "
+                                f"blend_start_out_idx={out_frame_idx} out_t={t_out:.3f}"
+                            )
+                        out.write(_render_subtitles_after_zoom(blended))
+                        out_frame_idx += 1
+                        pbar.update(1)
+                    start_idx = blend_count
             else:
-                # Sequence or hold fade
-                blend_count = min(len(prev_tail_snapshot), len(head), fade_frames)
-                for i in range(blend_count):
-                    alpha = (i + 1) / float(blend_count + 1)
-                    alpha = alpha * alpha * (3.0 - 2.0 * alpha)  # smoothstep
-                    if fade_mode == "hold":
-                        prev_frame = prev_tail_snapshot[-1]
-                        next_frame = head[0]
-                    else:
-                        prev_frame = prev_tail_snapshot[i]
-                        next_frame = head[i]
-                    prev_payload = prev_frame
-                    next_payload = next_frame
-                    blended_frame = cv2.addWeighted(
-                        prev_payload["frame"], 1.0 - alpha, next_payload["frame"], alpha, 0
-                    )
-                    # Interpolate zoom parameters during fade for smooth transition
-                    interp_center = _blend_centers(prev_payload["center"], next_payload["center"], alpha)
-                    interp_zoom = lerp_scalar(prev_payload["zoom"], next_payload["zoom"], alpha)
-                    interp_rotate = lerp_scalar(prev_payload["rotate"], next_payload["rotate"], alpha)
-                    blended_payload = {
-                        "frame": blended_frame,
-                        "center": interp_center,
-                        "zoom": interp_zoom,
-                        "rotate": interp_rotate,
-                    }
-                    blended = _apply_zoom_payload(blended_payload)
-                    if blended is None:
+                for payload in prev_tail_snapshot:
+                    cropped = _apply_zoom_payload(payload)
+                    if cropped is None:
                         continue
-                    if debug_fade and i == 0:
-                        print(f"[fade] seg={seg_idx} blending alpha={alpha:.3f}")
-                    if debug_timeline and i == 0:
-                        t_out = out_frame_idx / fps if fps else 0.0
-                        print(
-                            f"[timeline] seg={seg_idx} fade_blend_count={blend_count} "
-                            f"blend_start_out_idx={out_frame_idx} out_t={t_out:.3f}"
-                        )
-                    out.write(_render_subtitles_after_zoom(blended))
+                    out.write(_render_subtitles_after_zoom(cropped))
                     out_frame_idx += 1
                     pbar.update(1)
-                # Skip the head frames that were used in the blend
-                start_idx = blend_count
-        else:
-            # First segment or no fade
-            start_idx = 0
-        
-        # Write frames from current segment
-        # For first segment: write all frames
-        # For subsequent segments: write from start_idx to end, but NOT the tail frames
-        # (tail frames will be saved for next segment's fade)
+
+        # Write frames from current segment excluding head used in fade and tail buffer
         write_end_idx = len(seg_frames) - fade_frames if fade_frames > 0 else len(seg_frames)
+        if write_end_idx < start_idx:
+            write_end_idx = start_idx
         for frame in seg_frames[start_idx:write_end_idx]:
             cropped = _apply_zoom_payload(frame)
             if cropped is None:
@@ -1319,10 +1326,20 @@ def extract_video_segments_dynamic(
             out.write(_render_subtitles_after_zoom(cropped))
             out_frame_idx += 1
             pbar.update(1)
-        
-        # Save tail frames for next segment's fade
-        prev_tail_frames = seg_frames[-fade_frames:] if fade_frames > 0 else []
+
+        # Buffer tail frames for next segment's fade
+        pending_tail_frames = seg_frames[write_end_idx:] if fade_frames > 0 else []
         prev_end_frame = seg["end_frame"]
+
+    # Flush any remaining buffered tail frames
+    if pending_tail_frames:
+        for payload in pending_tail_frames:
+            cropped = _apply_zoom_payload(payload)
+            if cropped is None:
+                continue
+            out.write(_render_subtitles_after_zoom(cropped))
+            out_frame_idx += 1
+            pbar.update(1)
 
     pbar.close()
     cap.release()
@@ -2049,7 +2066,7 @@ def main():
     parser.add_argument(
         "--fade-samples",
         type=int,
-        default=100,
+        default=200,
         help="Crossfade length for audio stitching in samples (default: 100)",
     )
     parser.add_argument(
@@ -2293,6 +2310,7 @@ def main():
         word_segment_times = segment_utils.load_word_segments_from_json(jsonfilename)
 
     sr = segment_utils.get_audio_sample_rate(audiofilename)
+    # Audio fade length is independent; do not derive from video fade frames.
     if args.subtitles_delay_ms is not None:
         args.shift_seconds = float(args.subtitles_delay_ms) / 1000.0
     if args.preserve_word_gaps:
@@ -2613,6 +2631,7 @@ def main():
                 source_audio,
                 temp_audio,
                 fade_samples=args.fade_samples,
+                fade_mode=args.fade_mode,
             )
             audio_for_combine = temp_audio
         elif args.no_cut:
@@ -2632,6 +2651,7 @@ def main():
                     audiofilename,
                     temp_audio,
                     fade_samples=args.fade_samples,
+                    fade_mode=args.fade_mode,
                 )
             else:
                 print(f"Warning: audio file not found: {audiofilename}")
@@ -2665,6 +2685,14 @@ def main():
         video_duration = total_frames / fps if fps else 0.0
         if not args.no_cut:
             word_segment_times_for_subs = _retime_segments_to_frame_timeline(word_segment_times_for_subs, fps)
+            if args.subtitles and args.fade_frames and args.fade_frames > 0:
+                word_segment_times_for_subs = adjust_subtitles_for_fades(
+                    word_segment_times_for_subs,
+                    word_segment_times_for_cut,
+                    fps,
+                    args.fade_frames,
+                    args.fade_mode,
+                )
             if args.subtitles:
                 max_chars = args.max_chars if args.max_chars and args.max_chars > 0 else None
                 subtitle_group_words, subtitle_group_for_idx, subtitle_start_times, subtitle_end_times = (
