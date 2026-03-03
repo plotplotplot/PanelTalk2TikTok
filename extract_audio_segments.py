@@ -39,8 +39,15 @@ def extract_audio_segments(
     for i, row in enumerate(tqdm(word_segment_times, desc="Extracting audio")):
         start = int(row["start"] * sr)
         end = int(row["end"] * sr)
+        if start < 0:
+            start = 0
+        if end < 0:
+            end = 0
+        if end > len(frames):
+            end = len(frames)
         if start >= end:
-            raise Exception(f"Start >= End {row} {start} {end}")
+            # Skip invalid or empty segments after clamping.
+            continue
         seg = frames[start:end]
 
         prev = []

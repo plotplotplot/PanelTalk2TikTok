@@ -4,15 +4,12 @@ Simple cut with dynamic zoom switching aligned to punctuation and face tracking.
 Optional subtitle rendering.
 """
 import argparse
-import csv
 import bisect
 import json
 import math
 import os
 import sys
 import subprocess
-import wave
-
 import cv2
 import numpy as np
 from tqdm import tqdm
@@ -21,8 +18,26 @@ from PIL import ImageFont
 import extract_audio_segments
 import segment_utils
 import transcriptJson2csv
-from subtitles import apply_subtitles, build_subtitle_context, get_active_word_idx, parse_bgr, build_word_groups
+from subtitles import build_subtitle_context, parse_bgr, build_word_groups
 from zoom_select import select_zoom_rects
+from cut_dynamic_helpers import (
+    SubtitleRenderer,
+    apply_bounded_prepend_extend,
+    merge_short_segments,
+    precompute_segments_basic,
+    prepend_silence_to_wav,
+    trim_leading_audio_wav,
+    _build_keep_ranges,
+    _precompute_segments_from_ranges,
+    _prompt_notch_ranges_cli,
+    _prompt_notch_ranges_gui,
+    _read_notch_csv,
+    _retime_segments_for_notches,
+    _retime_segments_for_word_cuts,
+    _retime_segments_to_frame_timeline,
+    _retime_zoom_rects_for_notches,
+    _write_notch_csv,
+)
 
 # Reuse helpers from simple_cut where possible.
 from simple_cut import (
@@ -34,452 +49,6 @@ from simple_cut import (
 )
 
 
-def prepend_silence_to_wav(path, seconds):
-    """
-    Prepend silence to a WAV file in-place using a temp file.
-    """
-    if seconds <= 0:
-        return False
-    tmp_path = path + ".silence_pre.tmp"
-    with wave.open(path, "rb") as rf:
-        params = rf.getparams()
-        nchannels = params.nchannels
-        sampwidth = params.sampwidth
-        framerate = params.framerate
-        silence_frames = int(round(seconds * framerate))
-        if silence_frames <= 0:
-            return False
-        with wave.open(tmp_path, "wb") as wf:
-            wf.setparams(params)
-            silence_byte = b"\x80" if sampwidth == 1 else b"\x00"
-            wf.writeframes(silence_byte * silence_frames * nchannels * sampwidth)
-            while True:
-                data = rf.readframes(16384)
-                if not data:
-                    break
-                wf.writeframes(data)
-    os.replace(tmp_path, path)
-    return True
-
-
-def trim_leading_audio_wav(path, seconds):
-    """
-    Trim leading audio from a WAV file in-place using a temp file.
-    """
-    if seconds <= 0:
-        return False
-    tmp_path = path + ".trim_pre.tmp"
-    with wave.open(path, "rb") as rf:
-        params = rf.getparams()
-        nchannels = params.nchannels
-        sampwidth = params.sampwidth
-        framerate = params.framerate
-        trim_frames = int(round(seconds * framerate))
-        if trim_frames <= 0:
-            return False
-        with wave.open(tmp_path, "wb") as wf:
-            wf.setparams(params)
-            rf.readframes(trim_frames)
-            while True:
-                data = rf.readframes(16384)
-                if not data:
-                    break
-                wf.writeframes(data)
-    os.replace(tmp_path, path)
-    return True
-
-
-def _parse_timecode_to_seconds(value):
-    s = str(value).strip()
-    if not s:
-        return None
-    if ":" in s:
-        parts = [p.strip() for p in s.split(":")]
-        try:
-            nums = [float(p) for p in parts]
-        except ValueError:
-            return None
-        if len(nums) == 3:
-            return nums[0] * 3600.0 + nums[1] * 60.0 + nums[2]
-        if len(nums) == 2:
-            return nums[0] * 60.0 + nums[1]
-        if len(nums) == 1:
-            return nums[0]
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-def _read_notch_csv(path):
-    ranges = []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                if not row:
-                    continue
-                if len(row) >= 2:
-                    start = _parse_timecode_to_seconds(row[0])
-                    end = _parse_timecode_to_seconds(row[1])
-                    if start is None or end is None:
-                        continue
-                    if end > start:
-                        ranges.append((float(start), float(end)))
-    except Exception as e:
-        print(f"Warning: failed to read notch CSV {path}: {e}")
-    return ranges
-
-
-def _write_notch_csv(path, ranges):
-    try:
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["start", "end"])
-            for start, end in ranges:
-                writer.writerow([f"{float(start):.3f}", f"{float(end):.3f}"])
-    except Exception as e:
-        print(f"Warning: failed to write notch CSV {path}: {e}")
-
-
-def _normalize_notch_ranges(ranges):
-    if not ranges:
-        return []
-    ranges = sorted([(float(s), float(e)) for s, e in ranges if e > s], key=lambda r: (r[0], r[1]))
-    merged = [ranges[0]]
-    for start, end in ranges[1:]:
-        last_start, last_end = merged[-1]
-        if start <= last_end:
-            merged[-1] = (last_start, max(last_end, end))
-        else:
-            merged.append((start, end))
-    return merged
-
-
-def _build_keep_ranges(total_duration, notch_ranges):
-    if total_duration is None or total_duration <= 0:
-        return []
-    notch_ranges = _normalize_notch_ranges(notch_ranges)
-    if not notch_ranges:
-        return [(0.0, float(total_duration))]
-    clipped = []
-    for start, end in notch_ranges:
-        s = max(0.0, float(start))
-        e = min(float(total_duration), float(end))
-        if e > s:
-            clipped.append((s, e))
-    clipped = _normalize_notch_ranges(clipped)
-    keep = []
-    cursor = 0.0
-    for start, end in clipped:
-        if start > cursor:
-            keep.append((cursor, start))
-        cursor = max(cursor, end)
-    if cursor < total_duration:
-        keep.append((cursor, float(total_duration)))
-    return keep
-
-
-def _precompute_segments_from_ranges(ranges, fps):
-    precomputed = []
-    for start, end in ranges:
-        start_f = float(start) * fps
-        end_f = float(end) * fps
-        start_frame = math.floor(start_f)
-        end_frame = math.floor(end_f)
-        if end_frame < start_frame:
-            end_frame = start_frame
-        precomputed.append(
-            {
-                "word": "",
-                "start_frame": start_frame,
-                "end_frame": end_frame,
-                "start_sec": start_frame / fps,
-                "end_sec": end_frame / fps,
-            }
-        )
-    return precomputed
-
-
-def _prompt_notch_ranges_gui(path):
-    try:
-        import tkinter as tk
-        from tkinter import messagebox
-        from tkinter.scrolledtext import ScrolledText
-    except Exception as e:
-        raise RuntimeError(
-            f"GUI not available for notch input: {e}\n"
-            "Install tkinter, e.g.:\n"
-            "  pip install tk\n"
-            "If you prefer system packages on Ubuntu:\n"
-            "  sudo apt-get install python3-tk"
-        )
-
-    result = {"ranges": None}
-
-    def _parse_lines(text):
-        ranges = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 2:
-                return None, f"Invalid line (need start,end): {line}"
-            start = _parse_timecode_to_seconds(parts[0])
-            end = _parse_timecode_to_seconds(parts[1])
-            if start is None or end is None:
-                return None, f"Invalid timecode in line: {line}"
-            if end <= start:
-                return None, f"End must be > start: {line}"
-            ranges.append((float(start), float(end)))
-        return ranges, None
-
-    root = tk.Tk()
-    root.title("Notch Ranges (Remove Sections)")
-    root.geometry("520x360")
-
-    msg = (
-        "Enter ranges to remove from the final cut.\n"
-        "Format: start,end (seconds or mm:ss or hh:mm:ss)\n"
-        "Example:\n"
-        "12.5,18.0\n"
-        "01:02,01:15.5"
-    )
-    label = tk.Label(root, text=msg, justify="left")
-    label.pack(padx=10, pady=8, anchor="w")
-
-    text = ScrolledText(root, height=10)
-    text.pack(fill="both", expand=True, padx=10, pady=6)
-
-    btn_frame = tk.Frame(root)
-    btn_frame.pack(pady=8)
-
-    def on_save():
-        ranges, err = _parse_lines(text.get("1.0", "end"))
-        if err:
-            messagebox.showerror("Invalid Input", err)
-            return
-        result["ranges"] = ranges
-        _write_notch_csv(path, ranges)
-        root.destroy()
-
-    def on_skip():
-        result["ranges"] = []
-        root.destroy()
-
-    tk.Button(btn_frame, text="Save", command=on_save, width=12).pack(side="left", padx=6)
-    tk.Button(btn_frame, text="Skip", command=on_skip, width=12).pack(side="left", padx=6)
-
-    root.mainloop()
-    return result["ranges"] if result["ranges"] is not None else []
-
-
-def _prompt_notch_ranges_cli():
-    print("Enter ranges to remove (start,end). Use seconds or mm:ss or hh:mm:ss.")
-    print("One range per line. Blank line to finish. Example: 12.5,18.0")
-    ranges = []
-    while True:
-        try:
-            line = input("notch> ").strip()
-        except EOFError:
-            break
-        if not line:
-            break
-        if line.startswith("#"):
-            continue
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 2:
-            print("Invalid line (need start,end).")
-            continue
-        start = _parse_timecode_to_seconds(parts[0])
-        end = _parse_timecode_to_seconds(parts[1])
-        if start is None or end is None:
-            print("Invalid timecode.")
-            continue
-        if end <= start:
-            print("End must be > start.")
-            continue
-        ranges.append((float(start), float(end)))
-    return ranges
-
-
-def _apply_notch_ranges(word_segment_times, ranges):
-    if not ranges:
-        return word_segment_times
-    ranges = _normalize_notch_ranges(ranges)
-    kept = []
-    removed = 0
-    for seg in word_segment_times:
-        start = float(seg.get("start", 0.0))
-        end = float(seg.get("end", start))
-        overlap = False
-        for r_start, r_end in ranges:
-            if end <= r_start:
-                break
-            if start < r_end and end > r_start:
-                overlap = True
-                break
-        if overlap:
-            removed += 1
-            continue
-        kept.append(seg)
-    print(f"Applied notch ranges: removed {removed} word segments, kept {len(kept)}")
-    return kept
-
-
-def _retime_segments_for_notches(word_segment_times, ranges):
-    if not ranges:
-        return word_segment_times
-    ranges = _normalize_notch_ranges(ranges)
-    retimed = []
-    removed = 0
-    for seg in word_segment_times:
-        start = float(seg.get("start", 0.0))
-        end = float(seg.get("end", start))
-        overlap = False
-        for r_start, r_end in ranges:
-            if end <= r_start:
-                break
-            if start < r_end and end > r_start:
-                overlap = True
-                break
-        if overlap:
-            removed += 1
-            continue
-        shift = 0.0
-        for r_start, r_end in ranges:
-            if r_end <= start:
-                shift += (r_end - r_start)
-            else:
-                break
-        curr = dict(seg)
-        curr["start"] = max(0.0, start - shift)
-        curr["end"] = max(curr["start"], end - shift)
-        retimed.append(curr)
-    print(f"Retimed notch ranges: removed {removed} word segments, kept {len(retimed)}")
-    return retimed
-
-
-def _retime_segments_for_word_cuts(word_segment_times):
-    if not word_segment_times:
-        return word_segment_times
-    retimed = []
-    cursor = 0.0
-    for seg in word_segment_times:
-        start = float(seg.get("start", 0.0))
-        end = float(seg.get("end", start))
-        dur = max(0.0, end - start)
-        curr = dict(seg)
-        curr["start"] = cursor
-        curr["end"] = cursor + dur
-        retimed.append(curr)
-        cursor += dur
-    print(f"Retimed word segments to concatenated timeline ({cursor:.2f}s total).")
-    return retimed
-
-
-def _retime_segments_to_frame_timeline(word_segment_times, fps):
-    if not word_segment_times or not fps:
-        return word_segment_times
-    retimed = []
-    cursor_frames = 0
-    for seg in word_segment_times:
-        start = float(seg.get("start", 0.0))
-        end = float(seg.get("end", start))
-        start_frame = math.floor(start * fps)
-        end_frame = math.floor(end * fps)
-        if end_frame < start_frame:
-            end_frame = start_frame
-        dur_frames = max(0, end_frame - start_frame)
-        curr = dict(seg)
-        curr["start"] = cursor_frames / fps
-        curr["end"] = (cursor_frames + dur_frames) / fps
-        retimed.append(curr)
-        cursor_frames += dur_frames
-    print(f"Quantized word segments to frame timeline ({cursor_frames / fps:.2f}s total).")
-    return retimed
-
-
-def _retime_zoom_rects_for_notches(zoom_rects, ranges, fps):
-    if not zoom_rects or not ranges or not fps:
-        return zoom_rects
-    ranges = _normalize_notch_ranges(ranges)
-    retimed = []
-    removed = 0
-    for rec in zoom_rects:
-        frame = rec.get("frame")
-        if frame is None:
-            retimed.append(rec)
-            continue
-        t = float(frame) / float(fps)
-        overlap = False
-        for r_start, r_end in ranges:
-            if t < r_start:
-                break
-            if t >= r_start and t < r_end:
-                overlap = True
-                break
-        if overlap:
-            removed += 1
-            continue
-        shift = 0.0
-        for r_start, r_end in ranges:
-            if r_end <= t:
-                shift += (r_end - r_start)
-            else:
-                break
-        new_t = max(0.0, t - shift)
-        new_frame = int(round(new_t * float(fps)))
-        curr = dict(rec)
-        curr["frame"] = new_frame
-        retimed.append(curr)
-    if removed:
-        print(f"Retimed zoom centers for notches: dropped {removed} point(s), kept {len(retimed)}")
-    return retimed
-
-
-def precompute_segments_basic(word_segment_times, fps):
-    precomputed = []
-    for seg in tqdm(word_segment_times, desc="Precomputing segment timings"):
-        start_f = seg["start"] * fps
-        end_f = seg["end"] * fps
-        start_frame = math.floor(start_f)
-        end_frame = math.floor(end_f)
-        if end_frame < start_frame:
-            end_frame = start_frame
-        precomputed.append(
-            {
-                "word": seg.get("word", ""),
-                "start_frame": start_frame,
-                "end_frame": end_frame,
-                "start_sec": start_frame / fps,
-                "end_sec": end_frame / fps,
-            }
-        )
-    return precomputed
-
-
-def enforce_min_caption_gap(word_segment_times, min_gap_seconds):
-    if not word_segment_times or min_gap_seconds is None:
-        return word_segment_times
-    min_gap = float(min_gap_seconds)
-    if min_gap <= 0:
-        return word_segment_times
-    adjusted = [dict(word_segment_times[0])]
-    for seg in word_segment_times[1:]:
-        curr = dict(seg)
-        prev = adjusted[-1]
-        try:
-            gap = float(curr.get("start", 0.0)) - float(prev.get("end", 0.0))
-        except Exception:
-            gap = 0.0
-        if gap < min_gap:
-            prev_end = float(prev.get("end", prev.get("start", 0.0)))
-            prev["end"] = max(prev_end, float(curr.get("start", prev_end)))
-        adjusted.append(curr)
-    return adjusted
 
 
 def build_punctuation_boundaries(word_segment_times, use_absolute_time=False, total_duration=None):
@@ -1015,7 +584,11 @@ def resolve_zoom_rect_state(t, fps, input_width, input_height, zoom_rects, zoom_
             continue
 
         transition_dur = max(0.001, float(zoom_time or 0.0))
-        transition_start = max(prev_frame / fps if fps else 0.0, target_time - transition_dur)
+        prev_time = prev_frame / fps if fps else 0.0
+        max_dur = max(0.001, target_time - prev_time)
+        if transition_dur > max_dur:
+            transition_dur = max_dur
+        transition_start = max(prev_time, target_time - transition_dur)
         if t < transition_start:
             return prev
         if t < target_time:
@@ -1153,6 +726,25 @@ def _zoomed_phase_index(seq_index):
     return None
 
 
+def apply_zoom_transform(frame, center, zoom, rotate, input_width, input_height, output_width, output_height, fallback_center):
+    """Apply zoom, pan, and rotation to a frame. Called AFTER fade blending."""
+    if center is None:
+        center = fallback_center
+    x1, y1, x2, y2 = compute_crop_box(
+        center,
+        input_width,
+        input_height,
+        output_width,
+        output_height,
+        zoom,
+    )
+    cropped = frame[y1:y2, x1:x2]
+    if cropped.size == 0:
+        return None
+    if cropped.shape[1] != output_width or cropped.shape[0] != output_height:
+        cropped = cv2.resize(cropped, (output_width, output_height))
+    cropped = rotate_output_frame(cropped, rotate)
+    return cropped
 
 
 def extract_video_segments_dynamic(
@@ -1207,16 +799,20 @@ def extract_video_segments_dynamic(
     subtitle_highlight_color=(0, 255, 255),
     subtitle_shadow_color=(0, 0, 0),
     subtitle_cache_max=64,
-    subtitle_hold_ms=120.0,
     max_seconds=None,
     temp_codec="avc1",
     fade_frames=0,
+    debug_fade=False,
+    debug_timeline=False,
+    fade_mode="sequence",
+    fade_use_source_gaps=True,
+    center_blend_frames=0,
+    debug_centers=False,
     video_shift_frames=0,
     fallback_center=None,
     rotate_degrees=0.0,
 ):
     print("Extracting video segments (dynamic zoom, face tracking)...")
-
     cap = cv2.VideoCapture(video_file)
     if not cap.isOpened():
         print(f"Error: Could not open video file {video_file}")
@@ -1231,6 +827,14 @@ def extract_video_segments_dynamic(
     total_duration = total_frames_source / input_fps if input_fps else 0.0
     print(f"Input video: {input_width}x{input_height}, {input_fps:.2f} fps, duration {total_duration:.2f}s")
     print(f"Output video: {output_width}x{output_height}")
+    if debug_fade:
+        print(f"[fade] enabled fade_frames={fade_frames}")
+    if debug_timeline:
+        print(
+            f"[timeline] fps={fps} input_fps={input_fps:.4f} "
+            f"video_shift_frames={video_shift_frames} "
+            f"fade_frames={fade_frames}"
+        )
 
     out, _actual_codec = create_video_writer(
         output_video_file,
@@ -1271,10 +875,54 @@ def extract_video_segments_dynamic(
         print(f"[state] t=0.00s -> {format_state_label(seq_states[seq_index], zoom_rects, zoomed_count)}")
         zoomed_count = 0
     zooming_duration = float(zoom_time) if zoom_time and zoom_time > 0 else float(zoom_ramp_sec or 0.0)
-    overlay_cache = {}
-    mask_cache = {}
-    bg_mask_cache = {}
     subtitle_cache_max = max(0, int(subtitle_cache_max))
+    subtitle_renderer = None
+    if subtitles and subtitle_group_words:
+        subtitle_renderer = SubtitleRenderer(
+            subtitles=subtitles,
+            subtitle_group_words=subtitle_group_words,
+            subtitle_group_for_idx=subtitle_group_for_idx,
+            subtitle_start_times=subtitle_start_times,
+            subtitle_end_times=subtitle_end_times,
+            output_height=output_height,
+            output_width=output_width,
+            font_scale=font_scale,
+            text_height=text_height,
+            text_height_2=text_height_2,
+            subtitle_lines=subtitle_lines,
+            font_ttf=font_ttf,
+            subtitle_bg=subtitle_bg,
+            subtitle_bg_color=subtitle_bg_color,
+            subtitle_bg_alpha=subtitle_bg_alpha,
+            subtitle_bg_pad=subtitle_bg_pad,
+            subtitle_bg_height=subtitle_bg_height,
+            subtitle_bg_offset_y=subtitle_bg_offset_y,
+            shadow_size=shadow_size,
+            shadow_offset_x=shadow_offset_x,
+            shadow_offset_y=shadow_offset_y,
+            subtitle_dilate=subtitle_dilate,
+            subtitle_dilate_size=subtitle_dilate_size,
+            subtitle_dilate_color=subtitle_dilate_color,
+            subtitle_text_color=subtitle_text_color,
+            subtitle_highlight_color=subtitle_highlight_color,
+            subtitle_shadow_color=subtitle_shadow_color,
+            subtitle_cache_max=subtitle_cache_max,
+        )
+
+    def _render_subtitles_after_zoom(frame, t_sub=None):
+        if subtitle_renderer is None:
+            return frame
+        if t_sub is None:
+            t_sub = frame_idx / fps if fps else 0.0
+        return subtitle_renderer.render(frame, t_sub)
+
+    def _render_subtitles_after_zoom(frame, t_sub=None):
+        nonlocal out_frame_idx
+        if subtitle_renderer is None:
+            return frame
+        if t_sub is None:
+            t_sub = out_frame_idx / fps if fps else 0.0
+        return subtitle_renderer.render(frame, t_sub)
 
     video_shift_frames = int(video_shift_frames)
 
@@ -1286,11 +934,62 @@ def extract_video_segments_dynamic(
     pbar = tqdm(total=total_frames, desc="Writing frames")
 
     fade_frames = max(0, int(fade_frames))
-    prev_tail = []
+    prev_tail_frames = []
 
-    for seg in precomputed_segments:
+    prev_end_frame = None
+    prev_segment_center = None
+    min_gap_frames = 0
+    def _blend_centers(a, b, alpha):
+        if a is None and b is None:
+            return None
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return (a[0] * (1.0 - alpha) + b[0] * alpha, a[1] * (1.0 - alpha) + b[1] * alpha)
+
+    def _apply_zoom_payload(payload):
+        frame = payload["frame"]
+        center = payload["center"]
+        current_zoom = payload["zoom"]
+        current_rotate = payload["rotate"]
+        return apply_zoom_transform(
+            frame, center, current_zoom, current_rotate,
+            input_width, input_height, output_width, output_height,
+            fallback_center
+        )
+
+    for seg_idx, seg in enumerate(precomputed_segments, start=1):
         seg_frame_idx = 0
-        prev_tail_snapshot = list(prev_tail) if fade_frames > 0 else []
+        seg_frames = []
+        gap_frames = None
+        if prev_end_frame is not None:
+            if fade_use_source_gaps:
+                gap_frames = int(seg["start_frame"]) - int(prev_end_frame)
+            else:
+                gap_frames = 0
+        if gap_frames is not None and gap_frames < 0:
+            gap_frames = 0
+        do_fade = fade_frames > 0 and prev_tail_frames and (gap_frames is None or gap_frames > 0)
+        prev_tail_snapshot = list(prev_tail_frames) if do_fade else []
+        if debug_timeline:
+            seg_len = max(0, int(seg["end_frame"]) - int(seg["start_frame"]))
+            out_time = (out_frame_idx + seg_frame_idx) / fps if fps else 0.0
+            print(
+                f"[timeline] seg={seg_idx} src_frames={seg['start_frame']}..{seg['end_frame']} "
+                f"len={seg_len} out_idx={out_frame_idx} out_t={out_time:.3f} "
+                f"gap_frames={gap_frames} do_fade={do_fade}"
+            )
+        if debug_centers and prev_segment_center is not None:
+            print(
+                f"[center] seg={seg_idx} prev_center=({prev_segment_center[0]:.1f},{prev_segment_center[1]:.1f})"
+            )
+        if fade_frames > 0 and debug_fade:
+            print(
+                f"[fade] seg={seg_idx} prev_tail={len(prev_tail_snapshot)} "
+                f"fade_frames={fade_frames} seg_frames={seg['end_frame'] - seg['start_frame']} "
+                f"gap_frames={gap_frames} do_fade={do_fade}"
+            )
         for frame_idx in range(seg["start_frame"], seg["end_frame"]):
             if max_seconds is not None and max_seconds > 0 and fps:
                 if out_frame_idx >= int(round(max_seconds * fps)):
@@ -1323,8 +1022,11 @@ def extract_video_segments_dynamic(
                 last_center = rotate_point(source_center, source_width, source_height, rotate_degrees)
             if last_center is None:
                 last_center = fallback_center
+            if center_blend_frames and prev_segment_center is not None and seg_frame_idx < center_blend_frames:
+                alpha_center = (seg_frame_idx + 1) / float(center_blend_frames + 1)
+                last_center = _blend_centers(prev_segment_center, last_center, alpha_center)
 
-            out_time = out_frame_idx / fps if fps else 0.0
+            out_time = (out_frame_idx + seg_frame_idx) / fps if fps else 0.0
             if zoom_rects_have_timeline(zoom_rects):
                 authored = resolve_zoom_rect_state(
                     out_time,
@@ -1448,93 +1150,22 @@ def extract_video_segments_dynamic(
                     center = last_center
                 current_rotate = 0.0
 
-            x1, y1, x2, y2 = compute_crop_box(
-                center,
-                input_width,
-                input_height,
-                output_width,
-                output_height,
-                current_zoom,
+            seg_frames.append(
+                {
+                    "frame": frame.copy(),
+                    "center": center,
+                    "zoom": float(current_zoom),
+                    "rotate": float(current_rotate),
+                }
             )
-            cropped = frame[y1:y2, x1:x2]
-            if cropped.size == 0:
-                continue
-            if cropped.shape[1] != output_width or cropped.shape[0] != output_height:
-                cropped = cv2.resize(cropped, (output_width, output_height))
-            cropped = rotate_output_frame(cropped, current_rotate)
-            if subtitles and subtitle_group_words:
-                if subtitle_cache_max == 0:
-                    overlay_cache.clear()
-                    mask_cache.clear()
-                    bg_mask_cache.clear()
-                elif subtitle_cache_max > 0 and len(overlay_cache) > subtitle_cache_max:
-                    overlay_cache.clear()
-                    mask_cache.clear()
-                    bg_mask_cache.clear()
-                t_sub = out_time
-                active_idx = get_active_word_idx(
-                    t_sub, subtitle_start_times, subtitle_end_times
-                )
-                if active_idx is None and last_sub_idx is not None and subtitle_hold_ms and last_sub_time is not None:
-                    if (t_sub - last_sub_time) <= (float(subtitle_hold_ms) / 1000.0):
-                        active_idx = last_sub_idx
-                if active_idx is not None:
-                    last_sub_idx = active_idx
-                    last_sub_time = t_sub
-                if active_idx is None and last_sub_idx is not None and subtitle_hold_ms and last_sub_time is not None:
-                    if (t_sub - last_sub_time) <= (float(subtitle_hold_ms) / 1000.0):
-                        active_idx = last_sub_idx
-                if active_idx is not None:
-                    last_sub_idx = active_idx
-                    last_sub_time = t_sub
-                if active_idx is not None:
-                    gi, pos = subtitle_group_for_idx.get(active_idx, (None, None))
-                    if gi is not None and gi < len(subtitle_group_words):
-                        group_words = subtitle_group_words[gi]
-                        cropped = apply_subtitles(
-                            cropped,
-                            (output_height, output_width, 3),
-                            group_words,
-                            pos,
-                            overlay_cache,
-                            mask_cache,
-                            bg_mask_cache,
-                            font_scale,
-                            text_height,
-                            text_height_2,
-                            subtitle_lines,
-                            font_ttf,
-                            subtitle_bg,
-                            subtitle_bg_color,
-                            subtitle_bg_alpha,
-                            subtitle_bg_pad,
-                            subtitle_bg_height,
-                            subtitle_bg_offset_y,
-                            shadow_size,
-                            shadow_offset_x,
-                            shadow_offset_y,
-                            subtitle_dilate,
-                            subtitle_dilate_size,
-                            subtitle_dilate_color,
-                            subtitle_text_color,
-                            subtitle_highlight_color,
-                            subtitle_shadow_color,
-                        )
-
-            if fade_frames > 0 and prev_tail_snapshot and seg_frame_idx < fade_frames:
-                prev_idx = min(seg_frame_idx, len(prev_tail_snapshot) - 1)
-                alpha = (seg_frame_idx + 1) / float(fade_frames + 1)
-                blended = cv2.addWeighted(prev_tail_snapshot[prev_idx], 1.0 - alpha, cropped, alpha, 0)
-                out.write(blended)
-            else:
-                out.write(cropped)
-            if fade_frames > 0:
-                if len(prev_tail) >= fade_frames:
-                    prev_tail.pop(0)
-                prev_tail.append(cropped.copy())
 
             if visualize:
-                preview = cropped.copy()
+                preview = _apply_zoom_payload(seg_frames[-1])
+                if preview is None:
+                    preview = frame.copy()
+                preview = _render_subtitles_after_zoom(
+                    preview, t_sub=(out_frame_idx + seg_frame_idx) / fps if fps else 0.0
+                )
                 cv2.putText(
                     preview,
                     f"t={out_time:.2f}s zoom={current_zoom:.2f}",
@@ -1560,9 +1191,138 @@ def extract_video_segments_dynamic(
                     cv2.destroyAllWindows()
                     return True
 
-            out_frame_idx += 1
             seg_frame_idx += 1
+            prev_segment_center = last_center
+
+        # Determine which frames to write from this segment
+        # For the first segment, write all frames (no previous tail to fade with)
+        # For subsequent segments with fade, we need to handle the crossfade properly
+        
+        if fade_frames > 0 and prev_tail_snapshot:
+            # We have a previous segment's tail to fade with
+            head = seg_frames[:fade_frames]
+            
+            if fade_mode == "split":
+                # Split fade: use half of fade frames from tail, half from head
+                prev_len = max(1, fade_frames // 2)
+                prev_len = min(prev_len, len(prev_tail_snapshot))
+                next_len = max(1, fade_frames - prev_len)
+                next_len = min(next_len, len(head))
+                prev_seq = prev_tail_snapshot[-prev_len:]
+                head_seq = head[:next_len]
+                blend_count = min(fade_frames, prev_len + next_len)
+                
+                # Write blended frames for the transition
+                # These replace the last prev_len frames of previous segment
+                # and the first next_len frames of current segment
+                for i in range(blend_count):
+                    alpha = (i + 1) / float(blend_count + 1)
+                    alpha = alpha * alpha * (3.0 - 2.0 * alpha)  # smoothstep
+                    
+                    # Map blend index to appropriate frames in tail and head sequences
+                    if prev_len > 1:
+                        prev_idx = int(round(i * (prev_len - 1) / max(1, blend_count - 1)))
+                    else:
+                        prev_idx = 0
+                    if next_len > 1:
+                        next_idx = int(round(i * (next_len - 1) / max(1, blend_count - 1)))
+                    else:
+                        next_idx = 0
+                    
+                    prev_payload = prev_seq[prev_idx]
+                    next_payload = head_seq[next_idx]
+                    blended_frame = cv2.addWeighted(
+                        prev_payload["frame"], 1.0 - alpha, next_payload["frame"], alpha, 0
+                    )
+                    # Interpolate zoom parameters during fade for smooth transition
+                    interp_center = _blend_centers(prev_payload["center"], next_payload["center"], alpha)
+                    interp_zoom = lerp_scalar(prev_payload["zoom"], next_payload["zoom"], alpha)
+                    interp_rotate = lerp_scalar(prev_payload["rotate"], next_payload["rotate"], alpha)
+                    blended_payload = {
+                        "frame": blended_frame,
+                        "center": interp_center,
+                        "zoom": interp_zoom,
+                        "rotate": interp_rotate,
+                    }
+                    blended = _apply_zoom_payload(blended_payload)
+                    if blended is None:
+                        continue
+                    if debug_fade and i == 0:
+                        print(f"[fade] seg={seg_idx} blending alpha={alpha:.3f}")
+                    if debug_timeline and i == 0:
+                        t_out = out_frame_idx / fps if fps else 0.0
+                        print(
+                            f"[timeline] seg={seg_idx} fade_blend_count={blend_count} "
+                            f"blend_start_out_idx={out_frame_idx} out_t={t_out:.3f}"
+                        )
+                    out.write(_render_subtitles_after_zoom(blended))
+                    out_frame_idx += 1
+                    pbar.update(1)
+                # Skip the head frames that were used in the blend
+                start_idx = next_len
+            else:
+                # Sequence or hold fade
+                blend_count = min(len(prev_tail_snapshot), len(head), fade_frames)
+                for i in range(blend_count):
+                    alpha = (i + 1) / float(blend_count + 1)
+                    alpha = alpha * alpha * (3.0 - 2.0 * alpha)  # smoothstep
+                    if fade_mode == "hold":
+                        prev_frame = prev_tail_snapshot[-1]
+                        next_frame = head[0]
+                    else:
+                        prev_frame = prev_tail_snapshot[i]
+                        next_frame = head[i]
+                    prev_payload = prev_frame
+                    next_payload = next_frame
+                    blended_frame = cv2.addWeighted(
+                        prev_payload["frame"], 1.0 - alpha, next_payload["frame"], alpha, 0
+                    )
+                    # Interpolate zoom parameters during fade for smooth transition
+                    interp_center = _blend_centers(prev_payload["center"], next_payload["center"], alpha)
+                    interp_zoom = lerp_scalar(prev_payload["zoom"], next_payload["zoom"], alpha)
+                    interp_rotate = lerp_scalar(prev_payload["rotate"], next_payload["rotate"], alpha)
+                    blended_payload = {
+                        "frame": blended_frame,
+                        "center": interp_center,
+                        "zoom": interp_zoom,
+                        "rotate": interp_rotate,
+                    }
+                    blended = _apply_zoom_payload(blended_payload)
+                    if blended is None:
+                        continue
+                    if debug_fade and i == 0:
+                        print(f"[fade] seg={seg_idx} blending alpha={alpha:.3f}")
+                    if debug_timeline and i == 0:
+                        t_out = out_frame_idx / fps if fps else 0.0
+                        print(
+                            f"[timeline] seg={seg_idx} fade_blend_count={blend_count} "
+                            f"blend_start_out_idx={out_frame_idx} out_t={t_out:.3f}"
+                        )
+                    out.write(_render_subtitles_after_zoom(blended))
+                    out_frame_idx += 1
+                    pbar.update(1)
+                # Skip the head frames that were used in the blend
+                start_idx = blend_count
+        else:
+            # First segment or no fade
+            start_idx = 0
+        
+        # Write frames from current segment
+        # For first segment: write all frames
+        # For subsequent segments: write from start_idx to end, but NOT the tail frames
+        # (tail frames will be saved for next segment's fade)
+        write_end_idx = len(seg_frames) - fade_frames if fade_frames > 0 else len(seg_frames)
+        for frame in seg_frames[start_idx:write_end_idx]:
+            cropped = _apply_zoom_payload(frame)
+            if cropped is None:
+                continue
+            out.write(_render_subtitles_after_zoom(cropped))
+            out_frame_idx += 1
             pbar.update(1)
+        
+        # Save tail frames for next segment's fade
+        prev_tail_frames = seg_frames[-fade_frames:] if fade_frames > 0 else []
+        prev_end_frame = seg["end_frame"]
 
     pbar.close()
     cap.release()
@@ -1621,7 +1381,6 @@ def extract_video_dynamic_full(
     subtitle_highlight_color=(0, 255, 255),
     subtitle_shadow_color=(0, 0, 0),
     subtitle_cache_max=64,
-    subtitle_hold_ms=120.0,
     max_seconds=None,
     temp_codec="avc1",
     rotate_degrees=0.0,
@@ -1671,9 +1430,38 @@ def extract_video_dynamic_full(
         seq_end = float(static_seconds or 0.0)
         print(f"[state] t=0.00s -> {format_state_label(seq_states[seq_index], zoom_rects, zoomed_count)}")
     zooming_duration = float(zoom_time) if zoom_time and zoom_time > 0 else float(zoom_ramp_sec or 0.0)
-    overlay_cache = {}
-    mask_cache = {}
-    bg_mask_cache = {}
+    subtitle_renderer = None
+    if subtitles and subtitle_group_words:
+        subtitle_renderer = SubtitleRenderer(
+            subtitles=subtitles,
+            subtitle_group_words=subtitle_group_words,
+            subtitle_group_for_idx=subtitle_group_for_idx,
+            subtitle_start_times=subtitle_start_times,
+            subtitle_end_times=subtitle_end_times,
+            output_height=output_height,
+            output_width=output_width,
+            font_scale=font_scale,
+            text_height=text_height,
+            text_height_2=text_height_2,
+            subtitle_lines=subtitle_lines,
+            font_ttf=font_ttf,
+            subtitle_bg=subtitle_bg,
+            subtitle_bg_color=subtitle_bg_color,
+            subtitle_bg_alpha=subtitle_bg_alpha,
+            subtitle_bg_pad=subtitle_bg_pad,
+            subtitle_bg_height=subtitle_bg_height,
+            subtitle_bg_offset_y=subtitle_bg_offset_y,
+            shadow_size=shadow_size,
+            shadow_offset_x=shadow_offset_x,
+            shadow_offset_y=shadow_offset_y,
+            subtitle_dilate=subtitle_dilate,
+            subtitle_dilate_size=subtitle_dilate_size,
+            subtitle_dilate_color=subtitle_dilate_color,
+            subtitle_text_color=subtitle_text_color,
+            subtitle_highlight_color=subtitle_highlight_color,
+            subtitle_shadow_color=subtitle_shadow_color,
+            subtitle_cache_max=subtitle_cache_max,
+        )
     pbar = tqdm(total=total_frames, desc="Writing frames")
     frame_idx = 0
 
@@ -1839,52 +1627,7 @@ def extract_video_dynamic_full(
             if cropped.shape[1] != output_width or cropped.shape[0] != output_height:
                 cropped = cv2.resize(cropped, (output_width, output_height))
             cropped = rotate_output_frame(cropped, current_rotate)
-            if subtitles and subtitle_group_words:
-                if subtitle_cache_max == 0:
-                    overlay_cache.clear()
-                    mask_cache.clear()
-                    bg_mask_cache.clear()
-                elif subtitle_cache_max > 0 and len(overlay_cache) > subtitle_cache_max:
-                    overlay_cache.clear()
-                    mask_cache.clear()
-                    bg_mask_cache.clear()
-                t_sub = t
-                active_idx = get_active_word_idx(
-                    t_sub, subtitle_start_times, subtitle_end_times
-                )
-                if active_idx is not None:
-                    gi, pos = subtitle_group_for_idx.get(active_idx, (None, None))
-                    if gi is not None and gi < len(subtitle_group_words):
-                        group_words = subtitle_group_words[gi]
-                        cropped = apply_subtitles(
-                            cropped,
-                            (output_height, output_width, 3),
-                            group_words,
-                            pos,
-                            overlay_cache,
-                            mask_cache,
-                            bg_mask_cache,
-                            font_scale,
-                            text_height,
-                            text_height_2,
-                            subtitle_lines,
-                            font_ttf,
-                            subtitle_bg,
-                            subtitle_bg_color,
-                            subtitle_bg_alpha,
-                            subtitle_bg_pad,
-                            subtitle_bg_height,
-                            subtitle_bg_offset_y,
-                            shadow_size,
-                            shadow_offset_x,
-                            shadow_offset_y,
-                            subtitle_dilate,
-                            subtitle_dilate_size,
-                            subtitle_dilate_color,
-                            subtitle_text_color,
-                            subtitle_highlight_color,
-                            subtitle_shadow_color,
-                        )
+            cropped = _render_subtitles_after_zoom(cropped, t)
 
             out.write(cropped)
             if visualize:
@@ -2055,12 +1798,6 @@ def main():
         type=int,
         default=64,
         help="Max subtitle overlay cache entries (default: 64; 0 disables caching).",
-    )
-    parser.add_argument(
-        "--subtitle-hold-ms",
-        type=float,
-        default=120.0,
-        help="Hold last subtitle highlight for this many ms to reduce flicker (default: 120).",
     )
     parser.add_argument(
         "--subtitle-shadow-color",
@@ -2268,7 +2005,46 @@ def main():
         "--fade-frames",
         type=int,
         default=6,
-        help="Crossfade length for video stitching (default: 6, unused but kept for parity)",
+        help="Crossfade length for video stitching in segment mode (default: 6).",
+    )
+    parser.add_argument(
+        "--min-gap-len",
+        type=float,
+        default=0.0,
+        help="Minimum gap length in seconds; gaps shorter than this are merged into adjacent segments (default: 0).",
+    )
+    parser.add_argument(
+        "--debug-fade",
+        action="store_true",
+        help="Log crossfade details per segment.",
+    )
+    parser.add_argument(
+        "--debug-timeline",
+        action="store_true",
+        help="Log segment timing and output frame mapping.",
+    )
+    parser.add_argument(
+        "--debug-segments",
+        action="store_true",
+        help="Log total duration and segment stats for audio/video extraction.",
+    )
+    parser.add_argument(
+        "--center-blend-frames",
+        type=int,
+        default=0,
+        help="Blend centers over N frames at each segment boundary to reduce jumps (default: 0).",
+    )
+    parser.add_argument(
+        "--debug-centers",
+        action="store_true",
+        help="Log center deltas at segment boundaries.",
+    )
+    parser.add_argument(
+        "--fade-mode",
+        type=str,
+        default="sequence",
+        choices=["sequence", "hold", "split"],
+        help="Crossfade mode: sequence blends matching tail/head frames, hold blends last/first frames, split blends leading head frames against trailing tail frames (default: sequence).",
     )
     parser.add_argument(
         "--fade-samples",
@@ -2316,19 +2092,13 @@ def main():
         "--extend-ms",
         type=int,
         default=20,
-        help="Extend each segment end by this many ms (default: 20)",
-    )
-    parser.add_argument(
-        "--min-caption-gap",
-        type=float,
-        default=1.0,
-        help="Minimum gap between captions in seconds (default: 1.0). Gaps below this are closed by extending the previous caption.",
+        help="Extend each segment end by this many ms, up to the start of the next segment (default: 20)",
     )
     parser.add_argument(
         "--prepend-ms",
         type=int,
         default=20,
-        help="Extend each segment start earlier by this many ms (default: 20)",
+        help="Extend each segment start earlier by this many ms, up to the end of the previous segment (default: 20)",
     )
     parser.add_argument(
         "--audio-delay-ms",
@@ -2420,6 +2190,9 @@ def main():
                 if tok.startswith(prefix):
                     return True
         return False
+
+    if args.debug_fade:
+        print(f"[fade] args fade_frames={args.fade_frames}")
 
     if args.baltimoretechmeetup:
         args.no_cut = True
@@ -2532,16 +2305,9 @@ def main():
     word_segment_times = segment_utils.fix_zero_length_words(
         word_segment_times, sr, shift_seconds=args.shift_seconds
     )
-    word_segment_times = segment_utils.extend_segments(
-        word_segment_times, extend_ms=args.extend_ms
+    word_segment_times = apply_bounded_prepend_extend(
+        word_segment_times, prepend_ms=args.prepend_ms, extend_ms=args.extend_ms
     )
-    word_segment_times = segment_utils.prepend_segments(
-        word_segment_times, prepend_ms=args.prepend_ms
-    )
-    if args.min_caption_gap is not None:
-        word_segment_times = enforce_min_caption_gap(
-            word_segment_times, args.min_caption_gap
-        )
     if args.max_seconds and args.max_seconds > 0:
         limit = float(args.max_seconds)
         trimmed = []
@@ -2574,7 +2340,11 @@ def main():
             shifted, sr
         )
         print(f"Applied audio delay: {args.audio_delay_ms:.1f} ms")
+    # Preserve original word timings for subtitles/highlights.
     word_segment_times_for_cut = word_segment_times
+    if args.min_gap_len and args.min_gap_len > 0:
+        word_segment_times_for_cut = [dict(seg) for seg in word_segment_times_for_cut]
+        word_segment_times_for_cut = merge_short_segments(word_segment_times_for_cut, args.min_gap_len)
 
     notch_ranges = []
     cut_ranges = None
@@ -2585,7 +2355,11 @@ def main():
             print(f"Loaded notch ranges from: {notch_csv}")
     else:
         print(f"No notch file found at: {notch_csv}")
-        notch_ranges = _prompt_notch_ranges_gui(notch_csv)
+        try:
+            notch_ranges = _prompt_notch_ranges_gui(notch_csv)
+        except RuntimeError as exc:
+            print(str(exc))
+            sys.exit(1)
         if notch_ranges is None:
             notch_ranges = _prompt_notch_ranges_cli()
             if notch_ranges:
@@ -2975,7 +2749,6 @@ def main():
                 subtitle_highlight_color=subtitle_highlight_color,
                 subtitle_shadow_color=subtitle_shadow_color,
                 subtitle_cache_max=args.subtitle_cache_max,
-                subtitle_hold_ms=args.subtitle_hold_ms,
                 max_seconds=args.max_seconds if args.max_seconds and args.max_seconds > 0 else None,
                 zoom_point=zoom_point,
                 zoom_rects=zoom_rects,
@@ -2984,6 +2757,12 @@ def main():
                 no_punct_schedule=args.no_punct_schedule,
                 temp_codec=args.temp_codec,
                 fade_frames=args.fade_frames,
+                debug_fade=args.debug_fade,
+                debug_timeline=args.debug_timeline,
+                fade_mode=args.fade_mode,
+                fade_use_source_gaps=True,
+                center_blend_frames=args.center_blend_frames,
+                debug_centers=args.debug_centers,
                 video_shift_frames=args.video_shift_frames,
                 rotate_degrees=args.rotate,
             )
@@ -3034,7 +2813,6 @@ def main():
                 subtitle_highlight_color=subtitle_highlight_color,
                 subtitle_shadow_color=subtitle_shadow_color,
                 subtitle_cache_max=args.subtitle_cache_max,
-                subtitle_hold_ms=args.subtitle_hold_ms,
                 max_seconds=args.max_seconds if args.max_seconds and args.max_seconds > 0 else None,
                 zoom_point=zoom_point,
                 zoom_rects=zoom_rects,
@@ -3093,7 +2871,6 @@ def main():
                 subtitle_highlight_color=subtitle_highlight_color,
                 subtitle_shadow_color=subtitle_shadow_color,
                 subtitle_cache_max=args.subtitle_cache_max,
-                subtitle_hold_ms=args.subtitle_hold_ms,
                 max_seconds=args.max_seconds if args.max_seconds and args.max_seconds > 0 else None,
                 zoom_point=zoom_point,
                 zoom_rects=zoom_rects,
@@ -3101,6 +2878,11 @@ def main():
                 loop_sequence=args.loop_sequence,
                 no_punct_schedule=args.no_punct_schedule,
                 temp_codec=args.temp_codec,
+                fade_frames=args.fade_frames,
+                debug_fade=args.debug_fade,
+                debug_timeline=args.debug_timeline,
+                fade_mode=args.fade_mode,
+                fade_use_source_gaps=True,
                 video_shift_frames=args.video_shift_frames,
                 rotate_degrees=args.rotate,
             )
