@@ -10,10 +10,12 @@
 #include <QHostAddress>
 #include <QJsonDocument>
 #include <QJsonParseError>
+#include <QMenu>
 #include <QMetaObject>
 #include <QMouseEvent>
 #include <QPoint>
 #include <QPointer>
+#include <QAction>
 #include <QSemaphore>
 #include <QSlider>
 #include <QTcpServer>
@@ -140,7 +142,18 @@ QWidget* findWidgetByObjectName(QWidget* root, const QString& objectName) {
     return matches.isEmpty() ? nullptr : matches.constFirst();
 }
 
-bool sendSyntheticClick(QWidget* window, const QPoint& pos) {
+Qt::MouseButton parseMouseButton(const QString& value) {
+    const QString normalized = value.trimmed().toLower();
+    if (normalized == QStringLiteral("right")) {
+        return Qt::RightButton;
+    }
+    if (normalized == QStringLiteral("middle")) {
+        return Qt::MiddleButton;
+    }
+    return Qt::LeftButton;
+}
+
+bool sendSyntheticClick(QWidget* window, const QPoint& pos, Qt::MouseButton button) {
     if (!window) {
         return false;
     }
@@ -156,20 +169,50 @@ bool sendSyntheticClick(QWidget* window, const QPoint& pos) {
         QEvent::MouseButtonPress,
         localPos,
         globalPos,
-        Qt::LeftButton,
-        Qt::LeftButton,
+        button,
+        button,
         Qt::NoModifier);
     QMouseEvent releaseEvent(
         QEvent::MouseButtonRelease,
         localPos,
         globalPos,
-        Qt::LeftButton,
+        button,
         Qt::NoButton,
         Qt::NoModifier);
 
     const bool pressOk = QApplication::sendEvent(target, &pressEvent);
     const bool releaseOk = QApplication::sendEvent(target, &releaseEvent);
     return pressOk && releaseOk;
+}
+
+bool sendSyntheticClick(QWidget* window, const QPoint& pos) {
+    return sendSyntheticClick(window, pos, Qt::LeftButton);
+}
+
+QJsonObject menuSnapshot(QMenu* menu) {
+    QJsonArray actions;
+    if (menu) {
+        const auto menuActions = menu->actions();
+        for (QAction* action : menuActions) {
+            if (!action || action->isSeparator()) {
+                continue;
+            }
+            actions.append(QJsonObject{
+                {QStringLiteral("text"), action->text()},
+                {QStringLiteral("enabled"), action->isEnabled()}
+            });
+        }
+    }
+    return QJsonObject{
+        {QStringLiteral("ok"), menu != nullptr},
+        {QStringLiteral("visible"), menu && menu->isVisible()},
+        {QStringLiteral("actions"), actions}
+    };
+}
+
+QMenu* activePopupMenu() {
+    QWidget* widget = QApplication::activePopupWidget();
+    return qobject_cast<QMenu*>(widget);
 }
 
 struct Request {

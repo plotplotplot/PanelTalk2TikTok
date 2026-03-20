@@ -135,10 +135,10 @@ QImage applyClipGrade(const QImage& source, const TimelineClip& clip) {
         QRgb* row = reinterpret_cast<QRgb*>(graded.scanLine(y));
         for (int x = 0; x < graded.width(); ++x) {
             QColor color = QColor::fromRgb(row[x]);
-            qreal h = 0.0;
-            qreal s = 0.0;
-            qreal l = 0.0;
-            qreal a = 0.0;
+            float h = 0.0f;
+            float s = 0.0f;
+            float l = 0.0f;
+            float a = 0.0f;
             color.getHslF(&h, &s, &l, &a);
 
             int r = clampChannel(qRound(((color.red() - 127.5) * clip.contrast) + 127.5 + clip.brightness * 255.0));
@@ -147,8 +147,8 @@ QImage applyClipGrade(const QImage& source, const TimelineClip& clip) {
 
             QColor adjusted(r, g, b, color.alpha());
             adjusted.getHslF(&h, &s, &l, &a);
-            s = qBound(0.0, s * clip.saturation, 1.0);
-            a = qBound(0.0, a * clip.opacity, 1.0);
+            s = qBound(0.0f, static_cast<float>(s * clip.saturation), 1.0f);
+            a = qBound(0.0f, static_cast<float>(a * clip.opacity), 1.0f);
             adjusted.setHslF(h, s, l, a);
             row[x] = adjusted.rgba();
         }
@@ -1246,6 +1246,8 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
     
     QMenu menu(this);
     QAction* deleteAction = menu.addAction(QStringLiteral("Delete"));
+    QAction* gradingAction = menu.addAction(QStringLiteral("Grading..."));
+    QAction* resetGradingAction = menu.addAction(QStringLiteral("Reset Grading"));
     QAction* propertiesAction = menu.addAction(QStringLiteral("Properties"));
     
     QAction* selected = menu.exec(event->globalPos());
@@ -1257,15 +1259,81 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
         update();
         return;
     }
+
+    if (selected == gradingAction) {
+        TimelineClip& clip = m_clips[clipIndex];
+        QDialog dialog(this);
+        dialog.setWindowTitle(QStringLiteral("Clip Grading"));
+        auto* layout = new QFormLayout(&dialog);
+
+        auto* brightnessSpin = new QDoubleSpinBox(&dialog);
+        brightnessSpin->setRange(-1.0, 1.0);
+        brightnessSpin->setSingleStep(0.05);
+        brightnessSpin->setDecimals(2);
+        brightnessSpin->setValue(clip.brightness);
+
+        auto* contrastSpin = new QDoubleSpinBox(&dialog);
+        contrastSpin->setRange(0.0, 3.0);
+        contrastSpin->setSingleStep(0.05);
+        contrastSpin->setDecimals(2);
+        contrastSpin->setValue(clip.contrast);
+
+        auto* saturationSpin = new QDoubleSpinBox(&dialog);
+        saturationSpin->setRange(0.0, 3.0);
+        saturationSpin->setSingleStep(0.05);
+        saturationSpin->setDecimals(2);
+        saturationSpin->setValue(clip.saturation);
+
+        auto* opacitySpin = new QDoubleSpinBox(&dialog);
+        opacitySpin->setRange(0.0, 1.0);
+        opacitySpin->setSingleStep(0.05);
+        opacitySpin->setDecimals(2);
+        opacitySpin->setValue(clip.opacity);
+
+        layout->addRow(QStringLiteral("Brightness"), brightnessSpin);
+        layout->addRow(QStringLiteral("Contrast"), contrastSpin);
+        layout->addRow(QStringLiteral("Saturation"), saturationSpin);
+        layout->addRow(QStringLiteral("Opacity"), opacitySpin);
+
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+        layout->addRow(buttons);
+        QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+        QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+        if (dialog.exec() == QDialog::Accepted) {
+            clip.brightness = brightnessSpin->value();
+            clip.contrast = contrastSpin->value();
+            clip.saturation = saturationSpin->value();
+            clip.opacity = opacitySpin->value();
+            if (clipsChanged) clipsChanged();
+            update();
+        }
+        return;
+    }
+
+    if (selected == resetGradingAction) {
+        TimelineClip& clip = m_clips[clipIndex];
+        clip.brightness = 0.0;
+        clip.contrast = 1.0;
+        clip.saturation = 1.0;
+        clip.opacity = 1.0;
+        if (clipsChanged) clipsChanged();
+        update();
+        return;
+    }
     
     if (selected == propertiesAction) {
         const TimelineClip& clip = m_clips[clipIndex];
         QMessageBox::information(this, QStringLiteral("Clip Properties"),
-            QStringLiteral("Name: %1\nPath: %2\nStart: %3\nDuration: %4 frames")
+            QStringLiteral("Name: %1\nPath: %2\nStart: %3\nDuration: %4 frames\nBrightness: %5\nContrast: %6\nSaturation: %7\nOpacity: %8")
                 .arg(clip.label)
                 .arg(QDir::toNativeSeparators(clip.filePath))
                 .arg(timecodeForFrame(clip.startFrame))
-                .arg(clip.durationFrames));
+                .arg(clip.durationFrames)
+                .arg(clip.brightness, 0, 'f', 2)
+                .arg(clip.contrast, 0, 'f', 2)
+                .arg(clip.saturation, 0, 'f', 2)
+                .arg(clip.opacity, 0, 'f', 2));
         return;
     }
 }
@@ -1597,6 +1665,10 @@ private:
         obj[QStringLiteral("durationFrames")] = static_cast<qint64>(clip.durationFrames);
         obj[QStringLiteral("trackIndex")] = clip.trackIndex;
         obj[QStringLiteral("color")] = clip.color.name(QColor::HexArgb);
+        obj[QStringLiteral("brightness")] = clip.brightness;
+        obj[QStringLiteral("contrast")] = clip.contrast;
+        obj[QStringLiteral("saturation")] = clip.saturation;
+        obj[QStringLiteral("opacity")] = clip.opacity;
         return obj;
     }
     
@@ -1613,6 +1685,10 @@ private:
         if (!clip.color.isValid()) {
             clip.color = QColor::fromHsv(static_cast<int>(qHash(clip.filePath) % 360), 160, 220, 220);
         }
+        clip.brightness = obj.value(QStringLiteral("brightness")).toDouble(0.0);
+        clip.contrast = obj.value(QStringLiteral("contrast")).toDouble(1.0);
+        clip.saturation = obj.value(QStringLiteral("saturation")).toDouble(1.0);
+        clip.opacity = obj.value(QStringLiteral("opacity")).toDouble(1.0);
         return clip;
     }
     
