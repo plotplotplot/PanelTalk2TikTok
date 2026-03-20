@@ -1,0 +1,1004 @@
+[STARTUP] main() started
+[STARTUP] QApplication created in 6 ms
+[STARTUP] Building explorer pane...
+[STARTUP] Explorer pane built in 16 ms
+[STARTUP] Building editor pane...
+[STARTUP] Offscreen surface created in 0 ms
+[STARTUP] Creating QRhi OpenGL context...
+[STARTUP] QRhi::create(OpenGLES2) took 252 ms
+PreviewRenderer: Using backend: "OpenGL"
+[STARTUP] Initializing GPUCompositor...
+[STARTUP] GPUCompositor initialized in 0 ms
+[STARTUP] PreviewRenderer::initialize() total: 252 ms
+[DEBUG] Adding transport widgets...
+[DEBUG] Transport widgets added
+[DEBUG] Creating TimelineWidget...
+[DEBUG] TimelineWidget created
+[DEBUG] buildEditorPane() returning
+[STARTUP] Editor pane built in 259 ms
+ControlServer listening on http://127.0.0.1: 40130
+[STARTUP] ControlServer started in 276 ms
+This plugin does not support propagateSizeHints()
+[PLAYBACK      0 ms] PreviewWindow::requestFramesForCurrentPosition | no-active-clips frame=0
+[PLAYBACK      0 ms] PreviewWindow::setTimelineClips | clips=1 cache=0
+[PLAYBACK      0 ms] EditorWindow::setCurrentFrame | requested=94 bounded=94
+[PLAYBACK      0 ms] PreviewWindow::setCurrentFrame | frame=94 visible=1 cache=0
+[PLAYBACK      0 ms] PreviewWindow::ensurePipeline.begin | clips=1 frame=94
+AsyncDecoder initialized with 8 workers
+[PLAYBACK      0 ms] PreviewWindow::ensurePipeline.end | workers=8
+[PLAYBACK      0 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=94 pending=0
+[PLAYBACK      0 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=61 cached=0
+[CACHE      0 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=61
+[CACHE      0 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=61 priority=20
+[DECODE      0 ms] AsyncDecoder::requestFrame | seq=1 file=aiarchitectures2.mp4 frame=61 priority=20 timeoutMs=10000 pending=0
+[DECODE      0 ms] DecoderWorker::processRequest.begin | seq=1 file=aiarchitectures2.mp4 frame=61 priority=20 queue=0 thread=762f6505a6c0
+[PLAYBACK      0 ms] PreviewWindow::setPlaybackState | playing=0 clips=1 cache=1
+[PLAYBACK      0 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=94 pending=0
+[PLAYBACK      0 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=61 cached=0
+[CACHE      0 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=61
+[CACHE      0 ms] TimelineCache::requestFrame.dedup | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=61 listeners=2
+[DECODE     14 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=61 last=-1
+[DECODE     14 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=61 delta=62
+[DECODE     14 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=61
+[DECODE     81 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=61 null=0 waitMs=67 decoded=61
+[CACHE     81 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=61 null=0 waitMs=81
+[PLAYBACK     82 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=61 null=0 waitMs=82
+[PLAYBACK     82 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=61 null=0 waitMs=82
+[DECODE     81 ms] DecoderWorker::processRequest.end | seq=1 file=aiarchitectures2.mp4 frame=61 null=0 waitMs=81
+[STARTUP] main() started
+[STARTUP] QApplication created in 57 ms
+[STARTUP] Building explorer pane...
+[STARTUP] Explorer pane built in 13 ms
+[STARTUP] Building editor pane...
+[STARTUP] Offscreen surface created in 29 ms
+[STARTUP] Creating QRhi OpenGL context...
+[STARTUP] QRhi::create(OpenGLES2) took 126 ms
+PreviewRenderer: Using backend: "OpenGL"
+[STARTUP] Initializing GPUCompositor...
+[STARTUP] GPUCompositor initialized in 0 ms
+[STARTUP] PreviewRenderer::initialize() total: 155 ms
+[DEBUG] Adding transport widgets...
+[DEBUG] Transport widgets added
+[DEBUG] Creating TimelineWidget...
+[DEBUG] TimelineWidget created
+[DEBUG] buildEditorPane() returning
+[STARTUP] Editor pane built in 166 ms
+ControlServer listening on http://127.0.0.1: 59899
+[STARTUP] ControlServer started in 179 ms
+[PLAYBACK      0 ms] PreviewWindow::requestFramesForCurrentPosition | no-active-clips frame=0
+[PLAYBACK      0 ms] PreviewWindow::setTimelineClips | clips=1 cache=0
+[PLAYBACK      0 ms] EditorWindow::setCurrentFrame | requested=94 bounded=94
+[PLAYBACK      0 ms] PreviewWindow::setCurrentFrame | frame=94 visible=1 cache=0
+[PLAYBACK      0 ms] PreviewWindow::ensurePipeline.begin | clips=1 frame=94
+AsyncDecoder initialized with 8 workers
+[PLAYBACK      0 ms] PreviewWindow::ensurePipeline.end | workers=8
+[PLAYBACK      0 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=94 pending=0
+[PLAYBACK      0 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=61 cached=0
+[CACHE      0 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=61
+[CACHE      0 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=61 priority=20
+[DECODE      0 ms] AsyncDecoder::requestFrame | seq=1 file=aiarchitectures2.mp4 frame=61 priority=20 timeoutMs=10000 pending=0
+[DECODE      0 ms] DecoderWorker::processRequest.begin | seq=1 file=aiarchitectures2.mp4 frame=61 priority=20 queue=0 thread=725d395ff6c0
+[PLAYBACK      0 ms] PreviewWindow::setPlaybackState | playing=0 clips=1 cache=1
+[PLAYBACK      1 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=94 pending=0
+[PLAYBACK      1 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=61 cached=0
+[CACHE      1 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=61
+[CACHE      1 ms] TimelineCache::requestFrame.dedup | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=61 listeners=2
+[DECODE     11 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=61 last=-1
+[DECODE     11 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=61 delta=62
+[DECODE     11 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=61
+[DECODE     87 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=61 null=0 waitMs=76 decoded=61
+[CACHE     87 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=61 null=0 waitMs=87
+[PLAYBACK     88 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=61 null=0 waitMs=88
+[PLAYBACK     88 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=61 null=0 waitMs=87
+[DECODE     87 ms] DecoderWorker::processRequest.end | seq=1 file=aiarchitectures2.mp4 frame=61 null=0 waitMs=87
+[PLAYBACK  13879 ms] EditorWindow::setCurrentFrame | requested=85 bounded=85
+[PLAYBACK  13879 ms] PreviewWindow::setCurrentFrame | frame=85 visible=1 cache=1
+[PLAYBACK  13879 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=85 pending=0
+[PLAYBACK  13879 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=52 cached=0
+[CACHE  13879 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=52
+[CACHE  13879 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=52 priority=20
+[DECODE  13879 ms] AsyncDecoder::requestFrame | seq=2 file=aiarchitectures2.mp4 frame=52 priority=20 timeoutMs=10000 pending=0
+[DECODE  13879 ms] DecoderWorker::processRequest.begin | seq=2 file=aiarchitectures2.mp4 frame=52 priority=20 queue=0 thread=725d38dfe6c0
+[DECODE  13890 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=52 last=-1
+[DECODE  13890 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=52 delta=53
+[DECODE  13890 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=52
+[DECODE  14257 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=52 null=0 waitMs=367 decoded=52
+[CACHE  14257 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=52 null=0 waitMs=378
+[PLAYBACK  14258 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=52 null=0 waitMs=379
+[DECODE  14257 ms] DecoderWorker::processRequest.end | seq=2 file=aiarchitectures2.mp4 frame=52 null=0 waitMs=378
+[PLAYBACK  15216 ms] PreviewWindow::setPlaybackState | playing=1 clips=1 cache=1
+[CACHE  15226 ms] TimelineCache::onPrefetchTimer | playhead=85
+[CACHE  15226 ms] TimelineCache::prefetch.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=53 priority=19
+[DECODE  15226 ms] AsyncDecoder::requestFrame | seq=3 file=aiarchitectures2.mp4 frame=53 priority=19 timeoutMs=5000 pending=0
+[CACHE  15226 ms] TimelineCache::prefetch.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=54 priority=18
+[DECODE  15226 ms] AsyncDecoder::requestFrame | seq=4 file=aiarchitectures2.mp4 frame=54 priority=18 timeoutMs=5000 pending=0
+[DECODE  15226 ms] DecoderWorker::processRequest.begin | seq=3 file=aiarchitectures2.mp4 frame=53 priority=19 queue=0 thread=725d32ffd6c0
+[DECODE  15226 ms] DecoderWorker::processRequest.begin | seq=4 file=aiarchitectures2.mp4 frame=54 priority=18 queue=0 thread=725d337fe6c0
+[DECODE  15236 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=54 last=-1
+[DECODE  15236 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=54 delta=55
+[DECODE  15236 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=54
+[DECODE  15236 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=53 last=-1
+[DECODE  15236 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=53 delta=54
+[DECODE  15236 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=53
+[PLAYBACK  15250 ms] EditorWindow::advanceFrame | current=85 next=86
+[PLAYBACK  15251 ms] EditorWindow::setCurrentFrame | requested=86 bounded=86
+[PLAYBACK  15251 ms] PreviewWindow::setCurrentFrame | frame=86 visible=1 cache=1
+[CACHE  15250 ms] TimelineCache::prefetch.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=55 priority=18
+[DECODE  15250 ms] AsyncDecoder::requestFrame | seq=5 file=aiarchitectures2.mp4 frame=55 priority=18 timeoutMs=5000 pending=0
+[CACHE  15250 ms] TimelineCache::prefetch.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=56 priority=17
+[DECODE  15250 ms] AsyncDecoder::requestFrame | seq=6 file=aiarchitectures2.mp4 frame=56 priority=17 timeoutMs=5000 pending=0
+[DECODE  15250 ms] DecoderWorker::processRequest.begin | seq=5 file=aiarchitectures2.mp4 frame=55 priority=18 queue=0 thread=725d33fff6c0
+[DECODE  15250 ms] DecoderWorker::processRequest.begin | seq=6 file=aiarchitectures2.mp4 frame=56 priority=17 queue=0 thread=725d327fc6c0
+[PLAYBACK  15251 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=86 pending=1
+[PLAYBACK  15251 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=53 cached=0
+[CACHE  15250 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=53
+[CACHE  15250 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=53 priority=20
+[DECODE  15250 ms] AsyncDecoder::requestFrame | seq=7 file=aiarchitectures2.mp4 frame=53 priority=20 timeoutMs=10000 pending=0
+[DECODE  15250 ms] DecoderWorker::processRequest.begin | seq=7 file=aiarchitectures2.mp4 frame=53 priority=20 queue=0 thread=725d31ffb6c0
+[PLAYBACK  15251 ms] PreviewWindow::onFrameTimer | currentFrame=86
+[PLAYBACK  15251 ms] EditorWindow::advanceFrame | current=86 next=87
+[PLAYBACK  15251 ms] EditorWindow::setCurrentFrame | requested=87 bounded=87
+[PLAYBACK  15251 ms] PreviewWindow::setCurrentFrame | frame=87 visible=1 cache=1
+[CACHE  15250 ms] TimelineCache::prefetch.skip | reason=visible-pending count=1
+[PLAYBACK  15251 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=87 pending=0
+[PLAYBACK  15251 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=54 cached=0
+[CACHE  15250 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=54
+[CACHE  15250 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=54 priority=20
+[DECODE  15250 ms] AsyncDecoder::requestFrame | seq=8 file=aiarchitectures2.mp4 frame=54 priority=20 timeoutMs=10000 pending=0
+[DECODE  15250 ms] DecoderWorker::processRequest.begin | seq=8 file=aiarchitectures2.mp4 frame=54 priority=20 queue=0 thread=725d317fa6c0
+[CACHE  15258 ms] TimelineCache::onPrefetchTimer | playhead=87
+[CACHE  15258 ms] TimelineCache::prefetch.skip | reason=visible-pending count=2
+[DECODE  15261 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=54 last=-1
+[DECODE  15261 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=54 delta=55
+[DECODE  15261 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=54
+[DECODE  15264 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=56 last=-1
+[DECODE  15264 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=56 delta=57
+[DECODE  15264 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=56
+[DECODE  15264 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=55 last=-1
+[DECODE  15264 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=55 delta=56
+[DECODE  15264 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=55
+[DECODE  15265 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=53 last=-1
+[DECODE  15265 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=53 delta=54
+[DECODE  15265 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=53
+[PLAYBACK  15282 ms] EditorWindow::advanceFrame | current=87 next=88
+[PLAYBACK  15282 ms] EditorWindow::setCurrentFrame | requested=88 bounded=88
+[PLAYBACK  15282 ms] PreviewWindow::setCurrentFrame | frame=88 visible=1 cache=1
+[CACHE  15282 ms] TimelineCache::prefetch.skip | reason=visible-pending count=2
+[PLAYBACK  15282 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=88 pending=0
+[PLAYBACK  15282 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=55 cached=0
+[CACHE  15282 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=55
+[CACHE  15282 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=55 priority=20
+[DECODE  15282 ms] AsyncDecoder::requestFrame | seq=9 file=aiarchitectures2.mp4 frame=55 priority=20 timeoutMs=10000 pending=0
+[DECODE  15282 ms] DecoderWorker::processRequest.begin | seq=9 file=aiarchitectures2.mp4 frame=55 priority=20 queue=0 thread=725d395ff6c0
+[PLAYBACK  15283 ms] PreviewWindow::onFrameTimer | currentFrame=88
+[PLAYBACK  15283 ms] EditorWindow::advanceFrame | current=88 next=89
+[DECODE  15282 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=55 last=61
+[PLAYBACK  15283 ms] EditorWindow::setCurrentFrame | requested=89 bounded=89
+[PLAYBACK  15283 ms] PreviewWindow::setCurrentFrame | frame=89 visible=1 cache=1
+[CACHE  15282 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  15283 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=89 pending=0
+[DECODE  15282 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=55 delta=-6
+[PLAYBACK  15283 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=56 cached=0
+[DECODE  15282 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=55
+[CACHE  15282 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=56
+[CACHE  15282 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=56 priority=20
+[DECODE  15282 ms] AsyncDecoder::requestFrame | seq=10 file=aiarchitectures2.mp4 frame=56 priority=20 timeoutMs=10000 pending=0
+[DECODE  15282 ms] DecoderWorker::processRequest.begin | seq=10 file=aiarchitectures2.mp4 frame=56 priority=20 queue=0 thread=725d38dfe6c0
+[DECODE  15282 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=56 last=52
+[CACHE  15290 ms] TimelineCache::onPrefetchTimer | playhead=89
+[CACHE  15290 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15315 ms] EditorWindow::advanceFrame | current=89 next=90
+[PLAYBACK  15315 ms] EditorWindow::setCurrentFrame | requested=90 bounded=90
+[PLAYBACK  15315 ms] PreviewWindow::setCurrentFrame | frame=90 visible=1 cache=1
+[CACHE  15314 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15315 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=90 pending=0
+[PLAYBACK  15315 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15315 ms] PreviewWindow::onFrameTimer | currentFrame=90
+[PLAYBACK  15315 ms] EditorWindow::advanceFrame | current=90 next=91
+[PLAYBACK  15315 ms] EditorWindow::setCurrentFrame | requested=91 bounded=91
+[PLAYBACK  15315 ms] PreviewWindow::setCurrentFrame | frame=91 visible=1 cache=1
+[CACHE  15314 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15315 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=91 pending=0
+[PLAYBACK  15315 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  15322 ms] TimelineCache::onPrefetchTimer | playhead=91
+[CACHE  15322 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15347 ms] EditorWindow::advanceFrame | current=91 next=92
+[PLAYBACK  15347 ms] EditorWindow::setCurrentFrame | requested=92 bounded=92
+[PLAYBACK  15347 ms] PreviewWindow::setCurrentFrame | frame=92 visible=1 cache=1
+[CACHE  15346 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15347 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=92 pending=0
+[PLAYBACK  15347 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15347 ms] PreviewWindow::onFrameTimer | currentFrame=92
+[PLAYBACK  15347 ms] EditorWindow::advanceFrame | current=92 next=93
+[PLAYBACK  15347 ms] EditorWindow::setCurrentFrame | requested=93 bounded=93
+[PLAYBACK  15347 ms] PreviewWindow::setCurrentFrame | frame=93 visible=1 cache=1
+[CACHE  15346 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15347 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=93 pending=0
+[PLAYBACK  15347 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  15354 ms] TimelineCache::onPrefetchTimer | playhead=93
+[CACHE  15354 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15379 ms] EditorWindow::advanceFrame | current=93 next=94
+[PLAYBACK  15379 ms] EditorWindow::setCurrentFrame | requested=94 bounded=94
+[PLAYBACK  15379 ms] PreviewWindow::setCurrentFrame | frame=94 visible=1 cache=1
+[CACHE  15378 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15379 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=94 pending=0
+[PLAYBACK  15379 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15379 ms] PreviewWindow::onFrameTimer | currentFrame=94
+[PLAYBACK  15379 ms] EditorWindow::advanceFrame | current=94 next=95
+[PLAYBACK  15379 ms] EditorWindow::setCurrentFrame | requested=95 bounded=95
+[PLAYBACK  15379 ms] PreviewWindow::setCurrentFrame | frame=95 visible=1 cache=1
+[CACHE  15378 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15379 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=95 pending=0
+[PLAYBACK  15379 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[DECODE  15379 ms] DecoderContext::decodeFrame.end | file=aiarchitectures2.mp4 target=56 null=0 decoded=56
+[CACHE  15379 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=56 null=0 waitMs=97
+[PLAYBACK  15380 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=56 null=0 waitMs=97
+[DECODE  15379 ms] DecoderWorker::processRequest.end | seq=10 file=aiarchitectures2.mp4 frame=56 null=0 waitMs=97
+[CACHE  15390 ms] TimelineCache::onPrefetchTimer | playhead=95
+[CACHE  15390 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  15410 ms] EditorWindow::advanceFrame | current=95 next=96
+[PLAYBACK  15410 ms] EditorWindow::setCurrentFrame | requested=96 bounded=96
+[PLAYBACK  15410 ms] PreviewWindow::setCurrentFrame | frame=96 visible=1 cache=1
+[CACHE  15410 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  15410 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=96 pending=0
+[PLAYBACK  15410 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=63 cached=0
+[CACHE  15410 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=63
+[CACHE  15410 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=63 priority=20
+[DECODE  15410 ms] AsyncDecoder::requestFrame | seq=11 file=aiarchitectures2.mp4 frame=63 priority=20 timeoutMs=10000 pending=0
+[PLAYBACK  15411 ms] PreviewWindow::onFrameTimer | currentFrame=96
+[PLAYBACK  15411 ms] EditorWindow::advanceFrame | current=96 next=97
+[PLAYBACK  15411 ms] EditorWindow::setCurrentFrame | requested=97 bounded=97
+[PLAYBACK  15411 ms] PreviewWindow::setCurrentFrame | frame=97 visible=1 cache=1
+[CACHE  15410 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15411 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=97 pending=1
+[PLAYBACK  15411 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[DECODE  15410 ms] DecoderWorker::processRequest.begin | seq=11 file=aiarchitectures2.mp4 frame=63 priority=20 queue=0 thread=725d38dfe6c0
+[DECODE  15410 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=63 last=56
+[CACHE  15418 ms] TimelineCache::onPrefetchTimer | playhead=97
+[CACHE  15418 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15442 ms] EditorWindow::advanceFrame | current=97 next=98
+[PLAYBACK  15443 ms] EditorWindow::setCurrentFrame | requested=98 bounded=98
+[PLAYBACK  15443 ms] PreviewWindow::setCurrentFrame | frame=98 visible=1 cache=1
+[CACHE  15442 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15443 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=98 pending=0
+[PLAYBACK  15443 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15443 ms] PreviewWindow::onFrameTimer | currentFrame=98
+[PLAYBACK  15443 ms] EditorWindow::advanceFrame | current=98 next=99
+[PLAYBACK  15443 ms] EditorWindow::setCurrentFrame | requested=99 bounded=99
+[PLAYBACK  15443 ms] PreviewWindow::setCurrentFrame | frame=99 visible=1 cache=1
+[CACHE  15442 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15443 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=99 pending=0
+[PLAYBACK  15443 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  15458 ms] TimelineCache::onPrefetchTimer | playhead=99
+[CACHE  15461 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15474 ms] EditorWindow::advanceFrame | current=99 next=100
+[PLAYBACK  15474 ms] EditorWindow::setCurrentFrame | requested=100 bounded=100
+[PLAYBACK  15474 ms] PreviewWindow::setCurrentFrame | frame=100 visible=1 cache=1
+[CACHE  15474 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15474 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=100 pending=0
+[PLAYBACK  15474 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15474 ms] PreviewWindow::onFrameTimer | currentFrame=100
+[PLAYBACK  15474 ms] EditorWindow::advanceFrame | current=100 next=101
+[PLAYBACK  15475 ms] EditorWindow::setCurrentFrame | requested=101 bounded=101
+[PLAYBACK  15475 ms] PreviewWindow::setCurrentFrame | frame=101 visible=1 cache=1
+[CACHE  15474 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15475 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=101 pending=0
+[PLAYBACK  15475 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  15481 ms] TimelineCache::onPrefetchTimer | playhead=101
+[CACHE  15481 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15506 ms] EditorWindow::advanceFrame | current=101 next=102
+[PLAYBACK  15506 ms] EditorWindow::setCurrentFrame | requested=102 bounded=102
+[PLAYBACK  15506 ms] PreviewWindow::setCurrentFrame | frame=102 visible=1 cache=1
+[CACHE  15506 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15506 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=102 pending=0
+[PLAYBACK  15506 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15506 ms] PreviewWindow::onFrameTimer | currentFrame=102
+[PLAYBACK  15507 ms] EditorWindow::advanceFrame | current=102 next=103
+[PLAYBACK  15507 ms] EditorWindow::setCurrentFrame | requested=103 bounded=103
+[PLAYBACK  15507 ms] PreviewWindow::setCurrentFrame | frame=103 visible=1 cache=1
+[CACHE  15506 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15507 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=103 pending=0
+[PLAYBACK  15507 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  15516 ms] TimelineCache::onPrefetchTimer | playhead=103
+[CACHE  15516 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15540 ms] EditorWindow::advanceFrame | current=103 next=104
+[PLAYBACK  15540 ms] EditorWindow::setCurrentFrame | requested=104 bounded=104
+[PLAYBACK  15540 ms] PreviewWindow::setCurrentFrame | frame=104 visible=1 cache=1
+[CACHE  15539 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15540 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=104 pending=0
+[PLAYBACK  15540 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15540 ms] PreviewWindow::onFrameTimer | currentFrame=104
+[PLAYBACK  15540 ms] EditorWindow::advanceFrame | current=104 next=105
+[PLAYBACK  15540 ms] EditorWindow::setCurrentFrame | requested=105 bounded=105
+[PLAYBACK  15540 ms] PreviewWindow::setCurrentFrame | frame=105 visible=1 cache=1
+[CACHE  15539 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15540 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=105 pending=0
+[PLAYBACK  15540 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  15548 ms] TimelineCache::onPrefetchTimer | playhead=105
+[CACHE  15549 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15570 ms] EditorWindow::advanceFrame | current=105 next=106
+[PLAYBACK  15570 ms] EditorWindow::setCurrentFrame | requested=106 bounded=106
+[PLAYBACK  15570 ms] PreviewWindow::setCurrentFrame | frame=106 visible=1 cache=1
+[CACHE  15570 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15570 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=106 pending=0
+[PLAYBACK  15570 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15571 ms] PreviewWindow::onFrameTimer | currentFrame=106
+[PLAYBACK  15571 ms] EditorWindow::advanceFrame | current=106 next=107
+[PLAYBACK  15571 ms] EditorWindow::setCurrentFrame | requested=107 bounded=107
+[PLAYBACK  15571 ms] PreviewWindow::setCurrentFrame | frame=107 visible=1 cache=1
+[CACHE  15570 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15571 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=107 pending=0
+[PLAYBACK  15571 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  15580 ms] TimelineCache::onPrefetchTimer | playhead=107
+[CACHE  15580 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[DECODE  15594 ms] DecoderContext::decodeFrame.end | file=aiarchitectures2.mp4 target=63 null=0 decoded=63
+[CACHE  15595 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=63 null=0 waitMs=185
+[PLAYBACK  15595 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=63 null=0 waitMs=184
+[DECODE  15595 ms] DecoderWorker::processRequest.end | seq=11 file=aiarchitectures2.mp4 frame=63 null=0 waitMs=185
+[PLAYBACK  15603 ms] EditorWindow::advanceFrame | current=107 next=108
+[PLAYBACK  15603 ms] EditorWindow::setCurrentFrame | requested=108 bounded=108
+[PLAYBACK  15603 ms] PreviewWindow::setCurrentFrame | frame=108 visible=1 cache=1
+[CACHE  15602 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  15603 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=108 pending=0
+[PLAYBACK  15603 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=75 cached=0
+[CACHE  15602 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=75
+[CACHE  15602 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=75 priority=20
+[DECODE  15602 ms] AsyncDecoder::requestFrame | seq=12 file=aiarchitectures2.mp4 frame=75 priority=20 timeoutMs=10000 pending=0
+[PLAYBACK  15603 ms] PreviewWindow::onFrameTimer | currentFrame=108
+[PLAYBACK  15603 ms] EditorWindow::advanceFrame | current=108 next=109
+[PLAYBACK  15603 ms] EditorWindow::setCurrentFrame | requested=109 bounded=109
+[PLAYBACK  15603 ms] PreviewWindow::setCurrentFrame | frame=109 visible=1 cache=1
+[CACHE  15602 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15603 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=109 pending=1
+[PLAYBACK  15603 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[DECODE  15602 ms] DecoderWorker::processRequest.begin | seq=12 file=aiarchitectures2.mp4 frame=75 priority=20 queue=0 thread=725d38dfe6c0
+[DECODE  15602 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=75 last=63
+[CACHE  15611 ms] TimelineCache::onPrefetchTimer | playhead=109
+[CACHE  15611 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15635 ms] EditorWindow::advanceFrame | current=109 next=110
+[PLAYBACK  15635 ms] EditorWindow::setCurrentFrame | requested=110 bounded=110
+[PLAYBACK  15635 ms] PreviewWindow::setCurrentFrame | frame=110 visible=1 cache=1
+[CACHE  15634 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15635 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=110 pending=0
+[PLAYBACK  15635 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15635 ms] PreviewWindow::onFrameTimer | currentFrame=110
+[PLAYBACK  15635 ms] EditorWindow::advanceFrame | current=110 next=111
+[PLAYBACK  15635 ms] EditorWindow::setCurrentFrame | requested=111 bounded=111
+[PLAYBACK  15635 ms] PreviewWindow::setCurrentFrame | frame=111 visible=1 cache=1
+[CACHE  15634 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15635 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=111 pending=0
+[PLAYBACK  15635 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  15641 ms] TimelineCache::onPrefetchTimer | playhead=111
+[CACHE  15641 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15666 ms] EditorWindow::advanceFrame | current=111 next=112
+[PLAYBACK  15666 ms] EditorWindow::setCurrentFrame | requested=112 bounded=112
+[PLAYBACK  15666 ms] PreviewWindow::setCurrentFrame | frame=112 visible=1 cache=1
+[CACHE  15665 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15666 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=112 pending=0
+[PLAYBACK  15666 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15666 ms] PreviewWindow::onFrameTimer | currentFrame=112
+[PLAYBACK  15666 ms] EditorWindow::advanceFrame | current=112 next=113
+[PLAYBACK  15666 ms] EditorWindow::setCurrentFrame | requested=113 bounded=113
+[PLAYBACK  15666 ms] PreviewWindow::setCurrentFrame | frame=113 visible=1 cache=1
+[CACHE  15665 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15666 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=113 pending=0
+[PLAYBACK  15666 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[DECODE  15679 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=54 null=0 waitMs=418 decoded=54
+[CACHE  15679 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=54 null=0 waitMs=429
+[PLAYBACK  15680 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=54 null=0 waitMs=429
+[DECODE  15679 ms] DecoderWorker::processRequest.end | seq=8 file=aiarchitectures2.mp4 frame=54 null=0 waitMs=429
+[CACHE  15680 ms] TimelineCache::onPrefetchTimer | playhead=113
+[CACHE  15680 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  15703 ms] EditorWindow::advanceFrame | current=113 next=114
+[PLAYBACK  15705 ms] EditorWindow::setCurrentFrame | requested=114 bounded=114
+[PLAYBACK  15705 ms] PreviewWindow::setCurrentFrame | frame=114 visible=1 cache=1
+[CACHE  15704 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  15705 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=114 pending=0
+[PLAYBACK  15705 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=81 cached=0
+[CACHE  15704 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=81
+[CACHE  15704 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=81 priority=20
+[DECODE  15704 ms] AsyncDecoder::requestFrame | seq=13 file=aiarchitectures2.mp4 frame=81 priority=20 timeoutMs=10000 pending=0
+[PLAYBACK  15705 ms] PreviewWindow::onFrameTimer | currentFrame=114
+[PLAYBACK  15705 ms] EditorWindow::advanceFrame | current=114 next=115
+[PLAYBACK  15705 ms] EditorWindow::setCurrentFrame | requested=115 bounded=115
+[PLAYBACK  15705 ms] PreviewWindow::setCurrentFrame | frame=115 visible=1 cache=1
+[CACHE  15704 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15705 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=115 pending=1
+[PLAYBACK  15705 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[DECODE  15705 ms] DecoderWorker::processRequest.begin | seq=13 file=aiarchitectures2.mp4 frame=81 priority=20 queue=0 thread=725d317fa6c0
+[DECODE  15705 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=81 last=54
+[CACHE  15727 ms] TimelineCache::onPrefetchTimer | playhead=115
+[CACHE  15727 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15730 ms] EditorWindow::advanceFrame | current=115 next=116
+[PLAYBACK  15730 ms] EditorWindow::setCurrentFrame | requested=116 bounded=116
+[PLAYBACK  15730 ms] PreviewWindow::setCurrentFrame | frame=116 visible=1 cache=1
+[CACHE  15730 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15730 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=116 pending=0
+[PLAYBACK  15730 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15730 ms] PreviewWindow::onFrameTimer | currentFrame=116
+[PLAYBACK  15730 ms] EditorWindow::advanceFrame | current=116 next=117
+[PLAYBACK  15730 ms] EditorWindow::setCurrentFrame | requested=117 bounded=117
+[PLAYBACK  15730 ms] PreviewWindow::setCurrentFrame | frame=117 visible=1 cache=1
+[CACHE  15730 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15731 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=117 pending=0
+[PLAYBACK  15731 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  15740 ms] TimelineCache::onPrefetchTimer | playhead=117
+[CACHE  15740 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15764 ms] EditorWindow::advanceFrame | current=117 next=118
+[PLAYBACK  15764 ms] EditorWindow::setCurrentFrame | requested=118 bounded=118
+[PLAYBACK  15764 ms] PreviewWindow::setCurrentFrame | frame=118 visible=1 cache=1
+[CACHE  15763 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15764 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=118 pending=0
+[PLAYBACK  15764 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15764 ms] PreviewWindow::onFrameTimer | currentFrame=118
+[PLAYBACK  15764 ms] EditorWindow::advanceFrame | current=118 next=119
+[PLAYBACK  15764 ms] EditorWindow::setCurrentFrame | requested=119 bounded=119
+[PLAYBACK  15764 ms] PreviewWindow::setCurrentFrame | frame=119 visible=1 cache=1
+[CACHE  15763 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15764 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=119 pending=0
+[PLAYBACK  15764 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  15774 ms] TimelineCache::onPrefetchTimer | playhead=119
+[CACHE  15774 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[DECODE  15781 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=53 null=0 waitMs=515 decoded=53
+[CACHE  15781 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=53 null=0 waitMs=531
+[PLAYBACK  15781 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=53 null=0 waitMs=530
+[DECODE  15781 ms] DecoderWorker::processRequest.end | seq=7 file=aiarchitectures2.mp4 frame=53 null=0 waitMs=531
+[PLAYBACK  15795 ms] EditorWindow::advanceFrame | current=119 next=120
+[PLAYBACK  15795 ms] EditorWindow::setCurrentFrame | requested=120 bounded=120
+[PLAYBACK  15795 ms] PreviewWindow::setCurrentFrame | frame=120 visible=1 cache=1
+[CACHE  15794 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  15795 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=120 pending=0
+[PLAYBACK  15795 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=87 cached=0
+[CACHE  15794 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=87
+[CACHE  15794 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=87 priority=20
+[DECODE  15794 ms] AsyncDecoder::requestFrame | seq=14 file=aiarchitectures2.mp4 frame=87 priority=20 timeoutMs=10000 pending=0
+[DECODE  15794 ms] DecoderWorker::processRequest.begin | seq=14 file=aiarchitectures2.mp4 frame=87 priority=20 queue=0 thread=725d31ffb6c0
+[DECODE  15794 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=87 last=53
+[DECODE  15794 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=87 delta=34
+[DECODE  15794 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=87
+[PLAYBACK  15795 ms] PreviewWindow::onFrameTimer | currentFrame=120
+[PLAYBACK  15795 ms] EditorWindow::advanceFrame | current=120 next=121
+[PLAYBACK  15795 ms] EditorWindow::setCurrentFrame | requested=121 bounded=121
+[PLAYBACK  15795 ms] PreviewWindow::setCurrentFrame | frame=121 visible=1 cache=1
+[CACHE  15794 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15795 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=121 pending=0
+[PLAYBACK  15795 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  15802 ms] TimelineCache::onPrefetchTimer | playhead=121
+[CACHE  15802 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15827 ms] EditorWindow::advanceFrame | current=121 next=122
+[PLAYBACK  15827 ms] EditorWindow::setCurrentFrame | requested=122 bounded=122
+[PLAYBACK  15827 ms] PreviewWindow::setCurrentFrame | frame=122 visible=1 cache=1
+[CACHE  15826 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15827 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=122 pending=0
+[PLAYBACK  15827 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15827 ms] PreviewWindow::onFrameTimer | currentFrame=122
+[PLAYBACK  15827 ms] EditorWindow::advanceFrame | current=122 next=123
+[PLAYBACK  15827 ms] EditorWindow::setCurrentFrame | requested=123 bounded=123
+[PLAYBACK  15827 ms] PreviewWindow::setCurrentFrame | frame=123 visible=1 cache=1
+[CACHE  15826 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15827 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=123 pending=0
+[PLAYBACK  15827 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[DECODE  15830 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=54 null=0 waitMs=594 decoded=54
+[CACHE  15831 ms] TimelineCache::prefetch.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=54 null=0
+[DECODE  15831 ms] DecoderWorker::processRequest.end | seq=4 file=aiarchitectures2.mp4 frame=54 null=0 waitMs=605
+[DECODE  15833 ms] DecoderContext::decodeFrame.end | file=aiarchitectures2.mp4 target=75 null=0 decoded=75
+[CACHE  15833 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=75 null=0 waitMs=231
+[PLAYBACK  15834 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=75 null=0 waitMs=231
+[DECODE  15833 ms] DecoderWorker::processRequest.end | seq=12 file=aiarchitectures2.mp4 frame=75 null=0 waitMs=231
+[CACHE  15833 ms] TimelineCache::onPrefetchTimer | playhead=123
+[CACHE  15833 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[DECODE  15842 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=53 null=0 waitMs=606 decoded=53
+[CACHE  15843 ms] TimelineCache::prefetch.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=53 null=0
+[DECODE  15843 ms] DecoderWorker::processRequest.end | seq=3 file=aiarchitectures2.mp4 frame=53 null=0 waitMs=617
+[PLAYBACK  15861 ms] EditorWindow::advanceFrame | current=123 next=124
+[PLAYBACK  15861 ms] EditorWindow::setCurrentFrame | requested=124 bounded=124
+[PLAYBACK  15861 ms] PreviewWindow::setCurrentFrame | frame=124 visible=1 cache=1
+[CACHE  15861 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  15862 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=124 pending=0
+[PLAYBACK  15862 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=91 cached=0
+[CACHE  15861 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=91
+[CACHE  15861 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=91 priority=20
+[DECODE  15861 ms] AsyncDecoder::requestFrame | seq=15 file=aiarchitectures2.mp4 frame=91 priority=20 timeoutMs=10000 pending=0
+[PLAYBACK  15862 ms] PreviewWindow::onFrameTimer | currentFrame=124
+[PLAYBACK  15862 ms] EditorWindow::advanceFrame | current=124 next=125
+[PLAYBACK  15862 ms] EditorWindow::setCurrentFrame | requested=125 bounded=125
+[PLAYBACK  15862 ms] PreviewWindow::setCurrentFrame | frame=125 visible=1 cache=1
+[CACHE  15861 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15862 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=125 pending=1
+[PLAYBACK  15862 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[DECODE  15862 ms] DecoderWorker::processRequest.begin | seq=15 file=aiarchitectures2.mp4 frame=91 priority=20 queue=0 thread=725d337fe6c0
+[DECODE  15862 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=91 last=54
+[DECODE  15862 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=91 delta=37
+[DECODE  15862 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=91
+[CACHE  15890 ms] TimelineCache::onPrefetchTimer | playhead=125
+[CACHE  15890 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15891 ms] EditorWindow::advanceFrame | current=125 next=126
+[PLAYBACK  15891 ms] EditorWindow::setCurrentFrame | requested=126 bounded=126
+[PLAYBACK  15891 ms] PreviewWindow::setCurrentFrame | frame=126 visible=1 cache=1
+[CACHE  15891 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15892 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=126 pending=0
+[PLAYBACK  15892 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15892 ms] PreviewWindow::onFrameTimer | currentFrame=126
+[PLAYBACK  15892 ms] EditorWindow::advanceFrame | current=126 next=127
+[PLAYBACK  15892 ms] EditorWindow::setCurrentFrame | requested=127 bounded=127
+[PLAYBACK  15892 ms] PreviewWindow::setCurrentFrame | frame=127 visible=1 cache=1
+[CACHE  15891 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15892 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=127 pending=0
+[PLAYBACK  15892 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[DECODE  15900 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=56 null=0 waitMs=636 decoded=56
+[CACHE  15901 ms] TimelineCache::prefetch.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=56 null=0
+[DECODE  15901 ms] DecoderWorker::processRequest.end | seq=6 file=aiarchitectures2.mp4 frame=56 null=0 waitMs=651
+[CACHE  15907 ms] TimelineCache::onPrefetchTimer | playhead=127
+[CACHE  15907 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15922 ms] EditorWindow::advanceFrame | current=127 next=128
+[PLAYBACK  15923 ms] EditorWindow::setCurrentFrame | requested=128 bounded=128
+[PLAYBACK  15923 ms] PreviewWindow::setCurrentFrame | frame=128 visible=1 cache=1
+[CACHE  15922 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15923 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=128 pending=0
+[PLAYBACK  15923 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15923 ms] PreviewWindow::onFrameTimer | currentFrame=128
+[PLAYBACK  15923 ms] EditorWindow::advanceFrame | current=128 next=129
+[PLAYBACK  15923 ms] EditorWindow::setCurrentFrame | requested=129 bounded=129
+[PLAYBACK  15923 ms] PreviewWindow::setCurrentFrame | frame=129 visible=1 cache=1
+[CACHE  15923 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15923 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=129 pending=0
+[PLAYBACK  15923 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[DECODE  15934 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=91 null=0 waitMs=72 decoded=91
+[CACHE  15935 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=91 null=0 waitMs=74
+[PLAYBACK  15935 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=91 null=0 waitMs=73
+[DECODE  15935 ms] DecoderWorker::processRequest.end | seq=15 file=aiarchitectures2.mp4 frame=91 null=0 waitMs=73
+[CACHE  15937 ms] TimelineCache::onPrefetchTimer | playhead=129
+[CACHE  15937 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[DECODE  15949 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=55 null=0 waitMs=685 decoded=55
+[CACHE  15949 ms] TimelineCache::prefetch.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=55 null=0
+[DECODE  15949 ms] DecoderWorker::processRequest.end | seq=5 file=aiarchitectures2.mp4 frame=55 null=0 waitMs=699
+[DECODE  15958 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=55 null=0 waitMs=676 decoded=55
+[CACHE  15958 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=55 null=0 waitMs=676
+[PLAYBACK  15959 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=55 null=0 waitMs=677
+[DECODE  15958 ms] DecoderWorker::processRequest.end | seq=9 file=aiarchitectures2.mp4 frame=55 null=0 waitMs=676
+[PLAYBACK  15963 ms] EditorWindow::advanceFrame | current=129 next=130
+[PLAYBACK  15963 ms] EditorWindow::setCurrentFrame | requested=130 bounded=130
+[PLAYBACK  15963 ms] PreviewWindow::setCurrentFrame | frame=130 visible=1 cache=1
+[CACHE  15963 ms] TimelineCache::prefetch.skip | reason=visible-pending count=2
+[PLAYBACK  15963 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=130 pending=0
+[PLAYBACK  15963 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=97 cached=0
+[CACHE  15963 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=97
+[CACHE  15963 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=97 priority=20
+[DECODE  15963 ms] AsyncDecoder::requestFrame | seq=16 file=aiarchitectures2.mp4 frame=97 priority=20 timeoutMs=10000 pending=0
+[DECODE  15963 ms] DecoderWorker::processRequest.begin | seq=16 file=aiarchitectures2.mp4 frame=97 priority=20 queue=0 thread=725d38dfe6c0
+[PLAYBACK  15963 ms] PreviewWindow::onFrameTimer | currentFrame=130
+[PLAYBACK  15963 ms] EditorWindow::advanceFrame | current=130 next=131
+[PLAYBACK  15963 ms] EditorWindow::setCurrentFrame | requested=131 bounded=131
+[DECODE  15963 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=97 last=75
+[PLAYBACK  15963 ms] PreviewWindow::setCurrentFrame | frame=131 visible=1 cache=1
+[CACHE  15963 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  15963 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=131 pending=0
+[PLAYBACK  15963 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=98 cached=0
+[CACHE  15963 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=98
+[CACHE  15963 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=98 priority=20
+[DECODE  15963 ms] AsyncDecoder::requestFrame | seq=17 file=aiarchitectures2.mp4 frame=98 priority=20 timeoutMs=10000 pending=0
+[CACHE  15963 ms] TimelineCache::onPrefetchTimer | playhead=131
+[CACHE  15963 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[DECODE  15963 ms] DecoderWorker::processRequest.begin | seq=17 file=aiarchitectures2.mp4 frame=98 priority=20 queue=0 thread=725d32ffd6c0
+[DECODE  15963 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=98 last=53
+[DECODE  15963 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=98 delta=45
+[DECODE  15963 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=98
+[PLAYBACK  15986 ms] EditorWindow::advanceFrame | current=131 next=132
+[PLAYBACK  15986 ms] EditorWindow::setCurrentFrame | requested=132 bounded=132
+[PLAYBACK  15986 ms] PreviewWindow::setCurrentFrame | frame=132 visible=1 cache=1
+[CACHE  15985 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15986 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=132 pending=0
+[PLAYBACK  15986 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  15986 ms] PreviewWindow::onFrameTimer | currentFrame=132
+[PLAYBACK  15986 ms] EditorWindow::advanceFrame | current=132 next=133
+[PLAYBACK  15986 ms] EditorWindow::setCurrentFrame | requested=133 bounded=133
+[PLAYBACK  15986 ms] PreviewWindow::setCurrentFrame | frame=133 visible=1 cache=1
+[CACHE  15985 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  15986 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=133 pending=0
+[PLAYBACK  15986 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  15995 ms] TimelineCache::onPrefetchTimer | playhead=133
+[CACHE  15995 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16007 ms] PreviewWindow::setPlaybackState | playing=1 clips=1 cache=1
+[PLAYBACK  16018 ms] PreviewWindow::onFrameTimer | currentFrame=133
+[PLAYBACK  16018 ms] EditorWindow::advanceFrame | current=133 next=134
+[PLAYBACK  16018 ms] EditorWindow::setCurrentFrame | requested=134 bounded=134
+[PLAYBACK  16018 ms] PreviewWindow::setCurrentFrame | frame=134 visible=1 cache=1
+[CACHE  16018 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16018 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=134 pending=0
+[PLAYBACK  16018 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16026 ms] TimelineCache::onPrefetchTimer | playhead=134
+[CACHE  16026 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16042 ms] EditorWindow::advanceFrame | current=134 next=135
+[PLAYBACK  16042 ms] EditorWindow::setCurrentFrame | requested=135 bounded=135
+[PLAYBACK  16042 ms] PreviewWindow::setCurrentFrame | frame=135 visible=1 cache=1
+[CACHE  16041 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16042 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=135 pending=0
+[PLAYBACK  16042 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  16050 ms] PreviewWindow::onFrameTimer | currentFrame=135
+[PLAYBACK  16050 ms] EditorWindow::advanceFrame | current=135 next=136
+[PLAYBACK  16050 ms] EditorWindow::setCurrentFrame | requested=136 bounded=136
+[PLAYBACK  16050 ms] PreviewWindow::setCurrentFrame | frame=136 visible=1 cache=1
+[CACHE  16050 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16050 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=136 pending=0
+[PLAYBACK  16050 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16058 ms] TimelineCache::onPrefetchTimer | playhead=136
+[CACHE  16058 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16075 ms] EditorWindow::advanceFrame | current=136 next=137
+[PLAYBACK  16075 ms] EditorWindow::setCurrentFrame | requested=137 bounded=137
+[PLAYBACK  16075 ms] PreviewWindow::setCurrentFrame | frame=137 visible=1 cache=1
+[CACHE  16074 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16075 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=137 pending=0
+[PLAYBACK  16075 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  16082 ms] PreviewWindow::onFrameTimer | currentFrame=137
+[PLAYBACK  16082 ms] EditorWindow::advanceFrame | current=137 next=138
+[PLAYBACK  16082 ms] EditorWindow::setCurrentFrame | requested=138 bounded=138
+[PLAYBACK  16082 ms] PreviewWindow::setCurrentFrame | frame=138 visible=1 cache=1
+[CACHE  16082 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16082 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=138 pending=0
+[PLAYBACK  16082 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16091 ms] TimelineCache::onPrefetchTimer | playhead=138
+[CACHE  16091 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16106 ms] EditorWindow::advanceFrame | current=138 next=139
+[PLAYBACK  16106 ms] EditorWindow::setCurrentFrame | requested=139 bounded=139
+[PLAYBACK  16106 ms] PreviewWindow::setCurrentFrame | frame=139 visible=1 cache=1
+[CACHE  16106 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16106 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=139 pending=0
+[PLAYBACK  16106 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  16114 ms] PreviewWindow::onFrameTimer | currentFrame=139
+[PLAYBACK  16114 ms] EditorWindow::advanceFrame | current=139 next=140
+[PLAYBACK  16114 ms] EditorWindow::setCurrentFrame | requested=140 bounded=140
+[PLAYBACK  16114 ms] PreviewWindow::setCurrentFrame | frame=140 visible=1 cache=1
+[CACHE  16113 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16114 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=140 pending=0
+[PLAYBACK  16114 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16134 ms] TimelineCache::onPrefetchTimer | playhead=140
+[CACHE  16134 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16138 ms] EditorWindow::advanceFrame | current=140 next=141
+[PLAYBACK  16138 ms] EditorWindow::setCurrentFrame | requested=141 bounded=141
+[PLAYBACK  16138 ms] PreviewWindow::setCurrentFrame | frame=141 visible=1 cache=1
+[CACHE  16137 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16138 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=141 pending=0
+[PLAYBACK  16138 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  16159 ms] PreviewWindow::onFrameTimer | currentFrame=141
+[PLAYBACK  16159 ms] EditorWindow::advanceFrame | current=141 next=142
+[PLAYBACK  16159 ms] EditorWindow::setCurrentFrame | requested=142 bounded=142
+[PLAYBACK  16159 ms] PreviewWindow::setCurrentFrame | frame=142 visible=1 cache=1
+[CACHE  16159 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16159 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=142 pending=0
+[PLAYBACK  16159 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16159 ms] TimelineCache::onPrefetchTimer | playhead=142
+[CACHE  16159 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[DECODE  16186 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=98 null=0 waitMs=223 decoded=98
+[CACHE  16186 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=98 null=0 waitMs=223
+[PLAYBACK  16187 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=98 null=0 waitMs=224
+[DECODE  16186 ms] DecoderWorker::processRequest.end | seq=17 file=aiarchitectures2.mp4 frame=98 null=0 waitMs=223
+[PLAYBACK  16189 ms] EditorWindow::advanceFrame | current=142 next=143
+[PLAYBACK  16189 ms] EditorWindow::setCurrentFrame | requested=143 bounded=143
+[PLAYBACK  16189 ms] PreviewWindow::setCurrentFrame | frame=143 visible=1 cache=1
+[CACHE  16188 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  16189 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=143 pending=0
+[PLAYBACK  16189 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=110 cached=0
+[CACHE  16188 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=110
+[CACHE  16188 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=110 priority=20
+[DECODE  16188 ms] AsyncDecoder::requestFrame | seq=18 file=aiarchitectures2.mp4 frame=110 priority=20 timeoutMs=10000 pending=0
+[PLAYBACK  16189 ms] PreviewWindow::onFrameTimer | currentFrame=143
+[PLAYBACK  16189 ms] EditorWindow::advanceFrame | current=143 next=144
+[PLAYBACK  16189 ms] EditorWindow::setCurrentFrame | requested=144 bounded=144
+[PLAYBACK  16189 ms] PreviewWindow::setCurrentFrame | frame=144 visible=1 cache=1
+[CACHE  16189 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16189 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=144 pending=1
+[PLAYBACK  16189 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16189 ms] TimelineCache::onPrefetchTimer | playhead=144
+[CACHE  16189 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[DECODE  16189 ms] DecoderWorker::processRequest.begin | seq=18 file=aiarchitectures2.mp4 frame=110 priority=20 queue=0 thread=725d327fc6c0
+[DECODE  16189 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=110 last=56
+[DECODE  16189 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=110 delta=54
+[DECODE  16189 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=110
+[PLAYBACK  16202 ms] EditorWindow::advanceFrame | current=144 next=145
+[PLAYBACK  16202 ms] EditorWindow::setCurrentFrame | requested=145 bounded=145
+[PLAYBACK  16202 ms] PreviewWindow::setCurrentFrame | frame=145 visible=1 cache=1
+[CACHE  16201 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16202 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=145 pending=0
+[PLAYBACK  16202 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  16214 ms] PreviewWindow::onFrameTimer | currentFrame=145
+[PLAYBACK  16214 ms] EditorWindow::advanceFrame | current=145 next=146
+[PLAYBACK  16214 ms] EditorWindow::setCurrentFrame | requested=146 bounded=146
+[PLAYBACK  16214 ms] PreviewWindow::setCurrentFrame | frame=146 visible=1 cache=1
+[CACHE  16213 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16214 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=146 pending=0
+[PLAYBACK  16214 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16222 ms] TimelineCache::onPrefetchTimer | playhead=146
+[CACHE  16222 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16235 ms] EditorWindow::advanceFrame | current=146 next=147
+[PLAYBACK  16235 ms] EditorWindow::setCurrentFrame | requested=147 bounded=147
+[PLAYBACK  16235 ms] PreviewWindow::setCurrentFrame | frame=147 visible=1 cache=1
+[CACHE  16234 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16235 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=147 pending=0
+[PLAYBACK  16235 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  16242 ms] PreviewWindow::onFrameTimer | currentFrame=147
+[PLAYBACK  16242 ms] EditorWindow::advanceFrame | current=147 next=148
+[PLAYBACK  16242 ms] EditorWindow::setCurrentFrame | requested=148 bounded=148
+[PLAYBACK  16242 ms] PreviewWindow::setCurrentFrame | frame=148 visible=1 cache=1
+[CACHE  16241 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16242 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=148 pending=0
+[PLAYBACK  16242 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16259 ms] TimelineCache::onPrefetchTimer | playhead=148
+[CACHE  16259 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16266 ms] EditorWindow::advanceFrame | current=148 next=149
+[PLAYBACK  16266 ms] EditorWindow::setCurrentFrame | requested=149 bounded=149
+[PLAYBACK  16266 ms] PreviewWindow::setCurrentFrame | frame=149 visible=1 cache=1
+[CACHE  16266 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16266 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=149 pending=0
+[PLAYBACK  16266 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  16284 ms] PreviewWindow::onFrameTimer | currentFrame=149
+[PLAYBACK  16284 ms] EditorWindow::advanceFrame | current=149 next=150
+[PLAYBACK  16284 ms] EditorWindow::setCurrentFrame | requested=150 bounded=150
+[PLAYBACK  16284 ms] PreviewWindow::setCurrentFrame | frame=150 visible=1 cache=1
+[CACHE  16283 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16284 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=150 pending=0
+[PLAYBACK  16284 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16283 ms] TimelineCache::onPrefetchTimer | playhead=150
+[CACHE  16283 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16309 ms] EditorWindow::advanceFrame | current=150 next=151
+[PLAYBACK  16309 ms] EditorWindow::setCurrentFrame | requested=151 bounded=151
+[PLAYBACK  16309 ms] PreviewWindow::setCurrentFrame | frame=151 visible=1 cache=1
+[CACHE  16308 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16309 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=151 pending=0
+[PLAYBACK  16309 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  16309 ms] PreviewWindow::onFrameTimer | currentFrame=151
+[PLAYBACK  16309 ms] EditorWindow::advanceFrame | current=151 next=152
+[PLAYBACK  16309 ms] EditorWindow::setCurrentFrame | requested=152 bounded=152
+[PLAYBACK  16309 ms] PreviewWindow::setCurrentFrame | frame=152 visible=1 cache=1
+[CACHE  16308 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16309 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=152 pending=0
+[PLAYBACK  16309 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16319 ms] TimelineCache::onPrefetchTimer | playhead=152
+[CACHE  16319 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[DECODE  16325 ms] DecoderContext::decodeFrame.end | file=aiarchitectures2.mp4 target=81 null=0 decoded=81
+[CACHE  16325 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=81 null=0 waitMs=621
+[PLAYBACK  16326 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=81 null=0 waitMs=621
+[DECODE  16325 ms] DecoderWorker::processRequest.end | seq=13 file=aiarchitectures2.mp4 frame=81 null=0 waitMs=620
+[PLAYBACK  16331 ms] EditorWindow::advanceFrame | current=152 next=153
+[PLAYBACK  16331 ms] EditorWindow::setCurrentFrame | requested=153 bounded=153
+[PLAYBACK  16331 ms] PreviewWindow::setCurrentFrame | frame=153 visible=1 cache=1
+[CACHE  16330 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  16331 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=153 pending=0
+[PLAYBACK  16331 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=120 cached=0
+[CACHE  16330 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=120
+[CACHE  16330 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=120 priority=20
+[DECODE  16330 ms] AsyncDecoder::requestFrame | seq=19 file=aiarchitectures2.mp4 frame=120 priority=20 timeoutMs=10000 pending=0
+[DECODE  16330 ms] DecoderWorker::processRequest.begin | seq=19 file=aiarchitectures2.mp4 frame=120 priority=20 queue=0 thread=725d337fe6c0
+[DECODE  16330 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=120 last=91
+[PLAYBACK  16340 ms] PreviewWindow::onFrameTimer | currentFrame=153
+[PLAYBACK  16340 ms] EditorWindow::advanceFrame | current=153 next=154
+[PLAYBACK  16340 ms] EditorWindow::setCurrentFrame | requested=154 bounded=154
+[PLAYBACK  16340 ms] PreviewWindow::setCurrentFrame | frame=154 visible=1 cache=1
+[CACHE  16339 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16340 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=154 pending=0
+[PLAYBACK  16340 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[DECODE  16356 ms] DecoderContext::decodeFrame.end | file=aiarchitectures2.mp4 target=97 null=0 decoded=97
+[CACHE  16356 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=97 null=0 waitMs=393
+[PLAYBACK  16357 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=97 null=0 waitMs=394
+[DECODE  16356 ms] DecoderWorker::processRequest.end | seq=16 file=aiarchitectures2.mp4 frame=97 null=0 waitMs=393
+[CACHE  16387 ms] TimelineCache::onPrefetchTimer | playhead=154
+[CACHE  16387 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  16387 ms] EditorWindow::advanceFrame | current=154 next=155
+[PLAYBACK  16387 ms] EditorWindow::setCurrentFrame | requested=155 bounded=155
+[PLAYBACK  16387 ms] PreviewWindow::setCurrentFrame | frame=155 visible=1 cache=1
+[CACHE  16387 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  16387 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=155 pending=0
+[PLAYBACK  16387 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=122 cached=0
+[CACHE  16387 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=122
+[CACHE  16387 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=122 priority=20
+[DECODE  16387 ms] AsyncDecoder::requestFrame | seq=20 file=aiarchitectures2.mp4 frame=122 priority=20 timeoutMs=10000 pending=0
+[DECODE  16387 ms] DecoderWorker::processRequest.begin | seq=20 file=aiarchitectures2.mp4 frame=122 priority=20 queue=0 thread=725d33fff6c0
+[PLAYBACK  16387 ms] PreviewWindow::onFrameTimer | currentFrame=155
+[DECODE  16387 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=122 last=55
+[DECODE  16387 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=122 delta=67
+[DECODE  16387 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=122
+[PLAYBACK  16387 ms] EditorWindow::advanceFrame | current=155 next=156
+[PLAYBACK  16387 ms] EditorWindow::setCurrentFrame | requested=156 bounded=156
+[PLAYBACK  16387 ms] PreviewWindow::setCurrentFrame | frame=156 visible=1 cache=1
+[CACHE  16387 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16387 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=156 pending=0
+[PLAYBACK  16387 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[DECODE  16407 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=87 null=0 waitMs=613 decoded=87
+[CACHE  16407 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=87 null=0 waitMs=613
+[PLAYBACK  16408 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=87 null=0 waitMs=613
+[DECODE  16407 ms] DecoderWorker::processRequest.end | seq=14 file=aiarchitectures2.mp4 frame=87 null=0 waitMs=613
+[PLAYBACK  16409 ms] EditorWindow::advanceFrame | current=156 next=157
+[PLAYBACK  16409 ms] EditorWindow::setCurrentFrame | requested=157 bounded=157
+[PLAYBACK  16409 ms] PreviewWindow::setCurrentFrame | frame=157 visible=1 cache=1
+[CACHE  16408 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  16409 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=157 pending=0
+[PLAYBACK  16409 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=124 cached=0
+[CACHE  16408 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=124
+[CACHE  16408 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=124 priority=20
+[DECODE  16408 ms] AsyncDecoder::requestFrame | seq=21 file=aiarchitectures2.mp4 frame=124 priority=20 timeoutMs=10000 pending=0
+[DECODE  16408 ms] DecoderWorker::processRequest.begin | seq=21 file=aiarchitectures2.mp4 frame=124 priority=20 queue=0 thread=725d395ff6c0
+[PLAYBACK  16409 ms] PreviewWindow::onFrameTimer | currentFrame=157
+[DECODE  16408 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=124 last=55
+[PLAYBACK  16409 ms] EditorWindow::advanceFrame | current=157 next=158
+[PLAYBACK  16409 ms] EditorWindow::setCurrentFrame | requested=158 bounded=158
+[DECODE  16408 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=124 delta=69
+[PLAYBACK  16409 ms] PreviewWindow::setCurrentFrame | frame=158 visible=1 cache=1
+[DECODE  16408 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=124
+[CACHE  16408 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16409 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=158 pending=0
+[PLAYBACK  16409 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16423 ms] TimelineCache::onPrefetchTimer | playhead=158
+[CACHE  16423 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16426 ms] EditorWindow::advanceFrame | current=158 next=159
+[PLAYBACK  16426 ms] EditorWindow::setCurrentFrame | requested=159 bounded=159
+[PLAYBACK  16426 ms] PreviewWindow::setCurrentFrame | frame=159 visible=1 cache=1
+[CACHE  16425 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16426 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=159 pending=0
+[PLAYBACK  16426 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  16434 ms] PreviewWindow::onFrameTimer | currentFrame=159
+[PLAYBACK  16434 ms] EditorWindow::advanceFrame | current=159 next=160
+[PLAYBACK  16434 ms] EditorWindow::setCurrentFrame | requested=160 bounded=160
+[PLAYBACK  16434 ms] PreviewWindow::setCurrentFrame | frame=160 visible=1 cache=1
+[CACHE  16433 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16434 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=160 pending=0
+[PLAYBACK  16434 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16454 ms] TimelineCache::onPrefetchTimer | playhead=160
+[CACHE  16454 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16459 ms] EditorWindow::advanceFrame | current=160 next=161
+[PLAYBACK  16459 ms] EditorWindow::setCurrentFrame | requested=161 bounded=161
+[PLAYBACK  16459 ms] PreviewWindow::setCurrentFrame | frame=161 visible=1 cache=1
+[CACHE  16458 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16459 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=161 pending=0
+[PLAYBACK  16459 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  16466 ms] PreviewWindow::onFrameTimer | currentFrame=161
+[PLAYBACK  16466 ms] EditorWindow::advanceFrame | current=161 next=162
+[PLAYBACK  16466 ms] EditorWindow::setCurrentFrame | requested=162 bounded=162
+[PLAYBACK  16466 ms] PreviewWindow::setCurrentFrame | frame=162 visible=1 cache=1
+[CACHE  16465 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16466 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=162 pending=0
+[PLAYBACK  16466 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16487 ms] TimelineCache::onPrefetchTimer | playhead=162
+[CACHE  16487 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16490 ms] EditorWindow::advanceFrame | current=162 next=163
+[PLAYBACK  16490 ms] EditorWindow::setCurrentFrame | requested=163 bounded=163
+[PLAYBACK  16490 ms] PreviewWindow::setCurrentFrame | frame=163 visible=1 cache=1
+[CACHE  16489 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16490 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=163 pending=0
+[PLAYBACK  16490 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[DECODE  16491 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=122 null=0 waitMs=104 decoded=122
+[CACHE  16491 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=122 null=0 waitMs=104
+[PLAYBACK  16492 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=122 null=0 waitMs=105
+[DECODE  16491 ms] DecoderWorker::processRequest.end | seq=20 file=aiarchitectures2.mp4 frame=122 null=0 waitMs=104
+[PLAYBACK  16512 ms] PreviewWindow::onFrameTimer | currentFrame=163
+[PLAYBACK  16512 ms] EditorWindow::advanceFrame | current=163 next=164
+[PLAYBACK  16512 ms] EditorWindow::setCurrentFrame | requested=164 bounded=164
+[PLAYBACK  16512 ms] PreviewWindow::setCurrentFrame | frame=164 visible=1 cache=1
+[CACHE  16512 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  16512 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=164 pending=0
+[PLAYBACK  16512 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=131 cached=0
+[CACHE  16512 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=131
+[CACHE  16512 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=131 priority=20
+[DECODE  16512 ms] AsyncDecoder::requestFrame | seq=22 file=aiarchitectures2.mp4 frame=131 priority=20 timeoutMs=10000 pending=0
+[DECODE  16512 ms] DecoderWorker::processRequest.begin | seq=22 file=aiarchitectures2.mp4 frame=131 priority=20 queue=0 thread=725d32ffd6c0
+[DECODE  16512 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=131 last=98
+[DECODE  16512 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=131 delta=33
+[DECODE  16512 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=131
+[CACHE  16536 ms] TimelineCache::onPrefetchTimer | playhead=164
+[CACHE  16536 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16537 ms] EditorWindow::advanceFrame | current=164 next=165
+[PLAYBACK  16537 ms] EditorWindow::setCurrentFrame | requested=165 bounded=165
+[PLAYBACK  16537 ms] PreviewWindow::setCurrentFrame | frame=165 visible=1 cache=1
+[CACHE  16536 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16537 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=165 pending=0
+[PLAYBACK  16537 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  16537 ms] PreviewWindow::onFrameTimer | currentFrame=165
+[PLAYBACK  16537 ms] EditorWindow::advanceFrame | current=165 next=166
+[PLAYBACK  16537 ms] EditorWindow::setCurrentFrame | requested=166 bounded=166
+[PLAYBACK  16537 ms] PreviewWindow::setCurrentFrame | frame=166 visible=1 cache=1
+[CACHE  16537 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16537 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=166 pending=0
+[PLAYBACK  16537 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[DECODE  16544 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=124 null=0 waitMs=136 decoded=124
+[CACHE  16544 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=124 null=0 waitMs=136
+[PLAYBACK  16545 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=124 null=0 waitMs=136
+[DECODE  16544 ms] DecoderWorker::processRequest.end | seq=21 file=aiarchitectures2.mp4 frame=124 null=0 waitMs=136
+[CACHE  16556 ms] TimelineCache::onPrefetchTimer | playhead=166
+[CACHE  16556 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  16557 ms] EditorWindow::advanceFrame | current=166 next=167
+[PLAYBACK  16557 ms] EditorWindow::setCurrentFrame | requested=167 bounded=167
+[PLAYBACK  16557 ms] PreviewWindow::setCurrentFrame | frame=167 visible=1 cache=1
+[CACHE  16556 ms] TimelineCache::prefetch.skip | reason=visible-pending count=3
+[PLAYBACK  16557 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=167 pending=0
+[PLAYBACK  16557 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=134 cached=0
+[CACHE  16556 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=134
+[CACHE  16556 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=134 priority=20
+[DECODE  16556 ms] AsyncDecoder::requestFrame | seq=23 file=aiarchitectures2.mp4 frame=134 priority=20 timeoutMs=10000 pending=0
+[DECODE  16556 ms] DecoderWorker::processRequest.begin | seq=23 file=aiarchitectures2.mp4 frame=134 priority=20 queue=0 thread=725d317fa6c0
+[DECODE  16556 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=134 last=81
+[DECODE  16556 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=134 delta=53
+[DECODE  16556 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=134
+[PLAYBACK  16563 ms] PreviewWindow::onFrameTimer | currentFrame=167
+[PLAYBACK  16563 ms] EditorWindow::advanceFrame | current=167 next=168
+[PLAYBACK  16563 ms] EditorWindow::setCurrentFrame | requested=168 bounded=168
+[PLAYBACK  16563 ms] PreviewWindow::setCurrentFrame | frame=168 visible=1 cache=1
+[CACHE  16562 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16563 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=168 pending=0
+[PLAYBACK  16563 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16581 ms] TimelineCache::onPrefetchTimer | playhead=168
+[CACHE  16581 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16586 ms] EditorWindow::advanceFrame | current=168 next=169
+[PLAYBACK  16586 ms] EditorWindow::setCurrentFrame | requested=169 bounded=169
+[PLAYBACK  16586 ms] PreviewWindow::setCurrentFrame | frame=169 visible=1 cache=1
+[CACHE  16585 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16586 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=169 pending=0
+[PLAYBACK  16586 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  16598 ms] PreviewWindow::onFrameTimer | currentFrame=169
+[PLAYBACK  16598 ms] EditorWindow::advanceFrame | current=169 next=170
+[PLAYBACK  16598 ms] EditorWindow::setCurrentFrame | requested=170 bounded=170
+[PLAYBACK  16598 ms] PreviewWindow::setCurrentFrame | frame=170 visible=1 cache=1
+[CACHE  16598 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16598 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=170 pending=0
+[PLAYBACK  16598 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16623 ms] TimelineCache::onPrefetchTimer | playhead=170
+[CACHE  16623 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16624 ms] EditorWindow::advanceFrame | current=170 next=171
+[PLAYBACK  16624 ms] EditorWindow::setCurrentFrame | requested=171 bounded=171
+[PLAYBACK  16624 ms] PreviewWindow::setCurrentFrame | frame=171 visible=1 cache=1
+[CACHE  16623 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16624 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=171 pending=0
+[PLAYBACK  16624 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[PLAYBACK  16648 ms] PreviewWindow::onFrameTimer | currentFrame=171
+[PLAYBACK  16648 ms] EditorWindow::advanceFrame | current=171 next=172
+[PLAYBACK  16648 ms] EditorWindow::setCurrentFrame | requested=172 bounded=172
+[PLAYBACK  16648 ms] PreviewWindow::setCurrentFrame | frame=172 visible=1 cache=1
+[CACHE  16647 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[PLAYBACK  16648 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=172 pending=0
+[PLAYBACK  16648 ms] PreviewWindow::requestFramesForCurrentPosition.skip | reason=visible-backlog count=4
+[CACHE  16647 ms] TimelineCache::onPrefetchTimer | playhead=172
+[CACHE  16647 ms] TimelineCache::prefetch.skip | reason=visible-pending count=4
+[DECODE  16649 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=110 null=0 waitMs=460 decoded=110
+[CACHE  16649 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=110 null=0 waitMs=461
+[PLAYBACK  16649 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=110 null=0 waitMs=460
+[DECODE  16649 ms] DecoderWorker::processRequest.end | seq=18 file=aiarchitectures2.mp4 frame=110 null=0 waitMs=460
+[PLAYBACK  16694 ms] PreviewWindow::setPlaybackState | playing=0 clips=1 cache=1
+[DECODE  16772 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=131 null=0 waitMs=260 decoded=131
+[CACHE  16772 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=131 null=0 waitMs=260
+[PLAYBACK  16773 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=131 null=0 waitMs=261
+[DECODE  16772 ms] DecoderWorker::processRequest.end | seq=22 file=aiarchitectures2.mp4 frame=131 null=0 waitMs=260
+[DECODE  16797 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=134 null=0 waitMs=241 decoded=134
+[CACHE  16797 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=134 null=0 waitMs=241
+[PLAYBACK  16798 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=134 null=0 waitMs=241
+[DECODE  16797 ms] DecoderWorker::processRequest.end | seq=23 file=aiarchitectures2.mp4 frame=134 null=0 waitMs=241
+[DECODE  16807 ms] DecoderContext::decodeFrame.end | file=aiarchitectures2.mp4 target=120 null=0 decoded=120
+[CACHE  16807 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=120 null=0 waitMs=477
+[PLAYBACK  16807 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=120 null=0 waitMs=476
+[DECODE  16807 ms] DecoderWorker::processRequest.end | seq=19 file=aiarchitectures2.mp4 frame=120 null=0 waitMs=477
+[PLAYBACK  17800 ms] EditorWindow::setCurrentFrame | requested=121 bounded=121
+[PLAYBACK  17800 ms] PreviewWindow::setCurrentFrame | frame=121 visible=1 cache=1
+[PLAYBACK  17800 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=121 pending=0
+[PLAYBACK  17800 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=88 cached=0
+[CACHE  17800 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=88
+[CACHE  17800 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=88 priority=20
+[DECODE  17800 ms] AsyncDecoder::requestFrame | seq=24 file=aiarchitectures2.mp4 frame=88 priority=20 timeoutMs=10000 pending=0
+[DECODE  17800 ms] DecoderWorker::processRequest.begin | seq=24 file=aiarchitectures2.mp4 frame=88 priority=20 queue=0 thread=725d38dfe6c0
+[DECODE  17800 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=88 last=97
+[DECODE  17800 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=88 delta=-9
+[DECODE  17800 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=88
+[DECODE  18279 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=88 null=0 waitMs=479 decoded=88
+[CACHE  18279 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=88 null=0 waitMs=479
+[PLAYBACK  18279 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=88 null=0 waitMs=479
+[DECODE  18279 ms] DecoderWorker::processRequest.end | seq=24 file=aiarchitectures2.mp4 frame=88 null=0 waitMs=479
+[PLAYBACK  18345 ms] EditorWindow::setCurrentFrame | requested=101 bounded=101
+[PLAYBACK  18345 ms] PreviewWindow::setCurrentFrame | frame=101 visible=1 cache=1
+[PLAYBACK  18345 ms] PreviewWindow::requestFramesForCurrentPosition | active=1 frame=101 pending=0
+[PLAYBACK  18345 ms] PreviewWindow::visible-request | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=68 cached=0
+[CACHE  18344 ms] TimelineCache::requestFrame.miss | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=68
+[CACHE  18344 ms] TimelineCache::requestFrame.dispatch | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=68 priority=20
+[DECODE  18344 ms] AsyncDecoder::requestFrame | seq=25 file=aiarchitectures2.mp4 frame=68 priority=20 timeoutMs=10000 pending=0
+[DECODE  18345 ms] DecoderWorker::processRequest.begin | seq=25 file=aiarchitectures2.mp4 frame=68 priority=20 queue=0 thread=725d31ffb6c0
+[DECODE  18345 ms] DecoderContext::decodeFrame.begin | file=aiarchitectures2.mp4 target=68 last=87
+[DECODE  18345 ms] DecoderContext::decodeFrame.seek | file=aiarchitectures2.mp4 target=68 delta=-19
+[DECODE  18345 ms] DecoderContext::seekAndDecode.begin | file=aiarchitectures2.mp4 target=68
+[DECODE  18509 ms] DecoderContext::seekAndDecode.end | file=aiarchitectures2.mp4 target=68 null=0 waitMs=164 decoded=68
+[CACHE  18509 ms] TimelineCache::requestFrame.complete | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 frame=68 null=0 waitMs=165
+[PLAYBACK  18510 ms] PreviewWindow::visible-request.callback | clip=5c93bc2e-e56a-4cfe-8316-9fe1911daa22 localFrame=68 null=0 waitMs=165
+[DECODE  18509 ms] DecoderWorker::processRequest.end | seq=25 file=aiarchitectures2.mp4 frame=68 null=0 waitMs=164

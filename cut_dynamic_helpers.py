@@ -333,6 +333,26 @@ def _retime_segments_to_frame_timeline(word_segment_times, fps):
     return retimed
 
 
+def _retime_segments_to_frame_bounds(word_segment_times, fps):
+    if not word_segment_times or not fps:
+        return word_segment_times
+    retimed = []
+    for seg in word_segment_times:
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", start))
+        if end < start:
+            end = start
+        start_frame = math.floor(start * fps)
+        end_frame = math.floor(end * fps)
+        if end_frame < start_frame:
+            end_frame = start_frame
+        curr = dict(seg)
+        curr["start"] = start_frame / fps
+        curr["end"] = end_frame / fps
+        retimed.append(curr)
+    return retimed
+
+
 def _retime_zoom_rects_for_notches(zoom_rects, ranges, fps):
     if not ranges or not zoom_rects:
         return zoom_rects
@@ -447,6 +467,38 @@ def merge_short_segments(word_segment_times, min_segment_seconds):
     if len(merged) != len(word_segment_times):
         print(f"Merged short segments: {len(word_segment_times)} -> {len(merged)}")
     return merged
+
+
+def compress_small_gaps(word_segment_times, max_gap_seconds):
+    if not word_segment_times or max_gap_seconds is None:
+        return word_segment_times
+    max_gap = float(max_gap_seconds)
+    if max_gap <= 0:
+        return word_segment_times
+    adjusted = []
+    shift = 0.0
+    prev_end = None
+    for seg in word_segment_times:
+        curr = dict(seg)
+        start = float(curr.get("start", 0.0))
+        end = float(curr.get("end", start))
+        if end < start:
+            end = start
+        if prev_end is not None:
+            gap = start - prev_end
+            if gap > 0 and gap < max_gap:
+                shift += gap
+        start -= shift
+        end -= shift
+        if start < 0:
+            start = 0.0
+        if end < start:
+            end = start
+        curr["start"] = start
+        curr["end"] = end
+        adjusted.append(curr)
+        prev_end = float(curr.get("end", end))
+    return adjusted
 
 
 def adjust_subtitles_for_fades(word_segment_times_for_subs, cut_segments, fps, fade_frames, fade_mode):

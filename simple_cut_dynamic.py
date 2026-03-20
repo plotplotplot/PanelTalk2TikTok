@@ -5,6 +5,8 @@ Optional subtitle rendering.
 """
 import argparse
 import bisect
+import csv
+from fractions import Fraction
 import json
 import math
 import os
@@ -25,6 +27,7 @@ from cut_dynamic_helpers import (
     apply_bounded_prepend_extend,
     merge_short_segments,
     adjust_subtitles_for_fades,
+    compress_small_gaps,
     precompute_segments_basic,
     prepend_silence_to_wav,
     trim_leading_audio_wav,
@@ -36,9 +39,11 @@ from cut_dynamic_helpers import (
     _retime_segments_for_notches,
     _retime_segments_for_word_cuts,
     _retime_segments_to_frame_timeline,
+    _retime_segments_to_frame_bounds,
     _retime_zoom_rects_for_notches,
     _write_notch_csv,
 )
+from segment_debug import log_len_diff
 
 # Reuse helpers from simple_cut where possible.
 from simple_cut import (
@@ -807,11 +812,13 @@ def extract_video_segments_dynamic(
     debug_timeline=False,
     fade_mode="sequence",
     fade_use_source_gaps=True,
+    fade_preserve_length=True,
     center_blend_frames=0,
     debug_centers=False,
     video_shift_frames=0,
     fallback_center=None,
     rotate_degrees=0.0,
+    debug_lengths=False,
 ):
     print("Extracting video segments (dynamic zoom, face tracking)...")
     cap = cv2.VideoCapture(video_file)
@@ -932,10 +939,13 @@ def extract_video_segments_dynamic(
     )
     if max_seconds is not None and max_seconds > 0 and fps:
         total_frames = min(total_frames, int(round(max_seconds * fps)))
+    expected_total_frames = int(total_frames)
     pbar = tqdm(total=total_frames, desc="Writing frames")
 
     fade_frames = max(0, int(fade_frames))
     pending_tail_frames = []
+    prev_tail_frames = []
+    preserve_fade_length = bool(fade_preserve_length and fade_frames > 0)
 
     prev_end_frame = None
     prev_segment_center = None
@@ -971,8 +981,29 @@ def extract_video_segments_dynamic(
                 gap_frames = 0
         if gap_frames is not None and gap_frames < 0:
             gap_frames = 0
-        do_fade = fade_frames > 0 and pending_tail_frames and (gap_frames is None or gap_frames > 0)
-        prev_tail_snapshot = list(pending_tail_frames) if pending_tail_frames else []
+        prev_tail_len = len(prev_tail_frames) if preserve_fade_length else len(pending_tail_frames)
+        has_prev_tail = fade_frames > 0 and prev_tail_len > 0
+        gap_ok_for_fade = (gap_frames is None or gap_frames > 0)
+        if preserve_fade_length:
+            do_fade = (
+                has_prev_tail
+                and gap_ok_for_fade
+            )
+            prev_tail_snapshot = list(prev_tail_frames) if prev_tail_frames else []
+        else:
+            do_fade = (
+                has_prev_tail
+                and gap_ok_for_fade
+            )
+            prev_tail_snapshot = list(pending_tail_frames) if pending_tail_frames else []
+        if debug_fade:
+            seg_len_frames = max(0, int(seg["end_frame"]) - int(seg["start_frame"]))
+            print(
+                f"[fade-gate] seg={seg_idx} seg_len={seg_len_frames} "
+                f"fade_frames={fade_frames} prev_tail_len={prev_tail_len} "
+                f"gap_frames={gap_frames} has_prev_tail={has_prev_tail} "
+                f"gap_ok={gap_ok_for_fade} do_fade={do_fade}"
+            )
         if debug_timeline:
             seg_len = max(0, int(seg["end_frame"]) - int(seg["start_frame"]))
             out_time = (out_frame_idx + seg_frame_idx) / fps if fps else 0.0
@@ -994,6 +1025,12 @@ def extract_video_segments_dynamic(
         for frame_idx in range(seg["start_frame"], seg["end_frame"]):
             if max_seconds is not None and max_seconds > 0 and fps:
                 if out_frame_idx >= int(round(max_seconds * fps)):
+                    if debug_lengths:
+                        print(
+                            f"[len][video-total] expected={expected_total_frames} "
+                            f"actual={out_frame_idx} diff={out_frame_idx - expected_total_frames} "
+                            f"(early-stop at max_seconds)"
+                        )
                     pbar.close()
                     cap.release()
                     out.release()
@@ -1195,6 +1232,114 @@ def extract_video_segments_dynamic(
             seg_frame_idx += 1
             prev_segment_center = last_center
 
+        if preserve_fade_length:
+            seg_written = 0
+            # Blend onto the head frames without shortening output.
+            if do_fade and prev_tail_snapshot:
+                head = seg_frames[:fade_frames]
+                if fade_mode == "split":
+                    prev_len = max(1, fade_frames // 2)
+                    prev_len = min(prev_len, len(prev_tail_snapshot))
+                    next_len = max(1, fade_frames - prev_len)
+                    next_len = min(next_len, len(head))
+                    prev_seq = prev_tail_snapshot[-prev_len:] if prev_len > 0 else []
+                    head_seq = head[:next_len]
+                    blend_count = next_len
+                    for i in range(blend_count):
+                        alpha = (i + 1) / float(blend_count + 1)
+                        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+                        if prev_len > 1:
+                            prev_idx = int(round(i * (prev_len - 1) / max(1, blend_count - 1)))
+                        else:
+                            prev_idx = 0
+                        if next_len > 1:
+                            next_idx = int(round(i * (next_len - 1) / max(1, blend_count - 1)))
+                        else:
+                            next_idx = 0
+                        prev_payload = prev_seq[prev_idx] if prev_seq else None
+                        next_payload = head_seq[next_idx] if head_seq else None
+                        if prev_payload is None or next_payload is None:
+                            continue
+                        blended_frame = cv2.addWeighted(
+                            prev_payload["frame"], 1.0 - alpha, next_payload["frame"], alpha, 0
+                        )
+                        # Keep fade and zoom separate: fade blends source frames only.
+                        # Zoom/center/rotate follow the output segment state (next payload).
+                        interp_center = next_payload["center"]
+                        interp_zoom = next_payload["zoom"]
+                        interp_rotate = next_payload["rotate"]
+                        blended_payload = {
+                            "frame": blended_frame,
+                            "center": interp_center,
+                            "zoom": interp_zoom,
+                            "rotate": interp_rotate,
+                        }
+                        blended = _apply_zoom_payload(blended_payload)
+                        if blended is None:
+                            continue
+                        out.write(_render_subtitles_after_zoom(blended))
+                        out_frame_idx += 1
+                        pbar.update(1)
+                        seg_written += 1
+                else:
+                    blend_count = min(len(prev_tail_snapshot), len(head), fade_frames)
+                    if debug_fade:
+                        print(
+                            f"[fade-apply] seg={seg_idx} mode={fade_mode} "
+                            f"tail={len(prev_tail_snapshot)} head={len(head)} "
+                            f"blend_count={blend_count}"
+                        )
+                    for i in range(blend_count):
+                        alpha = (i + 1) / float(blend_count + 1)
+                        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+                        if fade_mode == "hold":
+                            prev_payload = prev_tail_snapshot[-1]
+                            next_payload = head[0]
+                        else:
+                            prev_payload = prev_tail_snapshot[i]
+                            next_payload = head[i]
+                        blended_frame = cv2.addWeighted(
+                            prev_payload["frame"], 1.0 - alpha, next_payload["frame"], alpha, 0
+                        )
+                        interp_center = next_payload["center"]
+                        interp_zoom = next_payload["zoom"]
+                        interp_rotate = next_payload["rotate"]
+                        blended_payload = {
+                            "frame": blended_frame,
+                            "center": interp_center,
+                            "zoom": interp_zoom,
+                            "rotate": interp_rotate,
+                        }
+                        blended = _apply_zoom_payload(blended_payload)
+                        if blended is None:
+                            continue
+                        out.write(_render_subtitles_after_zoom(blended))
+                        out_frame_idx += 1
+                        pbar.update(1)
+                        seg_written += 1
+                # No fade: just write all frames as-is
+            for frame in seg_frames[seg_written:]:
+                cropped = _apply_zoom_payload(frame)
+                if cropped is None:
+                    continue
+                out.write(_render_subtitles_after_zoom(cropped))
+                out_frame_idx += 1
+                pbar.update(1)
+                seg_written += 1
+
+            if debug_lengths:
+                expected = len(seg_frames)
+                log_len_diff("video", seg_idx, expected, seg_written, unit="frames")
+                if do_fade:
+                    print(
+                        f"[len][video-fade] seg={seg_idx} pre={expected} post={seg_written} "
+                        f"diff={seg_written - expected}"
+                    )
+
+            prev_tail_frames = seg_frames[-fade_frames:] if fade_frames > 0 else []
+            prev_end_frame = seg["end_frame"]
+            continue
+
         # Handle buffered tail from previous segment
         start_idx = 0
         if prev_tail_snapshot:
@@ -1235,9 +1380,9 @@ def extract_video_segments_dynamic(
                         blended_frame = cv2.addWeighted(
                             prev_payload["frame"], 1.0 - alpha, next_payload["frame"], alpha, 0
                         )
-                        interp_center = _blend_centers(prev_payload["center"], next_payload["center"], alpha)
-                        interp_zoom = lerp_scalar(prev_payload["zoom"], next_payload["zoom"], alpha)
-                        interp_rotate = lerp_scalar(prev_payload["rotate"], next_payload["rotate"], alpha)
+                        interp_center = next_payload["center"]
+                        interp_zoom = next_payload["zoom"]
+                        interp_rotate = next_payload["rotate"]
                         blended_payload = {
                             "frame": blended_frame,
                             "center": interp_center,
@@ -1261,6 +1406,12 @@ def extract_video_segments_dynamic(
                     start_idx = next_len
                 else:
                     blend_count = min(len(prev_tail_snapshot), len(head), fade_frames)
+                    if debug_fade:
+                        print(
+                            f"[fade-apply] seg={seg_idx} mode={fade_mode} "
+                            f"tail={len(prev_tail_snapshot)} head={len(head)} "
+                            f"blend_count={blend_count}"
+                        )
                     tail_prefix = prev_tail_snapshot[:-blend_count] if blend_count > 0 else prev_tail_snapshot
                     for payload in tail_prefix:
                         cropped = _apply_zoom_payload(payload)
@@ -1282,9 +1433,9 @@ def extract_video_segments_dynamic(
                         blended_frame = cv2.addWeighted(
                             prev_payload["frame"], 1.0 - alpha, next_payload["frame"], alpha, 0
                         )
-                        interp_center = _blend_centers(prev_payload["center"], next_payload["center"], alpha)
-                        interp_zoom = lerp_scalar(prev_payload["zoom"], next_payload["zoom"], alpha)
-                        interp_rotate = lerp_scalar(prev_payload["rotate"], next_payload["rotate"], alpha)
+                        interp_center = next_payload["center"]
+                        interp_zoom = next_payload["zoom"]
+                        interp_rotate = next_payload["rotate"]
                         blended_payload = {
                             "frame": blended_frame,
                             "center": interp_center,
@@ -1319,6 +1470,7 @@ def extract_video_segments_dynamic(
         write_end_idx = len(seg_frames) - fade_frames if fade_frames > 0 else len(seg_frames)
         if write_end_idx < start_idx:
             write_end_idx = start_idx
+        seg_written = 0
         for frame in seg_frames[start_idx:write_end_idx]:
             cropped = _apply_zoom_payload(frame)
             if cropped is None:
@@ -1326,10 +1478,19 @@ def extract_video_segments_dynamic(
             out.write(_render_subtitles_after_zoom(cropped))
             out_frame_idx += 1
             pbar.update(1)
+            seg_written += 1
 
         # Buffer tail frames for next segment's fade
         pending_tail_frames = seg_frames[write_end_idx:] if fade_frames > 0 else []
         prev_end_frame = seg["end_frame"]
+        if debug_lengths:
+            expected = len(seg_frames)
+            log_len_diff("video", seg_idx, expected, seg_written, unit="frames")
+            if do_fade:
+                print(
+                    f"[len][video-fade] seg={seg_idx} pre={expected} post={seg_written} "
+                    f"diff={seg_written - expected}"
+                )
 
     # Flush any remaining buffered tail frames
     if pending_tail_frames:
@@ -1344,6 +1505,11 @@ def extract_video_segments_dynamic(
     pbar.close()
     cap.release()
     out.release()
+    if debug_lengths:
+        print(
+            f"[len][video-total] expected={expected_total_frames} "
+            f"actual={out_frame_idx} diff={out_frame_idx - expected_total_frames}"
+        )
     return True
 
 
@@ -1479,6 +1645,14 @@ def extract_video_dynamic_full(
             subtitle_shadow_color=subtitle_shadow_color,
             subtitle_cache_max=subtitle_cache_max,
         )
+
+    def _render_subtitles_after_zoom(frame, t_sub=None):
+        if subtitle_renderer is None:
+            return frame
+        if t_sub is None:
+            t_sub = frame_idx / fps if fps else 0.0
+        return subtitle_renderer.render(frame, t_sub)
+
     pbar = tqdm(total=total_frames, desc="Writing frames")
     frame_idx = 0
 
@@ -1682,6 +1856,169 @@ def extract_video_dynamic_full(
     out.release()
     if visualize:
         cv2.destroyAllWindows()
+    return True
+
+
+def _write_boundary_debug_csv(
+    csv_path,
+    video_segments,
+    audio_segments,
+    subtitle_segments,
+    fps,
+    sample_rate,
+    fade_frames,
+    fade_samples,
+    fade_mode,
+):
+    if not video_segments or len(video_segments) < 2:
+        print("[debug] boundary CSV skipped: fewer than 2 segments.")
+        return False
+    if not fps or fps <= 0:
+        print("[debug] boundary CSV skipped: invalid fps.")
+        return False
+    if not sample_rate or sample_rate <= 0:
+        print("[debug] boundary CSV skipped: invalid audio sample rate.")
+        return False
+
+    fade_mode = (fade_mode or "sequence").lower()
+    if fade_mode not in ("sequence", "hold", "split"):
+        fade_mode = "sequence"
+    audio_fade_len = max(0, int(fade_samples or 0))
+    if fade_mode == "split" and audio_fade_len > 1:
+        audio_fade_len = audio_fade_len // 2
+
+    subtitle_starts = sorted(float(seg.get("start", 0.0)) for seg in (subtitle_segments or []))
+    subtitle_ends = sorted(float(seg.get("end", seg.get("start", 0.0))) for seg in (subtitle_segments or []))
+
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    out_boundary_frames = 0
+    row_count = 0
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "boundary_idx",
+                "prev_start_sec",
+                "prev_end_sec",
+                "next_start_sec",
+                "next_end_sec",
+                "prev_start_frame",
+                "prev_end_frame",
+                "next_start_frame",
+                "prev_len_frames",
+                "next_len_frames",
+                "gap_frames_raw",
+                "gap_frames_clamped",
+                "video_fade",
+                "video_prev_tail_frames",
+                "video_next_head_frames",
+                "out_boundary_frame",
+                "out_boundary_sec",
+                "audio_prev_start_sample",
+                "audio_prev_end_sample",
+                "audio_next_start_sample",
+                "audio_prev_len_samples",
+                "audio_fade_len_samples",
+                "audio_fade",
+                "subtitle_prev_end_sec",
+                "subtitle_next_start_sec",
+                "subtitle_prev_delta_ms",
+                "subtitle_next_delta_ms",
+            ]
+        )
+
+        max_boundaries = min(len(video_segments), len(audio_segments)) - 1
+        for i in range(max_boundaries):
+            prev_v = video_segments[i]
+            next_v = video_segments[i + 1]
+            prev_start = float(prev_v.get("start", 0.0))
+            prev_end = float(prev_v.get("end", prev_start))
+            next_start = float(next_v.get("start", prev_end))
+            next_end = float(next_v.get("end", next_start))
+
+            prev_start_frame = int(math.floor(prev_start * fps))
+            prev_end_frame = int(math.floor(prev_end * fps))
+            next_start_frame = int(math.floor(next_start * fps))
+            next_end_frame = int(math.floor(next_end * fps))
+            prev_len_frames = max(0, prev_end_frame - prev_start_frame)
+            next_len_frames = max(0, next_end_frame - next_start_frame)
+            gap_frames_raw = next_start_frame - prev_end_frame
+            gap_frames_clamped = max(0, gap_frames_raw)
+
+            video_prev_tail = min(max(0, int(fade_frames or 0)), prev_len_frames)
+            video_next_head = min(max(0, int(fade_frames or 0)), next_len_frames)
+            video_fade = int(
+                (fade_frames or 0) > 0
+                and prev_len_frames > 0
+                and next_len_frames > 0
+                and gap_frames_clamped > 0
+            )
+
+            out_boundary_frames += prev_len_frames
+            out_boundary_sec = out_boundary_frames / float(fps)
+
+            prev_a = audio_segments[i]
+            next_a = audio_segments[i + 1]
+            prev_a_start = int(float(prev_a.get("start", 0.0)) * sample_rate)
+            prev_a_end = int(float(prev_a.get("end", prev_a.get("start", 0.0))) * sample_rate)
+            next_a_start = int(float(next_a.get("start", 0.0)) * sample_rate)
+            audio_prev_len = max(0, prev_a_end - prev_a_start)
+            audio_fade = int(
+                audio_fade_len > 0
+                and audio_prev_len > audio_fade_len
+                and next_a_start >= audio_fade_len
+            )
+
+            prev_sub_end = ""
+            next_sub_start = ""
+            prev_delta_ms = ""
+            next_delta_ms = ""
+            if subtitle_ends:
+                idx_prev_end = bisect.bisect_right(subtitle_ends, out_boundary_sec) - 1
+                if idx_prev_end >= 0:
+                    prev_sub_end = subtitle_ends[idx_prev_end]
+                    prev_delta_ms = (out_boundary_sec - prev_sub_end) * 1000.0
+            if subtitle_starts:
+                idx_next_start = bisect.bisect_left(subtitle_starts, out_boundary_sec)
+                if idx_next_start < len(subtitle_starts):
+                    next_sub_start = subtitle_starts[idx_next_start]
+                    next_delta_ms = (next_sub_start - out_boundary_sec) * 1000.0
+
+            writer.writerow(
+                [
+                    i + 1,
+                    f"{prev_start:.6f}",
+                    f"{prev_end:.6f}",
+                    f"{next_start:.6f}",
+                    f"{next_end:.6f}",
+                    prev_start_frame,
+                    prev_end_frame,
+                    next_start_frame,
+                    prev_len_frames,
+                    next_len_frames,
+                    gap_frames_raw,
+                    gap_frames_clamped,
+                    video_fade,
+                    video_prev_tail,
+                    video_next_head,
+                    out_boundary_frames,
+                    f"{out_boundary_sec:.6f}",
+                    prev_a_start,
+                    prev_a_end,
+                    next_a_start,
+                    audio_prev_len,
+                    audio_fade_len,
+                    audio_fade,
+                    "" if prev_sub_end == "" else f"{prev_sub_end:.6f}",
+                    "" if next_sub_start == "" else f"{next_sub_start:.6f}",
+                    "" if prev_delta_ms == "" else f"{prev_delta_ms:.3f}",
+                    "" if next_delta_ms == "" else f"{next_delta_ms:.3f}",
+                ]
+            )
+            row_count += 1
+
+    print(f"[debug] boundary CSV written: {csv_path} ({row_count} boundaries)")
     return True
 
 
@@ -2064,6 +2401,18 @@ def main():
         help="Crossfade mode: sequence blends matching tail/head frames, hold blends last/first frames, split blends leading head frames against trailing tail frames (default: sequence).",
     )
     parser.add_argument(
+        "--debug-lengths",
+        action="store_true",
+        help="Log per-segment audio/video output lengths to ensure fades do not change segment duration.",
+    )
+    parser.add_argument(
+        "--debug-boundaries-csv",
+        nargs="?",
+        const="auto",
+        default=None,
+        help="Write boundary diagnostics CSV (optional path; default: <output>_boundaries.csv).",
+    )
+    parser.add_argument(
         "--fade-samples",
         type=int,
         default=200,
@@ -2309,6 +2658,7 @@ def main():
         print(f"Using JSON timings (missing, attempting anyway): {jsonfilename}")
         word_segment_times = segment_utils.load_word_segments_from_json(jsonfilename)
 
+    word_segment_times_source = [dict(seg) for seg in word_segment_times]
     sr = segment_utils.get_audio_sample_rate(audiofilename)
     # Audio fade length is independent; do not derive from video fade frames.
     if args.subtitles_delay_ms is not None:
@@ -2317,47 +2667,47 @@ def main():
         args.shift_seconds = 0.0
         args.extend_ms = 0
         args.prepend_ms = 0
-    word_segment_times = segment_utils.align_segments_to_sample_boundaries(
-        word_segment_times, sr
-    )
-    word_segment_times = segment_utils.fix_zero_length_words(
-        word_segment_times, sr, shift_seconds=args.shift_seconds
-    )
-    word_segment_times = apply_bounded_prepend_extend(
-        word_segment_times, prepend_ms=args.prepend_ms, extend_ms=args.extend_ms
-    )
-    if args.max_seconds and args.max_seconds > 0:
-        limit = float(args.max_seconds)
-        trimmed = []
-        for seg in word_segment_times:
-            start = float(seg.get("start", 0.0))
-            end = float(seg.get("end", start))
-            if start >= limit:
-                break
-            if end > limit:
-                end = limit
-            curr = dict(seg)
-            curr["end"] = max(start, end)
-            trimmed.append(curr)
-        word_segment_times = trimmed
-    if args.audio_delay_ms:
-        delay_sec = float(args.audio_delay_ms) / 1000.0
-        shifted = []
-        for seg in word_segment_times:
-            curr = dict(seg)
-            start = float(curr.get("start", 0.0)) + delay_sec
-            end = float(curr.get("end", start)) + delay_sec
-            if end <= 0:
-                continue
-            if start < 0:
-                start = 0.0
-            curr["start"] = start
-            curr["end"] = max(start, end)
-            shifted.append(curr)
-        word_segment_times = segment_utils.align_segments_to_sample_boundaries(
-            shifted, sr
-        )
-        print(f"Applied audio delay: {args.audio_delay_ms:.1f} ms")
+
+    def _prepare_segments(base_segments):
+        segs = [dict(seg) for seg in base_segments]
+        segs = segment_utils.align_segments_to_sample_boundaries(segs, sr)
+        segs = segment_utils.fix_zero_length_words(segs, sr, shift_seconds=args.shift_seconds)
+        segs = apply_bounded_prepend_extend(segs, prepend_ms=args.prepend_ms, extend_ms=args.extend_ms)
+        if args.max_seconds and args.max_seconds > 0:
+            limit = float(args.max_seconds)
+            trimmed = []
+            for seg in segs:
+                start = float(seg.get("start", 0.0))
+                end = float(seg.get("end", start))
+                if start >= limit:
+                    break
+                if end > limit:
+                    end = limit
+                curr = dict(seg)
+                curr["end"] = max(start, end)
+                trimmed.append(curr)
+            segs = trimmed
+        if args.audio_delay_ms:
+            delay_sec = float(args.audio_delay_ms) / 1000.0
+            shifted = []
+            for seg in segs:
+                curr = dict(seg)
+                start = float(curr.get("start", 0.0)) + delay_sec
+                end = float(curr.get("end", start)) + delay_sec
+                if end <= 0:
+                    continue
+                if start < 0:
+                    start = 0.0
+                curr["start"] = start
+                curr["end"] = max(start, end)
+                shifted.append(curr)
+            segs = segment_utils.align_segments_to_sample_boundaries(shifted, sr)
+            print(f"Applied audio delay: {args.audio_delay_ms:.1f} ms")
+        return segs
+
+    word_segment_times = _prepare_segments(word_segment_times_source)
+    word_segment_times_for_subs = _prepare_segments(word_segment_times_source)
+
     # Preserve original word timings for subtitles/highlights.
     word_segment_times_for_cut = word_segment_times
     if args.min_gap_len and args.min_gap_len > 0:
@@ -2399,10 +2749,10 @@ def main():
         cut_total = sum(max(0.0, e - s) for s, e in cut_ranges)
         print(f"Notch ranges detected; will remove sections from output ({cut_total:.2f}s kept).")
         word_segment_times = _retime_segments_for_notches(word_segment_times, notch_ranges)
+        word_segment_times_for_subs = _retime_segments_for_notches(word_segment_times_for_subs, notch_ranges)
     elif not args.no_cut:
         word_segment_times = _retime_segments_for_word_cuts(word_segment_times)
-
-    word_segment_times_for_subs = word_segment_times
+        word_segment_times_for_subs = _retime_segments_for_word_cuts(word_segment_times_for_subs)
 
     subtitle_group_words = None
     subtitle_group_for_idx = None
@@ -2456,6 +2806,11 @@ def main():
         args.output = f"{csv_root}_dynamic.mp4"
     if args.output is None:
         args.output = os.path.join(out_dir, f"{in_base}_dynamic.mp4")
+    if args.debug_boundaries_csv == "auto":
+        out_root, _ = os.path.splitext(args.output)
+        args.debug_boundaries_csv = f"{out_root}_boundaries.csv"
+    elif args.debug_boundaries_csv:
+        args.debug_boundaries_csv = os.path.abspath(args.debug_boundaries_csv)
     temp_video = os.path.join(out_dir, f"{in_base}_temp_dynamic.mp4")
     temp_audio = os.path.join(out_dir, f"{in_base}_temp_dynamic.wav")
 
@@ -2602,11 +2957,61 @@ def main():
         else:
             print("Warning: could not open video for zoom point selection.")
 
+    # Build one shared, frame-bounded cut timeline for both audio and video.
+    source_fps = 30.0
+    cap_meta = cv2.VideoCapture(args.video)
+    if cap_meta.isOpened():
+        source_fps = cap_meta.get(cv2.CAP_PROP_FPS) or 30.0
+    cap_meta.release()
+
+    av_precomputed_segments = None
+    av_time_segments = None
+    av_audio_segments = None
+    if not args.no_cut:
+        if cut_ranges:
+            av_precomputed_segments = _precompute_segments_from_ranges(cut_ranges, source_fps)
+        else:
+            av_precomputed_segments = precompute_segments_basic(word_segment_times_for_cut, source_fps)
+        av_time_segments = [
+            {
+                "start": (int(seg["start_frame"]) / float(source_fps)),
+                "end": (int(seg["end_frame"]) / float(source_fps)),
+            }
+            for seg in av_precomputed_segments
+        ]
+        # Map frame boundaries to integer audio sample boundaries once, using rational fps.
+        # This avoids cumulative float truncation drift from per-segment second->sample casts.
+        fps_frac = Fraction(str(source_fps)).limit_denominator(1_000_000)
+        av_audio_segments = []
+        for seg in av_precomputed_segments:
+            s_frame = int(seg["start_frame"])
+            e_frame = int(seg["end_frame"])
+            start_sample = (s_frame * sr * fps_frac.denominator) // fps_frac.numerator
+            end_sample = (e_frame * sr * fps_frac.denominator) // fps_frac.numerator
+            if end_sample < start_sample:
+                end_sample = start_sample
+            av_audio_segments.append(
+                {
+                    "start": s_frame / float(source_fps),
+                    "end": e_frame / float(source_fps),
+                    "start_sample": int(start_sample),
+                    "end_sample": int(end_sample),
+                }
+            )
+        print(
+            f"[sync] shared AV segment timeline prepared from {len(av_precomputed_segments)} "
+            f"frame-bounded segments at {source_fps:.4f} fps"
+        )
+
     # Process audio
     audio_for_combine = temp_audio
     temp_audio_is_original = False
     need_temp_audio = False
     if cut_ranges:
+        need_temp_audio = True
+    elif not args.no_cut:
+        # Segment-cut mode always depends on current timing/fade settings.
+        # Reusing stale temp audio can desync against freshly rendered video/subtitles.
         need_temp_audio = True
     elif args.no_cut:
         if args.max_seconds and args.max_seconds > 0:
@@ -2625,13 +3030,17 @@ def main():
             source_audio = audiofilename if os.path.exists(audiofilename) else args.video
             if not os.path.exists(audiofilename):
                 print(f"Warning: audio file not found: {audiofilename}; using video audio stream.")
-            range_segments = [{"start": s, "end": e} for s, e in cut_ranges]
+            range_segments = av_audio_segments if av_audio_segments is not None else (
+                av_time_segments if av_time_segments is not None else [{"start": s, "end": e} for s, e in cut_ranges]
+            )
             extract_audio_segments.extract_audio_segments(
                 range_segments,
                 source_audio,
                 temp_audio,
                 fade_samples=args.fade_samples,
                 fade_mode=args.fade_mode,
+                preserve_length=True,
+                debug_lengths=args.debug_lengths,
             )
             audio_for_combine = temp_audio
         elif args.no_cut:
@@ -2646,12 +3055,19 @@ def main():
             subprocess.run(cmd, check=False)
         else:
             if os.path.exists(audiofilename):
+                audio_segments_for_cut = (
+                    av_audio_segments
+                    if av_audio_segments is not None
+                    else (av_time_segments if av_time_segments is not None else word_segment_times_for_cut)
+                )
                 extract_audio_segments.extract_audio_segments(
-                    word_segment_times_for_cut,
+                    audio_segments_for_cut,
                     audiofilename,
                     temp_audio,
                     fade_samples=args.fade_samples,
                     fade_mode=args.fade_mode,
+                    preserve_length=True,
+                    debug_lengths=args.debug_lengths,
                 )
             else:
                 print(f"Warning: audio file not found: {audiofilename}")
@@ -2684,15 +3100,13 @@ def main():
 
         video_duration = total_frames / fps if fps else 0.0
         if not args.no_cut:
-            word_segment_times_for_subs = _retime_segments_to_frame_timeline(word_segment_times_for_subs, fps)
-            if args.subtitles and args.fade_frames and args.fade_frames > 0:
-                word_segment_times_for_subs = adjust_subtitles_for_fades(
-                    word_segment_times_for_subs,
-                    word_segment_times_for_cut,
-                    fps,
-                    args.fade_frames,
-                    args.fade_mode,
+            if args.min_gap_len and args.min_gap_len > 0:
+                # Close short gaps so subtitle timeline matches cut timeline.
+                word_segment_times_for_subs = compress_small_gaps(
+                    word_segment_times_for_subs, args.min_gap_len
                 )
+            # Align subtitle timings to the same frame quantization used for video segments.
+            word_segment_times_for_subs = _retime_segments_to_frame_bounds(word_segment_times_for_subs, fps)
             if args.subtitles:
                 max_chars = args.max_chars if args.max_chars and args.max_chars > 0 else None
                 subtitle_group_words, subtitle_group_for_idx, subtitle_start_times, subtitle_end_times = (
@@ -2703,6 +3117,30 @@ def main():
                         subtitle_lines=args.subtitle_lines,
                     )
                 )
+        if args.debug_boundaries_csv:
+            if cut_ranges:
+                boundary_segments = av_time_segments if av_time_segments is not None else [{"start": s, "end": e} for s, e in cut_ranges]
+            elif args.no_cut:
+                boundary_segments = []
+            else:
+                boundary_segments = av_time_segments if av_time_segments is not None else [
+                    {"start": float(seg.get("start", 0.0)), "end": float(seg.get("end", seg.get("start", 0.0)))}
+                    for seg in word_segment_times_for_cut
+                ]
+            if boundary_segments:
+                _write_boundary_debug_csv(
+                    args.debug_boundaries_csv,
+                    boundary_segments,
+                    boundary_segments,
+                    word_segment_times_for_subs,
+                    fps,
+                    sr,
+                    args.fade_frames,
+                    args.fade_samples,
+                    args.fade_mode,
+                )
+            else:
+                print("[debug] boundary CSV skipped: no stitched boundaries in --no-cut mode.")
         use_absolute = bool(args.no_cut) or bool(cut_ranges)
         total_duration_for_schedule = video_duration
         if cut_ranges and cut_total is not None:
@@ -2729,7 +3167,7 @@ def main():
             zoom_schedule = [{"start": 0.0, "end": total_out, "zoom": args.zoom_out}]
 
         if cut_ranges:
-            precomputed_segments = _precompute_segments_from_ranges(cut_ranges, fps)
+            precomputed_segments = av_precomputed_segments if av_precomputed_segments is not None else _precompute_segments_from_ranges(cut_ranges, fps)
             extract_video_segments_dynamic(
                 precomputed_segments,
                 args.video,
@@ -2789,9 +3227,11 @@ def main():
                 debug_timeline=args.debug_timeline,
                 fade_mode=args.fade_mode,
                 fade_use_source_gaps=True,
+                fade_preserve_length=True,
                 center_blend_frames=args.center_blend_frames,
                 debug_centers=args.debug_centers,
                 video_shift_frames=args.video_shift_frames,
+                debug_lengths=args.debug_lengths,
                 rotate_degrees=args.rotate,
             )
         elif args.no_cut:
@@ -2851,7 +3291,7 @@ def main():
                 rotate_degrees=args.rotate,
             )
         else:
-            precomputed_segments = precompute_segments_basic(word_segment_times_for_cut, fps)
+            precomputed_segments = av_precomputed_segments if av_precomputed_segments is not None else precompute_segments_basic(word_segment_times_for_cut, fps)
             extract_video_segments_dynamic(
                 precomputed_segments,
                 args.video,
@@ -2911,7 +3351,9 @@ def main():
                 debug_timeline=args.debug_timeline,
                 fade_mode=args.fade_mode,
                 fade_use_source_gaps=True,
+                fade_preserve_length=True,
                 video_shift_frames=args.video_shift_frames,
+                debug_lengths=args.debug_lengths,
                 rotate_degrees=args.rotate,
             )
 

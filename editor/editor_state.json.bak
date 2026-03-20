@@ -1,0 +1,15 @@
+{
+    "currentFrame": 84,
+    "explorerRoot": "/mnt/Cancer/PanelVid2TikTok",
+    "playing": false,
+    "timeline": [
+        {
+            "color": "#dcdc5277",
+            "durationFrames": 180,
+            "filePath": "/mnt/Cancer/PanelVid2TikTok/CodeCollective/aiarchitectures2.mp4",
+            "id": "5c93bc2e-e56a-4cfe-8316-9fe1911daa22",
+            "label": "aiarchitectures2.mp4",
+            "startFrame": 33
+        }
+    ]
+}

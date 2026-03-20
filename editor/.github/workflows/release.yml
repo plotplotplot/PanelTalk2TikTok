@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    steps:
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        draft: false
+        prerelease: false
+
+  build-release-linux:
+    runs-on: ubuntu-22.04
+    needs: create-release
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v3
+      with:
+        version: '6.4.2'
+        
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libavcodec60 \
+          libavformat60 \
+          libavutil58 \
+          libswscale7 \
+          libgl1-mesa-dev
+          
+    - name: Configure CMake
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Release
+      
+    - name: Build
+      run: cmake --build ${{github.workspace}}/build --config Release -j$(nproc)
+      
+    - name: Package
+      run: |
+        mkdir -p ${{github.workspace}}/package
+        cp ${{github.workspace}}/build/editor ${{github.workspace}}/package/
+        cp ${{github.workspace}}/README.md ${{github.workspace}}/package/ 2>/dev/null || true
+        cd ${{github.workspace}}/package
+        tar czf editor-linux-x64.tar.gz *
+        
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create-release.outputs.upload_url }}
+        asset_path: ${{github.workspace}}/package/editor-linux-x64.tar.gz
+        asset_name: editor-linux-x64.tar.gz
+        asset_content_type: application/gzip
+
+  build-release-macos:
+    runs-on: macos-14
+    needs: create-release
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v3
+      with:
+        version: '6.4.2'
+        
+    - name: Install FFmpeg
+      run: brew install ffmpeg@6
+      
+    - name: Configure CMake
+      run: |
+        export PKG_CONFIG_PATH="/opt/homebrew/opt/ffmpeg@6/lib/pkgconfig:$PKG_CONFIG_PATH"
+        cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Release
+      
+    - name: Build
+      run: cmake --build ${{github.workspace}}/build --config Release -j$(sysctl -n hw.ncpu)
+      
+    - name: Package
+      run: |
+        mkdir -p ${{github.workspace}}/package/editor.app/Contents/MacOS
+        cp ${{github.workspace}}/build/editor ${{github.workspace}}/package/editor.app/Contents/MacOS/
+        cd ${{github.workspace}}/package
+        tar czf editor-macos-arm64.tar.gz editor.app
+        
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create-release.outputs.upload_url }}
+        asset_path: ${{github.workspace}}/package/editor-macos-arm64.tar.gz
+        asset_name: editor-macos-arm64.tar.gz
+        asset_content_type: application/gzip

@@ -246,3 +246,31 @@ def render_grouped_subtitle_overlay(
             mask[outline_only] = 255
 
     return overlay, mask, bg_mask
+
+
+def compact_overlay_region(overlay, mask, bg_mask=None):
+    """
+    Crop rendered subtitle buffers to the smallest region that contains
+    visible subtitle pixels or subtitle background pixels.
+    """
+    if overlay is None or mask is None:
+        return None, None, None, None
+
+    nonzero = mask > 0
+    if bg_mask is not None:
+        nonzero |= bg_mask > 0
+
+    ys, xs = np.where(nonzero)
+    if ys.size == 0 or xs.size == 0:
+        return None, None, None, None
+
+    y1, y2 = ys.min(), ys.max() + 1
+    x1, x2 = xs.min(), xs.max() + 1
+
+    overlay_roi = overlay[y1:y2, x1:x2].copy()
+    mask_roi = mask[y1:y2, x1:x2].copy()
+    bg_mask_roi = None
+    if bg_mask is not None:
+        bg_mask_roi = bg_mask[y1:y2, x1:x2].copy()
+
+    return overlay_roi, mask_roi, bg_mask_roi, (x1, y1)

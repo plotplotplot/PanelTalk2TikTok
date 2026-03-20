@@ -2,8 +2,12 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 from PIL import ImageFont
+from collections import OrderedDict
 
 import subtitle_render
+
+
+MAX_SUBTITLE_CACHE_ENTRIES = 128
 
 
 def extract_video_segments(
@@ -35,6 +39,7 @@ def extract_video_segments(
     subtitle_text_color=(255, 255, 255),
     subtitle_highlight_color=(0, 255, 255),
     subtitle_shadow_color=(0, 0, 0),
+    render_subtitles=True,
     brightness_mult=None,
     video_shift_frames=0,
     includes=None,
@@ -80,9 +85,7 @@ def extract_video_segments(
     current_frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
 
     # Cache for overlay/mask per word group to avoid recomputation
-    overlay_cache = {}
-    mask_cache = {}
-    bg_mask_cache = {}
+    subtitle_cache = OrderedDict()
 
     # Process each segment
     video_shift_frames = int(video_shift_frames)
@@ -117,16 +120,22 @@ def extract_video_segments(
             inc["start"] = start
             inc["end"] = end
 
+    brightness_identity = True
+    if brightness_mult is not None:
+        brightness_identity = bool(
+            np.allclose(brightness_mult, np.ones((1, 1, 3), dtype=np.float32))
+        )
+
     def _prepare_frame(frame, frame_idx):
         if crop_config is not None:
             x1, y1, x2, y2 = crop_config["crop_box"]
             frame = frame[y1:y2, x1:x2]
             if frame.size == 0:
                 return None
-            if (x2 - x1) != output_width or (y2 - y1) != output_height:
+            if frame.shape[1] != output_width or frame.shape[0] != output_height:
                 frame = cv2.resize(frame, (output_width, output_height))
 
-        if brightness_mult is not None:
+        if brightness_mult is not None and not brightness_identity:
             mult = brightness_mult
             frame = np.clip(frame.astype(np.float32) * mult, 0, 255).astype(frame.dtype)
 
@@ -329,40 +338,49 @@ def extract_video_segments(
             subtitle_shadow_color,
         )
 
-        # Get or create overlay and mask
-        if cache_key in overlay_cache:
-            overlay = overlay_cache[cache_key]
-            mask = mask_cache[cache_key]
-            bg_mask = bg_mask_cache[cache_key]
-        else:
-            overlay, mask, bg_mask = subtitle_render.render_grouped_subtitle_overlay(
-                (output_height, output_width, 3),  # frame shape
-                group_words,
-                active_idx,
-                font_scale=font_scale,
-                text_height_from_bottom=text_height,
-                text_height_from_bottom_2=text_height_2,
-                subtitle_lines=subtitle_lines,
-                font_ttf=font_ttf,
-                subtitle_bg=subtitle_bg,
-                subtitle_bg_color=subtitle_bg_color,
-                subtitle_bg_alpha=subtitle_bg_alpha,
-                subtitle_bg_pad=subtitle_bg_pad,
-                subtitle_bg_full_width=True,
-                subtitle_bg_height=subtitle_bg_height,
-                subtitle_bg_offset_y=subtitle_bg_offset_y,
-                shadow_size=shadow_size,
-                shadow_offset_x=shadow_offset_x,
-                shadow_offset_y=shadow_offset_y,
-                dilate_size=subtitle_dilate_size if subtitle_dilate else 0,
-                dilate_color=subtitle_dilate_color,
-                text_color=subtitle_text_color,
-                highlight_color=subtitle_highlight_color,
-                shadow_color=subtitle_shadow_color,
-            )
-            overlay_cache[cache_key] = overlay
-            mask_cache[cache_key] = mask
-            bg_mask_cache[cache_key] = bg_mask
+        overlay = None
+        mask = None
+        bg_mask = None
+        overlay_origin = None
+        if render_subtitles:
+            # Cache compact subtitle ROIs and cap cache size to avoid
+            # unbounded memory growth on long transcripts.
+            cached = subtitle_cache.get(cache_key)
+            if cached is not None:
+                overlay, mask, bg_mask, overlay_origin = cached
+                subtitle_cache.move_to_end(cache_key)
+            else:
+                full_overlay, full_mask, full_bg_mask = subtitle_render.render_grouped_subtitle_overlay(
+                    (output_height, output_width, 3),  # frame shape
+                    group_words,
+                    active_idx,
+                    font_scale=font_scale,
+                    text_height_from_bottom=text_height,
+                    text_height_from_bottom_2=text_height_2,
+                    subtitle_lines=subtitle_lines,
+                    font_ttf=font_ttf,
+                    subtitle_bg=subtitle_bg,
+                    subtitle_bg_color=subtitle_bg_color,
+                    subtitle_bg_alpha=subtitle_bg_alpha,
+                    subtitle_bg_pad=subtitle_bg_pad,
+                    subtitle_bg_full_width=True,
+                    subtitle_bg_height=subtitle_bg_height,
+                    subtitle_bg_offset_y=subtitle_bg_offset_y,
+                    shadow_size=shadow_size,
+                    shadow_offset_x=shadow_offset_x,
+                    shadow_offset_y=shadow_offset_y,
+                    dilate_size=subtitle_dilate_size if subtitle_dilate else 0,
+                    dilate_color=subtitle_dilate_color,
+                    text_color=subtitle_text_color,
+                    highlight_color=subtitle_highlight_color,
+                    shadow_color=subtitle_shadow_color,
+                )
+                overlay, mask, bg_mask, overlay_origin = subtitle_render.compact_overlay_region(
+                    full_overlay, full_mask, full_bg_mask
+                )
+                subtitle_cache[cache_key] = (overlay, mask, bg_mask, overlay_origin)
+                if len(subtitle_cache) > MAX_SUBTITLE_CACHE_ENTRIES:
+                    subtitle_cache.popitem(last=False)
 
         # Optimized seeking: only seek if we're more than 50 frames away
         # (reduces expensive cv2.VideoCapture.set calls)
@@ -397,22 +415,22 @@ def extract_video_segments(
                 continue
 
             # Apply subtitle background (alpha blend) before text
-            if subtitle_bg and subtitle_bg_alpha > 0 and bg_mask is not None:
+            if subtitle_bg and subtitle_bg_alpha > 0 and bg_mask is not None and overlay_origin is not None:
                 alpha_bg = max(0.0, min(1.0, subtitle_bg_alpha))
-                ys, xs = np.where(bg_mask > 0)
-                if ys.size:
-                    y1, y2 = ys.min(), ys.max() + 1
-                    x1, x2 = xs.min(), xs.max() + 1
-                    roi = frame[y1:y2, x1:x2]
-                    roi_bg = overlay[y1:y2, x1:x2]
-                    frame[y1:y2, x1:x2] = cv2.addWeighted(
-                        roi, 1.0 - alpha_bg, roi_bg, alpha_bg, 0
-                    )
+                x1, y1 = overlay_origin
+                h, w = bg_mask.shape[:2]
+                roi = frame[y1:y1 + h, x1:x1 + w]
+                frame[y1:y1 + h, x1:x1 + w] = cv2.addWeighted(
+                    roi, 1.0 - alpha_bg, overlay, alpha_bg, 0
+                )
 
             # Apply text overlay using cached mask
-            if mask is not None:
+            if mask is not None and overlay_origin is not None:
+                x1, y1 = overlay_origin
+                h, w = mask.shape[:2]
+                roi = frame[y1:y1 + h, x1:x1 + w]
                 mask_indices = mask > 0
-                frame[mask_indices] = overlay[mask_indices]
+                roi[mask_indices] = overlay[mask_indices]
             frame = _apply_includes(frame, total_frames_processed)
             out.write(frame)
             total_frames_processed += 1

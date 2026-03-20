@@ -1,0 +1,198 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v3
+      with:
+        version: '6.4.2'
+        modules: 'qtbase qtdeclarative'
+        
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libavcodec-dev \
+          libavformat-dev \
+          libavutil-dev \
+          libswscale-dev \
+          libgl1-mesa-dev \
+          libxkbcommon-x11-dev
+          
+    - name: Configure CMake
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Release
+      
+    - name: Build
+      run: cmake --build ${{github.workspace}}/build --config Release -j$(nproc)
+      
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: editor-linux
+        path: |
+          ${{github.workspace}}/build/editor
+          
+  test-linux:
+    runs-on: ubuntu-24.04
+    needs: build-linux
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v3
+      with:
+        version: '6.4.2'
+        modules: 'qtbase qtdeclarative'
+        
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libavcodec-dev \
+          libavformat-dev \
+          libavutil-dev \
+          libswscale-dev \
+          libgl1-mesa-dev \
+          libxkbcommon-x11-dev \
+          ffmpeg \
+          xvfb
+          
+    - name: Configure CMake
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Release
+      
+    - name: Build with tests
+      run: cmake --build ${{github.workspace}}/build --config Release -j$(nproc)
+      
+    - name: Run unit tests
+      run: |
+        cd ${{github.workspace}}/build/tests
+        ./test_frame_handle
+        ./test_memory_budget
+        ./test_timeline_cache
+        ./test_async_decoder
+      env:
+        QT_QPA_PLATFORM: offscreen
+        
+    - name: Run integration tests
+      run: |
+        cd ${{github.workspace}}/build/tests
+        ./test_integration
+      env:
+        QT_QPA_PLATFORM: offscreen
+        
+  build-macos:
+    runs-on: macos-14
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v3
+      with:
+        version: '6.4.2'
+        modules: 'qtbase qtdeclarative'
+        
+    - name: Install FFmpeg
+      run: brew install ffmpeg@6
+      
+    - name: Configure CMake
+      run: |
+        export PKG_CONFIG_PATH="/opt/homebrew/opt/ffmpeg@6/lib/pkgconfig:$PKG_CONFIG_PATH"
+        cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Release
+      
+    - name: Build
+      run: cmake --build ${{github.workspace}}/build --config Release -j$(sysctl -n hw.ncpu)
+      
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: editor-macos
+        path: |
+          ${{github.workspace}}/build/editor
+
+  static-analysis:
+    runs-on: ubuntu-24.04
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v3
+      with:
+        version: '6.4.2'
+        
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libavcodec-dev \
+          libavformat-dev \
+          libavutil-dev \
+          libswscale-dev \
+          libgl1-mesa-dev \
+          clang-tidy \
+          cppcheck
+          
+    - name: Configure CMake
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Debug
+      
+    - name: Run clang-tidy
+      run: |
+        find ${{github.workspace}} -name "*.cpp" -not -path "*/build/*" | \
+          xargs clang-tidy -p ${{github.workspace}}/build || true
+          
+    - name: Run cppcheck
+      run: |
+        cppcheck --enable=all --error-exitcode=0 \
+          --suppress=missingIncludeSystem \
+          -I ${{github.workspace}} \
+          ${{github.workspace}}/*.cpp \
+          ${{github.workspace}}/*.h || true
+
+  asan-build:
+    runs-on: ubuntu-24.04
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v3
+      with:
+        version: '6.4.2'
+        
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libavcodec-dev \
+          libavformat-dev \
+          libavutil-dev \
+          libswscale-dev \
+          libgl1-mesa-dev
+          
+    - name: Configure with ASAN
+      run: cmake -B ${{github.workspace}}/build -DEDITOR_ASAN=ON
+      
+    - name: Build with ASAN
+      run: cmake --build ${{github.workspace}}/build -j$(nproc)
+      
+    - name: Run tests with ASAN
+      run: |
+        cd ${{github.workspace}}/build/tests
+        ./test_frame_handle
+        ./test_memory_budget
+      env:
+        QT_QPA_PLATFORM: offscreen
+        ASAN_OPTIONS: detect_leaks=0

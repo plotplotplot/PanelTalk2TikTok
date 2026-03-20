@@ -10,6 +10,7 @@ import math
 import os
 import subprocess
 import wave
+from fractions import Fraction
 
 import cv2
 import numpy as np
@@ -73,10 +74,8 @@ def precompute_segments(word_segment_times, fps, group_size=6, max_chars=None, s
             group_for_idx[wi] = (gi, pos)
 
     for idx, seg in enumerate(tqdm(word_segment_times, desc="Precomputing segment timings")):
-        start_f = seg["start"] * fps
-        end_f = seg["end"] * fps
-        start_frame = math.floor(start_f)
-        end_frame = math.floor(end_f)
+        start_frame = int(seg.get("start_frame", math.floor(seg["start"] * fps)))
+        end_frame = int(seg.get("end_frame", math.floor(seg["end"] * fps)))
 
         gi, pos = group_for_idx.get(idx, (idx // group_size, idx % group_size))
         group_indices = groups[gi] if gi < len(groups) else [idx]
@@ -94,6 +93,61 @@ def precompute_segments(word_segment_times, fps, group_size=6, max_chars=None, s
         })
     
     return precomputed_segments
+
+
+def annotate_source_timings(word_segment_times):
+    for idx, seg in enumerate(word_segment_times):
+        seg.setdefault("segment_idx", idx)
+        seg.setdefault("source_start", float(seg.get("start", 0.0) or 0.0))
+        source_end = float(seg.get("end", seg["source_start"]) or seg["source_start"])
+        seg.setdefault("source_end", source_end)
+    return word_segment_times
+
+
+def snap_segments_to_frame_times(word_segment_times, fps, sr):
+    snapped = []
+    for seg in word_segment_times:
+        curr = dict(seg)
+        curr["adjusted_start"] = float(curr.get("start", 0.0) or 0.0)
+        curr["adjusted_end"] = float(curr.get("end", curr["adjusted_start"]) or curr["adjusted_start"])
+        start_frame = int(math.floor(curr["adjusted_start"] * fps))
+        end_frame = int(math.floor(curr["adjusted_end"] * fps))
+        if start_frame < 0:
+            start_frame = 0
+        if end_frame < 0:
+            end_frame = 0
+        curr["start_frame"] = start_frame
+        curr["end_frame"] = end_frame
+        curr["start"] = start_frame / fps
+        curr["end"] = end_frame / fps
+        curr["start_sample"] = int(curr["start"] * sr)
+        curr["end_sample"] = int(curr["end"] * sr)
+        if curr["end_frame"] <= curr["start_frame"]:
+            continue
+        snapped.append(curr)
+    return snapped
+
+
+def write_segment_debug_csv(path, word_segment_times):
+    fieldnames = [
+        "segment_idx",
+        "word",
+        "source_start",
+        "source_end",
+        "adjusted_start",
+        "adjusted_end",
+        "start_frame",
+        "end_frame",
+        "start",
+        "end",
+        "start_sample",
+        "end_sample",
+    ]
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for seg in word_segment_times:
+            writer.writerow({k: seg.get(k, "") for k in fieldnames})
 
 def postpend_silence_to_wav(path, seconds):
     """
@@ -198,8 +252,11 @@ def combine_video_audio(video_file, audio_file, final_output):
         "ffmpeg",
         "-i", video_file,
         "-i", audio_file,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
         "-c:v", "copy" if video_copy else "libx264",
         "-c:a", "aac",
+        "-shortest",
         "-strict", "experimental",
         "-y",
         final_output
@@ -271,6 +328,131 @@ def resolve_font_file(font_value: str, base_dir: str) -> str | None:
     except Exception:
         return None
     return None
+
+
+def ensure_transcript_json(media_path: str, json_path: str) -> None:
+    """
+    Generate a WhisperX JSON transcript if it does not already exist.
+    Streams WhisperX output so long-running transcription is visible.
+    """
+    if os.path.exists(json_path):
+        return
+
+    script_path = os.path.join(os.path.dirname(__file__), "whisperx.sh")
+    if not os.path.exists(script_path):
+        raise FileNotFoundError(
+            f"Transcript JSON missing and whisperx.sh not found: {script_path}"
+        )
+    if not os.path.exists(media_path):
+        raise FileNotFoundError(
+            f"Transcript JSON missing and source media not found: {media_path}"
+        )
+
+    print(f"Transcript missing: {json_path}")
+    print(f"Generating transcript with: {script_path} {media_path}")
+    proc = subprocess.Popen(
+        ["bash", script_path, media_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if proc.stdout is not None:
+        for line in proc.stdout:
+            print(line, end="")
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"whisperx.sh exited with code {proc.returncode}")
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(
+            f"whisperx.sh completed but transcript JSON was not created: {json_path}"
+        )
+
+
+def ensure_audio_wav(video_path: str, wav_path: str) -> None:
+    """
+    Extract a mono PCM WAV sidecar from the source video when it is missing.
+    """
+    if os.path.exists(wav_path):
+        return
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(
+            f"Audio WAV missing and source video not found: {video_path}"
+        )
+
+    print(f"Audio sidecar missing: {wav_path}")
+    print(f"Extracting WAV from source video: {video_path}")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path,
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        wav_path,
+    ]
+    subprocess.run(cmd, check=True)
+    if not os.path.exists(wav_path):
+        raise FileNotFoundError(f"ffmpeg completed but WAV was not created: {wav_path}")
+
+
+def _ffprobe_json(path: str, *, select_streams: str | None = None, entries: str | None = None,
+                  read_intervals: str | None = None, show_packets: bool = False) -> dict:
+    cmd = ["ffprobe", "-v", "error", "-of", "json"]
+    if read_intervals:
+        cmd.extend(["-read_intervals", read_intervals])
+    if select_streams:
+        cmd.extend(["-select_streams", select_streams])
+    if entries:
+        cmd.extend(["-show_entries", entries])
+    if show_packets:
+        cmd.append("-show_packets")
+    cmd.append(path)
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    return json.loads(result.stdout or "{}")
+
+
+def _parse_fraction(value: str | None) -> float:
+    if not value:
+        return 0.0
+    try:
+        return float(Fraction(value))
+    except Exception:
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
+
+
+def assert_constant_rate_media(path: str) -> None:
+    """
+    Fail fast on likely VFR video inputs, which can produce sync drift
+    in the current segment-based pipeline.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Input media not found: {path}")
+
+    probe = _ffprobe_json(
+        path,
+        entries="stream=index,codec_type,codec_name,avg_frame_rate,r_frame_rate,bit_rate",
+    )
+    streams = probe.get("streams", [])
+
+    video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if video_stream:
+        avg_fps = _parse_fraction(video_stream.get("avg_frame_rate"))
+        real_fps = _parse_fraction(video_stream.get("r_frame_rate"))
+        if avg_fps > 0 and real_fps > 0 and abs(avg_fps - real_fps) > 1e-3:
+            raise ValueError(
+                "Input video appears to be VFR "
+                f"(avg_frame_rate={video_stream.get('avg_frame_rate')}, "
+                f"r_frame_rate={video_stream.get('r_frame_rate')}). "
+                "Convert it to CFR before running simple_cut."
+            )
 
 
 def main():
@@ -393,14 +575,19 @@ def main():
     parser.add_argument(
         "--subtitle-highlight-color",
         type=str,
-        default="0,255,255",
-        help="Subtitle highlight color as B,G,R (default: 0,255,255).",
+        default="255,200,120",
+        help="Subtitle highlight color as B,G,R (default: 255,200,120).",
     )
     parser.add_argument(
         "--subtitle-shadow-color",
         type=str,
         default="0,0,0",
         help="Subtitle shadow color as B,G,R (default: 0,0,0).",
+    )
+    parser.add_argument(
+        "--no-subtitles",
+        action="store_true",
+        help="Render video without subtitle overlays.",
     )
     parser.add_argument(
         "--brightness-mult",
@@ -450,6 +637,12 @@ def main():
         type=int,
         default=0,
         help="Max characters per subtitle line (0 = no limit).",
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=0.0,
+        help="Limit processing to the first N seconds of transcript timing (0 = no limit).",
     )
     parser.add_argument(
         "--temp-codec",
@@ -561,9 +754,17 @@ def main():
         action="store_true",
         help="Apply IG standard settings (1080x1920, 2 subtitle lines, bg, etc.)",
     )
+    parser.add_argument(
+        "--allow-variable-rate",
+        action="store_true",
+        help="Skip the input VFR/VBR safety check.",
+    )
     
     args = parser.parse_args()
     text_height_2 = None
+
+    if not args.allow_variable_rate:
+        assert_constant_rate_media(args.video)
 
     if args.ig_standard:
         args.width = 1080
@@ -603,9 +804,40 @@ def main():
         transcriptJson2csv.export_words_to_csv(jsonfilename, source_video=args.video)
         word_segment_times = segment_utils.load_word_segments_from_json(jsonfilename)
     else:
-        print(f"Using JSON timings (missing, attempting anyway): {jsonfilename}")
+        ensure_transcript_json(args.video, jsonfilename)
+        print(f"Using JSON timings: {jsonfilename}")
+        transcriptJson2csv.export_words_to_csv(jsonfilename, source_video=args.video)
         word_segment_times = segment_utils.load_word_segments_from_json(jsonfilename)
 
+    word_segment_times = annotate_source_timings(word_segment_times)
+
+    if args.max_seconds and args.max_seconds > 0:
+        max_seconds = float(args.max_seconds)
+        limited_segments = []
+        for seg in word_segment_times:
+            start = float(seg.get("start", 0.0) or 0.0)
+            end = float(seg.get("end", start) or start)
+            if start >= max_seconds:
+                break
+            curr = dict(seg)
+            curr["start"] = max(0.0, start)
+            curr["end"] = min(max_seconds, max(curr["start"], end))
+            if curr["end"] > curr["start"]:
+                limited_segments.append(curr)
+        word_segment_times = limited_segments
+        print(
+            f"Limiting to first {max_seconds:.3f}s "
+            f"({len(word_segment_times)} word segments)"
+        )
+
+    ensure_audio_wav(args.video, audiofilename)
+    cap = cv2.VideoCapture(args.video)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    input_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    input_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    if not fps or fps <= 0:
+        raise ValueError(f"Could not determine FPS for input video: {args.video}")
     sr = segment_utils.get_audio_sample_rate(audiofilename)
     if args.preserve_word_gaps:
         args.shift_seconds = 0.0
@@ -641,6 +873,10 @@ def main():
             shifted, sr
         )
         print(f"Applied audio delay: {args.audio_delay_ms:.1f} ms")
+
+    word_segment_times = snap_segments_to_frame_times(word_segment_times, fps, sr)
+    if not word_segment_times:
+        raise ValueError("No non-empty frame-aligned segments remain after timing adjustments.")
     
     # Output naming: if CSV provided, name after CSV; otherwise default to {infile}_final.mp4
     out_dir = os.path.dirname(args.video) or "."
@@ -652,18 +888,20 @@ def main():
         args.output = os.path.join(out_dir, f"{in_base}_final.mp4")
     temp_video = os.path.join(out_dir, f"{in_base}_temp.mp4")
     temp_audio = os.path.join(out_dir, f"{in_base}_temp.wav")
+    debug_segments_csv = os.path.join(out_dir, f"{in_base}_segments_debug.csv")
+    write_segment_debug_csv(debug_segments_csv, word_segment_times)
+    print(f"Segment debug CSV written to: {debug_segments_csv}")
     
     # Process audio
-    if not args.skip_audio and os.path.exists(temp_audio):
-        print(f"Temp audio exists, skipping audio processing: {temp_audio}")
-    elif not args.skip_audio:
+    if not args.skip_audio:
         print("\n=== Processing Audio ===")
         print(f"Audio source: {audiofilename}")
         extract_audio_segments.extract_audio_segments(
             word_segment_times,
             audiofilename,
             temp_audio,
-            fade_samples=args.fade_samples
+            fade_samples=args.fade_samples,
+            preserve_length=True,
         )
         if args.postpend_silence and args.postpend_silence_seconds > 0:
             try:
@@ -677,13 +915,6 @@ def main():
     # Process video
     if not args.skip_video:
         print("\n=== Processing Video ===")
-        
-        # Get video FPS and size
-        cap = cv2.VideoCapture(args.video)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        input_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        input_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        cap.release()
 
         crop_config = None
         if args.width > 0 and args.height > 0:
@@ -950,6 +1181,7 @@ def main():
             subtitle_text_color=subtitle_text_color,
             subtitle_highlight_color=subtitle_highlight_color,
             subtitle_shadow_color=subtitle_shadow_color,
+            render_subtitles=not args.no_subtitles,
             brightness_mult=brightness_mult,
             video_shift_frames=args.video_shift_frames,
             includes=includes,

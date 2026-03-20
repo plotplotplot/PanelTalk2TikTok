@@ -9,6 +9,8 @@ def extract_audio_segments(
     output_audio_file,
     fade_samples: int = 3000,
     fade_mode: str = "sequence",
+    preserve_length: bool = False,
+    debug_lengths: bool = False,
 ):
     """
     Faster version of extract_audio_segments().
@@ -50,10 +52,16 @@ def extract_audio_segments(
     fade_in = np.repeat(fade_in_1d, ch, axis=1)
 
     segments = []
+    expected_total = 0
+    actual_total = 0
 
     for i, row in enumerate(tqdm(word_segment_times, desc="Extracting audio")):
-        start = int(row["start"] * sr)
-        end = int(row["end"] * sr)
+        if "start_sample" in row and "end_sample" in row:
+            start = int(row["start_sample"])
+            end = int(row["end_sample"])
+        else:
+            start = int(row["start"] * sr)
+            end = int(row["end"] * sr)
         if start < 0:
             start = 0
         if end < 0:
@@ -64,6 +72,8 @@ def extract_audio_segments(
             # Skip invalid or empty segments after clamping.
             continue
         seg = frames[start:end]
+        expected_len = max(0, end - start)
+        expected_total += expected_len
 
         prev = []
         if segments:
@@ -73,13 +83,18 @@ def extract_audio_segments(
             overlap_in = frames[start - fade_len : start] * fade_in
             prev[-fade_len:] = prev[-fade_len:] * fade_out + overlap_in
             # Trim the head of the new segment to match the overlap length.
-            trim_len = fade_len
-            if fade_mode == "split":
-                trim_len = fade_samples // 2
-            if len(seg) > trim_len:
-                seg = seg[trim_len:]
+            if not preserve_length:
+                trim_len = fade_len
+                if fade_mode == "split":
+                    trim_len = fade_samples // 2
+                if len(seg) > trim_len:
+                    seg = seg[trim_len:]
 
         segments.append(seg.copy())
+        actual_total += len(seg)
+        if debug_lengths:
+            actual_len = len(seg)
+            print(f"[len][audio] seg={i+1} expected={expected_len} actual={actual_len} diff={actual_len - expected_len} samples")
 
 
     # Combine all at once
@@ -96,5 +111,10 @@ def extract_audio_segments(
         channels=ch,
     )
     out_seg.export(output_audio_file, format="wav")
+    if debug_lengths:
+        print(
+            f"[len][audio-total] expected={expected_total} actual={actual_total} "
+            f"diff={actual_total - expected_total} samples"
+        )
     print(f"✅ Audio segments extracted to: {output_audio_file}")
     return output_audio_file

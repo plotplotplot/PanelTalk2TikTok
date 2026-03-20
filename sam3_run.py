@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import os
 from pathlib import Path
 import subprocess
@@ -75,15 +76,84 @@ def overlay_masks(image_bgr: np.ndarray, masks: np.ndarray, alpha: float = 0.45)
     return out
 
 
-def mask_center(mask: np.ndarray, method: str = "bbox"):
-    if mask.dtype != np.bool_:
-        mask = mask.astype(bool)
+def normalize_mask(mask: np.ndarray) -> np.ndarray:
     if mask.ndim == 3 and mask.shape[0] == 1:
         mask = mask[0]
     elif mask.ndim == 3 and mask.shape[-1] == 1:
         mask = mask[:, :, 0]
     elif mask.ndim == 4 and mask.shape[1] == 1:
         mask = mask[0, 0]
+    if mask.dtype != np.bool_:
+        mask = mask.astype(bool)
+    if mask.ndim != 2:
+        raise ValueError(f"Unexpected mask shape: {mask.shape}")
+    return mask
+
+
+def union_masks(masks: np.ndarray | None, shape: tuple[int, int]) -> np.ndarray:
+    if masks is None or len(masks) == 0:
+        return np.zeros(shape, dtype=bool)
+    union = np.zeros(shape, dtype=bool)
+    for mask in masks:
+        union |= normalize_mask(mask)
+    return union
+
+
+def render_rgba_cutout(image_rgb: np.ndarray, masks: np.ndarray | None) -> np.ndarray:
+    alpha = union_masks(masks, image_rgb.shape[:2]).astype(np.uint8) * 255
+    rgba = np.zeros((image_rgb.shape[0], image_rgb.shape[1], 4), dtype=np.uint8)
+    rgba[..., :3] = image_rgb
+    rgba[..., 3] = alpha
+    return rgba
+
+
+def save_frame_image(path: Path, image: np.ndarray, image_mode: str | None = None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pil_image = Image.fromarray(image, mode=image_mode)
+    if path.suffix.lower() == ".webp":
+        pil_image.save(path, format="WEBP", lossless=False, quality=85, method=6)
+    else:
+        pil_image.save(path)
+
+
+def apply_text_prompt_cached(
+    processor: Sam3Processor,
+    prompt: str,
+    state: dict,
+    text_outputs_cache: dict | None = None,
+):
+    """Apply text prompt using a reusable backbone text cache."""
+    if "backbone_out" not in state:
+        raise ValueError("You must call set_image before setting text prompt")
+
+    if text_outputs_cache is None:
+        text_outputs_cache = processor.model.backbone.forward_text(
+            [prompt], device=processor.device
+        )
+
+    # Reuse cached text features across frames to avoid per-frame text encoding.
+    state["backbone_out"].update(text_outputs_cache)
+    if "geometric_prompt" not in state:
+        state["geometric_prompt"] = processor.model._get_dummy_prompt()
+    return processor._forward_grounding(state), text_outputs_cache
+
+
+def maybe_drain_futures(pending_writes: list, limit: int | None = None, wait_for_all: bool = False):
+    if not pending_writes:
+        return
+    if wait_for_all:
+        done, not_done = wait(pending_writes)
+    elif limit is not None and len(pending_writes) >= limit:
+        done, not_done = wait(pending_writes, return_when=FIRST_COMPLETED)
+    else:
+        return
+    for fut in done:
+        fut.result()
+    pending_writes[:] = list(not_done)
+
+
+def mask_center(mask: np.ndarray, method: str = "bbox"):
+    mask = normalize_mask(mask)
     ys, xs = np.where(mask)
     if ys.size == 0:
         return None
@@ -127,7 +197,7 @@ def run_image(
         new_h = int(round(image.height * (scale_width / image.width)))
         image = image.resize((scale_width, new_h), Image.BICUBIC)
     state = processor.set_image(image)
-    state = processor.set_text_prompt(prompt=prompt, state=state)
+    state, _ = apply_text_prompt_cached(processor, prompt, state, text_outputs_cache=None)
 
     masks = state.get("masks")
     masks_np = masks.cpu().numpy() if masks is not None else np.zeros((0,), dtype=bool)
@@ -356,7 +426,7 @@ def extract_frames(
     input_path: Path,
     frames_dir: Path,
     scale_width: int | None,
-    frames_format: str,
+    intermediate_frames_format: str,
     extract_fps: float | None,
 ):
     frames_dir.mkdir(parents=True, exist_ok=True)
@@ -366,7 +436,7 @@ def extract_frames(
     if extract_fps is not None and extract_fps > 0:
         vf.append(f"fps={extract_fps}")
     vf_arg = ",".join(vf) if vf else "null"
-    ext = "jpg" if frames_format == "jpg" else "png"
+    ext = intermediate_frames_format
     existing = list(frames_dir.glob(f"frame_*.{ext}"))
     if existing:
         print(f"[frames] skipping extract; found {len(existing)} frames in {frames_dir}")
@@ -463,13 +533,16 @@ def run_video_as_frames(
     scale_width: int | None,
     frames_dir: Path | None,
     frames_format: str,
+    intermediate_frames_format: str,
     extract_fps: float | None,
     stream_extract: bool,
     centers_path: Path | None,
     produce_output_video: bool,
+    mask_output: str,
     centers_method: str,
     smooth_alpha: float | None,
     add_center: bool,
+    encode_workers: int,
     base_stem: str | None = None,
     use_tqdm: bool = True,
 ):
@@ -480,10 +553,17 @@ def run_video_as_frames(
     frames_dir.mkdir(parents=True, exist_ok=True)
     out_frames_dir.mkdir(parents=True, exist_ok=True)
 
-    ext = "jpg" if frames_format == "jpg" else "png"
+    source_ext = intermediate_frames_format
+    output_ext = frames_format
 
     model = build_sam3_image_model()
     processor = Sam3Processor(model)
+    text_outputs_cache = None
+    if encode_workers < 1:
+        encode_workers = 1
+    pending_write_limit = max(encode_workers * 2, 1)
+    write_pool = ThreadPoolExecutor(max_workers=encode_workers)
+    pending_writes = []
     centers_f = None
     existing_frames = set()
     smooth_state = {}
@@ -498,6 +578,13 @@ def run_video_as_frames(
                     except Exception:
                         continue
         centers_f = centers_path.open("a", encoding="utf-8")
+
+    def resumed_frame_count(total: int | None = None) -> int:
+        if produce_output_video:
+            return 0
+        if total is None:
+            return len([idx for idx in existing_frames if idx >= 0])
+        return len([idx for idx in existing_frames if 0 <= idx < total])
 
     if stream_extract:
         total_frames = None
@@ -543,7 +630,7 @@ def run_video_as_frames(
             "0",
             "-vf",
             vf_arg,
-            str(frames_dir / f"frame_%06d.{ext}"),
+            str(frames_dir / f"frame_%06d.{source_ext}"),
         ]
         # Report intended fps without modifying it (unless --extract-fps is used).
         fps = None
@@ -574,7 +661,7 @@ def run_video_as_frames(
         print(f"[frames] source fps: {fps}")
         if extract_fps is not None and extract_fps > 0:
             print(f"[frames] target extract fps: {extract_fps}")
-        existing = list(frames_dir.glob(f"frame_*.{ext}"))
+        existing = list(frames_dir.glob(f"frame_*.{source_ext}"))
         if existing:
             print(f"[frames] skipping extract; found {len(existing)} frames in {frames_dir}")
             proc = None
@@ -585,9 +672,14 @@ def run_video_as_frames(
         idx = 1
         pbar = None
         if use_tqdm and tqdm is not None:
-            pbar = tqdm(total=total_frames, desc="frames", unit="frame")
+            pbar = tqdm(
+                total=total_frames,
+                initial=resumed_frame_count(total_frames),
+                desc="frames",
+                unit="frame",
+            )
         while True:
-            frame_path = frames_dir / f"frame_{idx:06d}.{ext}"
+            frame_path = frames_dir / f"frame_{idx:06d}.{source_ext}"
             if frame_path.exists():
                 frame_idx = idx - 1
                 if frame_idx in existing_frames and not produce_output_video:
@@ -608,23 +700,36 @@ def run_video_as_frames(
 
                 image = Image.open(frame_path).convert("RGB")
                 state = processor.set_image(image)
-                state = processor.set_text_prompt(prompt=prompt, state=state)
+                state, text_outputs_cache = apply_text_prompt_cached(
+                    processor, prompt, state, text_outputs_cache
+                )
                 masks = state.get("masks")
                 masks_np = (
                     masks.cpu().numpy() if masks is not None else np.zeros((0,), dtype=bool)
                 )
-                img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-                out_bgr = overlay_masks(img_bgr, masks_np)
+                image_rgb = np.array(image)
                 centers = []
                 for mask in masks_np:
                     ctr = mask_center(mask, method=centers_method)
                     if ctr is not None:
                         centers.append(ctr)
-                if add_center and centers:
-                    for ctr in centers:
-                        cv2.circle(out_bgr, (int(ctr[0]), int(ctr[1])), 8, (0, 0, 255), -1)
-                out_frame = out_frames_dir / frame_path.name
-                cv2.imwrite(str(out_frame), out_bgr)
+                out_frame = out_frames_dir / f"{frame_path.stem}.{output_ext}"
+                if mask_output == "rgba-cutout":
+                    out_rgba = render_rgba_cutout(image_rgb, masks_np)
+                    pending_writes.append(
+                        write_pool.submit(save_frame_image, out_frame, out_rgba, "RGBA")
+                    )
+                else:
+                    img_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+                    out_bgr = overlay_masks(img_bgr, masks_np)
+                    if add_center and centers:
+                        for ctr in centers:
+                            cv2.circle(out_bgr, (int(ctr[0]), int(ctr[1])), 8, (0, 0, 255), -1)
+                    out_rgb = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+                    pending_writes.append(
+                        write_pool.submit(save_frame_image, out_frame, out_rgb, "RGB")
+                    )
+                maybe_drain_futures(pending_writes, limit=pending_write_limit)
                 if centers_f is not None:
                     if centers:
                         for i, ctr in enumerate(centers):
@@ -674,15 +779,26 @@ def run_video_as_frames(
         if pbar is not None:
             pbar.close()
     else:
-        fps = extract_frames(input_path, frames_dir, scale_width, frames_format, extract_fps)
-        frame_files = sorted(frames_dir.glob(f"frame_*.{ext}"))
+        fps = extract_frames(
+            input_path,
+            frames_dir,
+            scale_width,
+            intermediate_frames_format,
+            extract_fps,
+        )
+        frame_files = sorted(frames_dir.glob(f"frame_*.{source_ext}"))
         if not frame_files:
             raise RuntimeError("No frames extracted.")
 
-        iterator = frame_files
+        pbar = None
         if use_tqdm and tqdm is not None:
-            iterator = tqdm(frame_files, desc="frames", unit="frame")
-        for frame_path in iterator:
+            pbar = tqdm(
+                total=len(frame_files),
+                initial=resumed_frame_count(len(frame_files)),
+                desc="frames",
+                unit="frame",
+            )
+        for frame_path in frame_files:
             frame_idx = int(frame_path.stem.split("_")[-1]) - 1
             if frame_idx in existing_frames and not produce_output_video:
                 continue
@@ -690,23 +806,36 @@ def run_video_as_frames(
                 print(f"[frames] processing {frame_path.name}")
             image = Image.open(frame_path).convert("RGB")
             state = processor.set_image(image)
-            state = processor.set_text_prompt(prompt=prompt, state=state)
+            state, text_outputs_cache = apply_text_prompt_cached(
+                processor, prompt, state, text_outputs_cache
+            )
             masks = state.get("masks")
             masks_np = (
                 masks.cpu().numpy() if masks is not None else np.zeros((0,), dtype=bool)
             )
-            img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            out_bgr = overlay_masks(img_bgr, masks_np)
+            image_rgb = np.array(image)
             centers = []
             for mask in masks_np:
                 ctr = mask_center(mask, method=centers_method)
                 if ctr is not None:
                     centers.append(ctr)
-            if add_center and centers:
-                for ctr in centers:
-                    cv2.circle(out_bgr, (int(ctr[0]), int(ctr[1])), 8, (0, 0, 255), -1)
-            out_frame = out_frames_dir / frame_path.name
-            cv2.imwrite(str(out_frame), out_bgr)
+            out_frame = out_frames_dir / f"{frame_path.stem}.{output_ext}"
+            if mask_output == "rgba-cutout":
+                out_rgba = render_rgba_cutout(image_rgb, masks_np)
+                pending_writes.append(
+                    write_pool.submit(save_frame_image, out_frame, out_rgba, "RGBA")
+                )
+            else:
+                img_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+                out_bgr = overlay_masks(img_bgr, masks_np)
+                if add_center and centers:
+                    for ctr in centers:
+                        cv2.circle(out_bgr, (int(ctr[0]), int(ctr[1])), 8, (0, 0, 255), -1)
+                out_rgb = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+                pending_writes.append(
+                    write_pool.submit(save_frame_image, out_frame, out_rgb, "RGB")
+                )
+            maybe_drain_futures(pending_writes, limit=pending_write_limit)
             if centers_f is not None:
                 if centers:
                     for i, ctr in enumerate(centers):
@@ -742,37 +871,45 @@ def run_video_as_frames(
                             )
                             + "\n"
                         )
+            if pbar is not None:
+                pbar.update(1)
+        if pbar is not None:
+            pbar.close()
 
-    if produce_output_video:
-        if stream_extract:
-            fps_arg = str(extract_fps) if extract_fps else "30"
+    try:
+        maybe_drain_futures(pending_writes, wait_for_all=True)
+        if produce_output_video:
+            if stream_extract:
+                fps_arg = str(extract_fps) if extract_fps else "30"
+            else:
+                fps_arg = str(extract_fps) if extract_fps else (str(fps) if fps else "30")
+            stitch_cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-framerate",
+                fps_arg,
+                "-i",
+                str(out_frames_dir / f"frame_%06d.{output_ext}"),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(out_path),
+            ]
+            if out_path.exists():
+                print(f"[frames] skipping stitch; output exists: {out_path}")
+            else:
+                print("[frames] stitch cmd:", " ".join(stitch_cmd))
+                subprocess.check_call(stitch_cmd)
         else:
-            fps_arg = str(extract_fps) if extract_fps else (str(fps) if fps else "30")
-        stitch_cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-framerate",
-            fps_arg,
-            "-i",
-            str(out_frames_dir / f"frame_%06d.{ext}"),
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            str(out_path),
-        ]
-        if out_path.exists():
-            print(f"[frames] skipping stitch; output exists: {out_path}")
-        else:
-            print("[frames] stitch cmd:", " ".join(stitch_cmd))
-            subprocess.check_call(stitch_cmd)
-    else:
-        print("[frames] skipping stitch; --produce-output-video not set")
-    if centers_f is not None:
-        centers_f.close()
+            print("[frames] skipping stitch; --produce-output-video not set")
+    finally:
+        write_pool.shutdown(wait=True)
+        if centers_f is not None:
+            centers_f.close()
 
 
 def run_video_chunked(
@@ -1081,9 +1218,32 @@ def main():
     )
     parser.add_argument(
         "--frames-format",
-        choices=["jpg", "png"],
+        choices=["jpg", "png", "webp"],
         default="jpg",
         help="Frame image format when using --extract-frames (default: jpg).",
+    )
+    parser.add_argument(
+        "--intermediate-frames-format",
+        "--source-frames-format",
+        dest="intermediate_frames_format",
+        choices=["jpg", "png"],
+        default="jpg",
+        help=(
+            "Intermediate extracted frame format before segmentation when using "
+            "--extract-frames (default: jpg)."
+        ),
+    )
+    parser.add_argument(
+        "--mask-output",
+        choices=["overlay", "rgba-cutout"],
+        default="overlay",
+        help="How to render output frames when using --extract-frames.",
+    )
+    parser.add_argument(
+        "--encode-workers",
+        type=int,
+        default=2,
+        help="Number of concurrent frame encoding workers when writing output frames.",
     )
     parser.add_argument(
         "--extract-fps",
@@ -1227,13 +1387,16 @@ def main():
                 args.scale_width,
                 frames_dir,
                 args.frames_format,
+                args.intermediate_frames_format,
                 args.extract_fps,
                 args.stream_extract,
                 centers_path,
                 args.produce_output_video,
+                args.mask_output,
                 args.centers_method,
                 args.smooth_alpha,
                 args.add_center,
+                args.encode_workers,
                 base_stem=orig_input_path.stem,
                 use_tqdm=args.tqdm,
             )
