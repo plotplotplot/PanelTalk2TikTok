@@ -7,6 +7,8 @@
 
 #include <QApplication>
 #include <QColor>
+#include <QCheckBox>
+#include <QComboBox>
 #include <QDateTime>
 #include <QDir>
 #include <QDialog>
@@ -16,6 +18,7 @@
 #include <QDropEvent>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFile>
 #include <QFileSystemModel>
 #include <QFormLayout>
 #include <QFrame>
@@ -26,6 +29,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QInputDialog>
+#include <QListWidget>
 #include <QMainWindow>
 #include <QMenu>
 #include <QMessageBox>
@@ -38,9 +43,13 @@
 #include <QRandomGenerator>
 #include <QResizeEvent>
 #include <QSaveFile>
+#include <QShortcut>
+#include <QSignalBlocker>
 #include <QSlider>
+#include <QSpinBox>
 #include <QSplitter>
 #include <QStyle>
+#include <QTabWidget>
 #include <QThread>
 #include <QTimer>
 #include <QToolButton>
@@ -56,9 +65,27 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <cmath>
+#include <chrono>
+#include <mutex>
+#include <deque>
+#include <thread>
+
+extern "C" {
+#include <alsa/asoundlib.h>
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/opt.h>
+#include <libavutil/samplefmt.h>
+#include <libavutil/avutil.h>
+#include <libswresample/swresample.h>
+}
 
 using namespace editor;
 
@@ -77,7 +104,15 @@ qint64 playbackTraceMs() {
     return timer.elapsed();
 }
 
+bool playbackTraceEnabled() {
+    static const bool enabled = qEnvironmentVariableIntValue("EDITOR_DEBUG_PLAYBACK") == 1;
+    return enabled;
+}
+
 void playbackTrace(const QString& stage, const QString& detail = QString()) {
+    if (!playbackTraceEnabled()) {
+        return;
+    }
     static QHash<QString, qint64> lastLogByStage;
     const qint64 now = playbackTraceMs();
     if (stage.startsWith(QStringLiteral("PreviewWindow::requestFramesForCurrentPosition")) ||
@@ -98,13 +133,34 @@ void playbackTrace(const QString& stage, const QString& detail = QString()) {
 
 }
 
+enum class ClipMediaType {
+    Unknown,
+    Image,
+    Video,
+    Audio,
+};
+
 // ============================================================================
 // TimelineClip - Timeline clip data structure
 // ============================================================================
 struct TimelineClip {
+    struct TransformKeyframe {
+        int64_t frame = 0;
+        qreal translationX = 0.0;
+        qreal translationY = 0.0;
+        qreal rotation = 0.0;
+        qreal scaleX = 1.0;
+        qreal scaleY = 1.0;
+        bool interpolated = true;
+    };
+
     QString id;
     QString filePath;
     QString label;
+    ClipMediaType mediaType = ClipMediaType::Unknown;
+    bool hasAudio = false;
+    int64_t sourceDurationFrames = 0;
+    int64_t sourceInFrame = 0;
     int64_t startFrame = 0;
     int64_t durationFrames = 90;
     int trackIndex = 0;
@@ -113,9 +169,221 @@ struct TimelineClip {
     qreal contrast = 1.0;
     qreal saturation = 1.0;
     qreal opacity = 1.0;
+    qreal baseTranslationX = 0.0;
+    qreal baseTranslationY = 0.0;
+    qreal baseRotation = 0.0;
+    qreal baseScaleX = 1.0;
+    qreal baseScaleY = 1.0;
+    QVector<TransformKeyframe> transformKeyframes;
+};
+
+struct TimelineTrack {
+    QString name;
+    int height = 44;
 };
 
 namespace {
+constexpr int kTimelineFps = 30;
+
+bool isImageSuffix(const QString& suffix) {
+    static const QSet<QString> kImageSuffixes = {
+        QStringLiteral("png"),
+        QStringLiteral("jpg"),
+        QStringLiteral("jpeg"),
+        QStringLiteral("webp"),
+    };
+    return kImageSuffixes.contains(suffix);
+}
+
+QString clipMediaTypeToString(ClipMediaType type) {
+    switch (type) {
+    case ClipMediaType::Image:
+        return QStringLiteral("image");
+    case ClipMediaType::Video:
+        return QStringLiteral("video");
+    case ClipMediaType::Audio:
+        return QStringLiteral("audio");
+    case ClipMediaType::Unknown:
+    default:
+        return QStringLiteral("unknown");
+    }
+}
+
+ClipMediaType clipMediaTypeFromString(const QString& value) {
+    if (value == QStringLiteral("image")) return ClipMediaType::Image;
+    if (value == QStringLiteral("video")) return ClipMediaType::Video;
+    if (value == QStringLiteral("audio")) return ClipMediaType::Audio;
+    return ClipMediaType::Unknown;
+}
+
+QString clipMediaTypeLabel(ClipMediaType type) {
+    switch (type) {
+    case ClipMediaType::Image:
+        return QStringLiteral("Image");
+    case ClipMediaType::Video:
+        return QStringLiteral("Video");
+    case ClipMediaType::Audio:
+        return QStringLiteral("Audio");
+    case ClipMediaType::Unknown:
+    default:
+        return QStringLiteral("Unknown");
+    }
+}
+
+bool clipHasVisuals(const TimelineClip& clip) {
+    return clip.mediaType == ClipMediaType::Image || clip.mediaType == ClipMediaType::Video;
+}
+
+bool clipIsAudioOnly(const TimelineClip& clip) {
+    return clip.mediaType == ClipMediaType::Audio;
+}
+
+QString transformInterpolationLabel(bool interpolated) {
+    return interpolated ? QStringLiteral("Interpolated") : QStringLiteral("Sudden");
+}
+
+qreal sanitizeScaleValue(qreal value) {
+    if (std::abs(value) < 0.01) {
+        return value < 0.0 ? -0.01 : 0.01;
+    }
+    return value;
+}
+
+void normalizeClipTransformKeyframes(TimelineClip& clip) {
+    clip.baseScaleX = sanitizeScaleValue(clip.baseScaleX);
+    clip.baseScaleY = sanitizeScaleValue(clip.baseScaleY);
+    std::sort(clip.transformKeyframes.begin(), clip.transformKeyframes.end(),
+              [](const TimelineClip::TransformKeyframe& a, const TimelineClip::TransformKeyframe& b) {
+                  return a.frame < b.frame;
+              });
+
+    QVector<TimelineClip::TransformKeyframe> normalized;
+    normalized.reserve(clip.transformKeyframes.size());
+    const int64_t maxFrame = qMax<int64_t>(0, clip.durationFrames - 1);
+    for (TimelineClip::TransformKeyframe keyframe : clip.transformKeyframes) {
+        keyframe.frame = qBound<int64_t>(0, keyframe.frame, maxFrame);
+        keyframe.scaleX = sanitizeScaleValue(keyframe.scaleX);
+        keyframe.scaleY = sanitizeScaleValue(keyframe.scaleY);
+        if (!normalized.isEmpty() && normalized.constLast().frame == keyframe.frame) {
+            normalized.last() = keyframe;
+        } else {
+            normalized.push_back(keyframe);
+        }
+    }
+    clip.transformKeyframes = normalized;
+}
+
+TimelineClip::TransformKeyframe evaluateClipKeyframeOffsetAtFrame(const TimelineClip& clip, int64_t timelineFrame) {
+    TimelineClip::TransformKeyframe state;
+    if (clip.transformKeyframes.isEmpty()) {
+        return state;
+    }
+
+    const int64_t localFrame = qBound<int64_t>(0, timelineFrame - clip.startFrame, qMax<int64_t>(0, clip.durationFrames - 1));
+    if (localFrame <= clip.transformKeyframes.constFirst().frame) {
+        return clip.transformKeyframes.constFirst();
+    }
+
+    for (int i = 1; i < clip.transformKeyframes.size(); ++i) {
+        const TimelineClip::TransformKeyframe& previous = clip.transformKeyframes[i - 1];
+        const TimelineClip::TransformKeyframe& current = clip.transformKeyframes[i];
+        if (localFrame < current.frame) {
+            if (!current.interpolated || current.frame <= previous.frame) {
+                return previous;
+            }
+            const qreal t = static_cast<qreal>(localFrame - previous.frame) /
+                            static_cast<qreal>(current.frame - previous.frame);
+            state.frame = localFrame;
+            state.translationX = previous.translationX + ((current.translationX - previous.translationX) * t);
+            state.translationY = previous.translationY + ((current.translationY - previous.translationY) * t);
+            state.rotation = previous.rotation + ((current.rotation - previous.rotation) * t);
+            state.scaleX = previous.scaleX + ((current.scaleX - previous.scaleX) * t);
+            state.scaleY = previous.scaleY + ((current.scaleY - previous.scaleY) * t);
+            state.interpolated = current.interpolated;
+            return state;
+        }
+        if (localFrame == current.frame) {
+            return current;
+        }
+    }
+
+    return clip.transformKeyframes.constLast();
+}
+
+TimelineClip::TransformKeyframe evaluateClipTransformAtFrame(const TimelineClip& clip, int64_t timelineFrame) {
+    TimelineClip::TransformKeyframe effective = evaluateClipKeyframeOffsetAtFrame(clip, timelineFrame);
+    effective.translationX += clip.baseTranslationX;
+    effective.translationY += clip.baseTranslationY;
+    effective.rotation += clip.baseRotation;
+    effective.scaleX = sanitizeScaleValue(clip.baseScaleX * effective.scaleX);
+    effective.scaleY = sanitizeScaleValue(clip.baseScaleY * effective.scaleY);
+    return effective;
+}
+
+struct MediaProbeResult {
+    ClipMediaType mediaType = ClipMediaType::Unknown;
+    bool hasAudio = false;
+    bool hasVideo = false;
+    int64_t durationFrames = 120;
+};
+
+MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames = 120) {
+    MediaProbeResult result;
+    result.durationFrames = fallbackFrames;
+
+    const QFileInfo info(filePath);
+    const QString suffix = info.suffix().toLower();
+    if (isImageSuffix(suffix)) {
+        result.mediaType = ClipMediaType::Image;
+        return result;
+    }
+
+    AVFormatContext* formatCtx = nullptr;
+    const QByteArray pathBytes = QFile::encodeName(filePath);
+    if (avformat_open_input(&formatCtx, pathBytes.constData(), nullptr, nullptr) < 0) {
+        return result;
+    }
+
+    if (avformat_find_stream_info(formatCtx, nullptr) >= 0) {
+        double durationSeconds = 0.0;
+        if (formatCtx->duration > 0) {
+            durationSeconds = formatCtx->duration / static_cast<double>(AV_TIME_BASE);
+        }
+
+        for (unsigned i = 0; i < formatCtx->nb_streams; ++i) {
+            const AVStream* stream = formatCtx->streams[i];
+            if (!stream || !stream->codecpar) {
+                continue;
+            }
+            if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                result.hasVideo = true;
+            } else if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                result.hasAudio = true;
+            }
+            if (durationSeconds <= 0.0 && stream->duration != AV_NOPTS_VALUE) {
+                const double streamSeconds = stream->duration * av_q2d(stream->time_base);
+                if (streamSeconds > durationSeconds) {
+                    durationSeconds = streamSeconds;
+                }
+            }
+        }
+
+        if (durationSeconds > 0.0) {
+            result.durationFrames = qMax<int64_t>(1, qRound64(durationSeconds * kTimelineFps));
+        }
+    }
+
+    avformat_close_input(&formatCtx);
+
+    if (result.hasVideo) {
+        result.mediaType = ClipMediaType::Video;
+    } else if (result.hasAudio) {
+        result.mediaType = ClipMediaType::Audio;
+    }
+
+    return result;
+}
+
 int clampChannel(int value) {
     return qBound(0, value, 255);
 }
@@ -134,7 +402,7 @@ QImage applyClipGrade(const QImage& source, const TimelineClip& clip) {
     for (int y = 0; y < graded.height(); ++y) {
         QRgb* row = reinterpret_cast<QRgb*>(graded.scanLine(y));
         for (int x = 0; x < graded.width(); ++x) {
-            QColor color = QColor::fromRgb(row[x]);
+            QColor color = QColor::fromRgba(row[x]);
             float h = 0.0f;
             float s = 0.0f;
             float l = 0.0f;
@@ -156,6 +424,587 @@ QImage applyClipGrade(const QImage& source, const TimelineClip& clip) {
     return graded.convertToFormat(QImage::Format_ARGB32_Premultiplied);
 }
 }
+
+class AudioEngine {
+public:
+    AudioEngine() = default;
+    ~AudioEngine() { shutdown(); }
+
+    void setTimelineClips(const QVector<TimelineClip>& clips) {
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            m_timelineClips = clips;
+            scheduleDecodesLocked(clips);
+        }
+        m_decodeCondition.notify_one();
+    }
+
+    bool initialize() {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        if (m_initialized) {
+            return true;
+        }
+
+        int err = snd_pcm_open(&m_pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
+        if (err < 0) {
+            qWarning() << "Failed to open ALSA playback device:" << snd_strerror(err);
+            return false;
+        }
+
+        err = snd_pcm_set_params(m_pcm,
+                                 SND_PCM_FORMAT_S16_LE,
+                                 SND_PCM_ACCESS_RW_INTERLEAVED,
+                                 m_channelCount,
+                                 m_sampleRate,
+                                 1,
+                                 100000);
+        if (err < 0) {
+            qWarning() << "Failed to configure ALSA playback device:" << snd_strerror(err);
+            snd_pcm_close(m_pcm);
+            m_pcm = nullptr;
+            return false;
+        }
+
+        m_running = true;
+        m_decodeWorker = std::thread([this]() { decodeLoop(); });
+        m_mixWorker = std::thread([this]() { mixLoop(); });
+        m_outputWorker = std::thread([this]() { outputLoop(); });
+        m_initialized = true;
+        return true;
+    }
+
+    void shutdown() {
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            if (!m_initialized) {
+                return;
+            }
+            m_running = false;
+            m_playing = false;
+        }
+        {
+            std::lock_guard<std::mutex> queueLock(m_queueMutex);
+            m_pcmQueue.clear();
+        }
+        m_stateCondition.notify_all();
+        m_decodeCondition.notify_all();
+        m_queueCondition.notify_all();
+        if (m_decodeWorker.joinable()) {
+            m_decodeWorker.join();
+        }
+        if (m_mixWorker.joinable()) {
+            m_mixWorker.join();
+        }
+        if (m_outputWorker.joinable()) {
+            m_outputWorker.join();
+        }
+        if (m_pcm) {
+            snd_pcm_drop(m_pcm);
+            snd_pcm_close(m_pcm);
+            m_pcm = nullptr;
+        }
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_initialized = false;
+    }
+
+    void setMuted(bool muted) {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_muted = muted;
+    }
+
+    void setVolume(qreal volume) {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_volume = qBound<qreal>(0.0, volume, 1.0);
+    }
+
+    bool muted() const {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        return m_muted;
+    }
+
+    int volumePercent() const {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        return qRound(m_volume * 100.0);
+    }
+
+    void start(int64_t startFrame) {
+        if (!initialize()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            m_timelineSampleCursor = timelineFrameToSamples(startFrame);
+            m_audioClockSample.store(m_timelineSampleCursor, std::memory_order_release);
+            m_playing = true;
+            scheduleDecodesLocked(m_timelineClips);
+        }
+        {
+            std::lock_guard<std::mutex> queueLock(m_queueMutex);
+            m_pcmQueue.clear();
+        }
+        m_stateCondition.notify_all();
+        m_decodeCondition.notify_one();
+        m_queueCondition.notify_all();
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            m_playing = false;
+        }
+        {
+            std::lock_guard<std::mutex> queueLock(m_queueMutex);
+            m_pcmQueue.clear();
+        }
+        if (m_pcm) {
+            snd_pcm_drop(m_pcm);
+            snd_pcm_prepare(m_pcm);
+        }
+        m_queueCondition.notify_all();
+    }
+
+    void seek(int64_t frame) {
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            m_timelineSampleCursor = timelineFrameToSamples(frame);
+            m_audioClockSample.store(m_timelineSampleCursor, std::memory_order_release);
+        }
+        {
+            std::lock_guard<std::mutex> queueLock(m_queueMutex);
+            m_pcmQueue.clear();
+        }
+        if (m_pcm) {
+            snd_pcm_drop(m_pcm);
+            snd_pcm_prepare(m_pcm);
+        }
+        m_stateCondition.notify_all();
+        m_queueCondition.notify_all();
+    }
+
+    bool hasPlayableAudio() const {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        for (const TimelineClip& clip : m_timelineClips) {
+            if (clip.hasAudio) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int64_t currentFrame() const {
+        return samplesToTimelineFrame(m_audioClockSample.load(std::memory_order_acquire));
+    }
+
+private:
+    struct AudioClipCacheEntry {
+        QVector<float> samples;
+        int sampleRate = 48000;
+        int channelCount = 2;
+        bool valid = false;
+    };
+
+    struct MixContext {
+        QVector<TimelineClip> clips;
+        bool muted = false;
+        qreal volume = 0.8;
+    };
+
+    int64_t timelineFrameToSamples(int64_t frame) const {
+        return qMax<int64_t>(0, qRound64((static_cast<double>(frame) * m_sampleRate) / kTimelineFps));
+    }
+
+    int64_t samplesToTimelineFrame(int64_t samples) const {
+        return qMax<int64_t>(0, qRound64((static_cast<double>(samples) * kTimelineFps) / m_sampleRate));
+    }
+
+    void scheduleDecodesLocked(const QVector<TimelineClip>& clips) {
+        for (const TimelineClip& clip : clips) {
+            if (!clip.hasAudio || clip.filePath.isEmpty()) {
+                continue;
+            }
+            if (m_audioCache.contains(clip.filePath) || m_pendingDecodeSet.contains(clip.filePath)) {
+                continue;
+            }
+            m_pendingDecodePaths.push_back(clip.filePath);
+            m_pendingDecodeSet.insert(clip.filePath);
+        }
+    }
+
+    AudioClipCacheEntry decodeClipAudio(const QString& path) {
+        AudioClipCacheEntry cache;
+
+        AVFormatContext* formatCtx = nullptr;
+        if (avformat_open_input(&formatCtx, QFile::encodeName(path).constData(), nullptr, nullptr) < 0) {
+            return cache;
+        }
+
+        if (avformat_find_stream_info(formatCtx, nullptr) < 0) {
+            avformat_close_input(&formatCtx);
+            return cache;
+        }
+
+        int audioStreamIndex = -1;
+        for (unsigned i = 0; i < formatCtx->nb_streams; ++i) {
+            if (formatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                audioStreamIndex = static_cast<int>(i);
+                break;
+            }
+        }
+        if (audioStreamIndex < 0) {
+            avformat_close_input(&formatCtx);
+            return cache;
+        }
+
+        AVStream* stream = formatCtx->streams[audioStreamIndex];
+        const AVCodec* decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+        if (!decoder) {
+            avformat_close_input(&formatCtx);
+            return cache;
+        }
+
+        AVCodecContext* codecCtx = avcodec_alloc_context3(decoder);
+        if (!codecCtx) {
+            avformat_close_input(&formatCtx);
+            return cache;
+        }
+
+        if (avcodec_parameters_to_context(codecCtx, stream->codecpar) < 0 ||
+            avcodec_open2(codecCtx, decoder, nullptr) < 0) {
+            avcodec_free_context(&codecCtx);
+            avformat_close_input(&formatCtx);
+            return cache;
+        }
+
+        SwrContext* swr = swr_alloc();
+        AVChannelLayout outLayout;
+        av_channel_layout_default(&outLayout, m_channelCount);
+        av_opt_set_chlayout(swr, "in_chlayout", &codecCtx->ch_layout, 0);
+        av_opt_set_chlayout(swr, "out_chlayout", &outLayout, 0);
+        av_opt_set_int(swr, "in_sample_rate", codecCtx->sample_rate, 0);
+        av_opt_set_int(swr, "out_sample_rate", m_sampleRate, 0);
+        av_opt_set_sample_fmt(swr, "in_sample_fmt", codecCtx->sample_fmt, 0);
+        av_opt_set_sample_fmt(swr, "out_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
+        if (!swr || swr_init(swr) < 0) {
+            av_channel_layout_uninit(&outLayout);
+            swr_free(&swr);
+            avcodec_free_context(&codecCtx);
+            avformat_close_input(&formatCtx);
+            return cache;
+        }
+
+        AVPacket* packet = av_packet_alloc();
+        AVFrame* frame = av_frame_alloc();
+        QByteArray converted;
+
+        auto appendConverted = [&](AVFrame* decoded) {
+            const int outSamples = swr_get_out_samples(swr, decoded->nb_samples);
+            if (outSamples <= 0) {
+                return;
+            }
+            uint8_t* outData = nullptr;
+            int outLineSize = 0;
+            if (av_samples_alloc(&outData, &outLineSize, m_channelCount, outSamples, AV_SAMPLE_FMT_FLT, 0) < 0) {
+                return;
+            }
+            const int convertedSamples = swr_convert(swr, &outData, outSamples,
+                                                     const_cast<const uint8_t**>(decoded->extended_data),
+                                                     decoded->nb_samples);
+            if (convertedSamples > 0) {
+                const int byteCount = convertedSamples * m_channelCount * static_cast<int>(sizeof(float));
+                converted.append(reinterpret_cast<const char*>(outData), byteCount);
+            }
+            av_freep(&outData);
+        };
+
+        while (av_read_frame(formatCtx, packet) >= 0) {
+            if (packet->stream_index != audioStreamIndex) {
+                av_packet_unref(packet);
+                continue;
+            }
+            if (avcodec_send_packet(codecCtx, packet) >= 0) {
+                while (avcodec_receive_frame(codecCtx, frame) >= 0) {
+                    appendConverted(frame);
+                    av_frame_unref(frame);
+                }
+            }
+            av_packet_unref(packet);
+        }
+
+        avcodec_send_packet(codecCtx, nullptr);
+        while (avcodec_receive_frame(codecCtx, frame) >= 0) {
+            appendConverted(frame);
+            av_frame_unref(frame);
+        }
+
+        const int outSamples = swr_get_out_samples(swr, 0);
+        if (outSamples > 0) {
+            uint8_t* outData = nullptr;
+            int outLineSize = 0;
+            if (av_samples_alloc(&outData, &outLineSize, m_channelCount, outSamples, AV_SAMPLE_FMT_FLT, 0) >= 0) {
+                const int flushed = swr_convert(swr, &outData, outSamples, nullptr, 0);
+                if (flushed > 0) {
+                    converted.append(reinterpret_cast<const char*>(outData),
+                                     flushed * m_channelCount * static_cast<int>(sizeof(float)));
+                }
+                av_freep(&outData);
+            }
+        }
+
+        const int sampleCount = converted.size() / static_cast<int>(sizeof(float));
+        cache.samples.resize(sampleCount);
+        std::memcpy(cache.samples.data(), converted.constData(), converted.size());
+        cache.valid = !cache.samples.isEmpty();
+
+        av_frame_free(&frame);
+        av_packet_free(&packet);
+        av_channel_layout_uninit(&outLayout);
+        swr_free(&swr);
+        avcodec_free_context(&codecCtx);
+        avformat_close_input(&formatCtx);
+        return cache;
+    }
+
+    AudioClipCacheEntry clipCacheForPathCopy(const QString& path) const {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        return m_audioCache.value(path);
+    }
+
+    void mixChunk(const MixContext& context, float* output, int frames, int64_t chunkStartSample) {
+        std::fill(output, output + frames * m_channelCount, 0.0f);
+
+        for (const TimelineClip& clip : context.clips) {
+            if (!clip.hasAudio) {
+                continue;
+            }
+            const AudioClipCacheEntry audio = clipCacheForPathCopy(clip.filePath);
+            if (!audio.valid) {
+                continue;
+            }
+
+            const int64_t clipStartSample = timelineFrameToSamples(clip.startFrame);
+            const int64_t sourceInSample = timelineFrameToSamples(clip.sourceInFrame);
+            const int64_t clipAvailableSamples = (audio.samples.size() / m_channelCount) - sourceInSample;
+            if (clipAvailableSamples <= 0) {
+                continue;
+            }
+            const int64_t clipEndSample = clipStartSample + qMin<int64_t>(clip.durationFrames * m_sampleRate / kTimelineFps,
+                                                                           clipAvailableSamples);
+            const int64_t chunkEndSample = chunkStartSample + frames;
+            if (chunkEndSample <= clipStartSample || chunkStartSample >= clipEndSample) {
+                continue;
+            }
+
+            const int64_t mixStart = qMax<int64_t>(chunkStartSample, clipStartSample);
+            const int64_t mixEnd = qMin<int64_t>(chunkEndSample, clipEndSample);
+            for (int64_t samplePos = mixStart; samplePos < mixEnd; ++samplePos) {
+                const int outFrame = static_cast<int>(samplePos - chunkStartSample);
+                const int inFrame = static_cast<int>(sourceInSample + (samplePos - clipStartSample));
+                const int outIndex = outFrame * m_channelCount;
+                const int inIndex = inFrame * m_channelCount;
+                output[outIndex] += audio.samples[inIndex];
+                output[outIndex + 1] += audio.samples[inIndex + 1];
+            }
+        }
+
+        const float gain = context.muted ? 0.0f : static_cast<float>(context.volume);
+        for (int i = 0; i < frames * m_channelCount; ++i) {
+            output[i] = qBound(-1.0f, output[i] * gain, 1.0f);
+        }
+    }
+
+    void decodeLoop() {
+        while (true) {
+            QString nextPath;
+            {
+                std::unique_lock<std::mutex> lock(m_stateMutex);
+                m_decodeCondition.wait(lock, [this]() {
+                    return !m_running || !m_pendingDecodePaths.empty();
+                });
+                if (!m_running) {
+                    break;
+                }
+                nextPath = m_pendingDecodePaths.front();
+                m_pendingDecodePaths.pop_front();
+            }
+
+            AudioClipCacheEntry decoded = decodeClipAudio(nextPath);
+
+            {
+                std::lock_guard<std::mutex> lock(m_stateMutex);
+                m_pendingDecodeSet.remove(nextPath);
+                m_audioCache.insert(nextPath, decoded);
+            }
+            m_stateCondition.notify_all();
+        }
+    }
+
+    void mixLoop() {
+        QVector<float> mixBuffer(m_periodFrames * m_channelCount);
+        QVector<int16_t> pcmBuffer(m_periodFrames * m_channelCount);
+
+        while (true) {
+            MixContext context;
+            int64_t chunkStartSample = 0;
+            {
+                std::unique_lock<std::mutex> lock(m_stateMutex);
+                m_stateCondition.wait(lock, [this]() {
+                    return !m_running || m_playing;
+                });
+                if (!m_running) {
+                    break;
+                }
+                lock.unlock();
+            }
+
+            {
+                std::unique_lock<std::mutex> queueLock(m_queueMutex);
+                m_queueCondition.wait(queueLock, [this]() {
+                    return !m_running || !m_playing || queuedFramesLocked() <= m_mixLowWaterFrames;
+                });
+                if (!m_running) {
+                    break;
+                }
+                if (!m_playing) {
+                    continue;
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(m_stateMutex);
+                if (!m_playing) {
+                    continue;
+                }
+                chunkStartSample = m_timelineSampleCursor;
+                m_timelineSampleCursor += m_periodFrames;
+                context.clips = m_timelineClips;
+                context.muted = m_muted;
+                context.volume = m_volume;
+            }
+
+            mixChunk(context, mixBuffer.data(), m_periodFrames, chunkStartSample);
+
+            for (int i = 0; i < pcmBuffer.size(); ++i) {
+                pcmBuffer[i] = static_cast<int16_t>(mixBuffer[i] * 32767.0f);
+            }
+
+            {
+                std::lock_guard<std::mutex> queueLock(m_queueMutex);
+                for (int16_t sample : pcmBuffer) {
+                    if (m_pcmQueue.size() >= m_maxQueuedSamples) {
+                        break;
+                    }
+                    m_pcmQueue.push_back(sample);
+                }
+            }
+            m_queueCondition.notify_all();
+        }
+    }
+
+    int queuedFramesLocked() const {
+        return static_cast<int>(m_pcmQueue.size() / m_channelCount);
+    }
+
+    void outputLoop() {
+        QVector<int16_t> pcmBuffer(m_periodFrames * m_channelCount);
+        QVector<int16_t> silenceBuffer(m_periodFrames * m_channelCount, 0);
+
+        while (true) {
+            bool playing = false;
+            {
+                std::lock_guard<std::mutex> lock(m_stateMutex);
+                if (!m_running) {
+                    break;
+                }
+                playing = m_playing;
+            }
+
+            if (!playing) {
+                std::unique_lock<std::mutex> lock(m_stateMutex);
+                m_stateCondition.wait(lock, [this]() { return !m_running || m_playing; });
+                if (!m_running) {
+                    break;
+                }
+                continue;
+            }
+
+            bool hadAudio = false;
+            {
+                std::unique_lock<std::mutex> queueLock(m_queueMutex);
+                if (m_pcmQueue.size() < pcmBuffer.size()) {
+                    m_queueCondition.wait_for(queueLock, std::chrono::milliseconds(10), [this, &pcmBuffer]() {
+                        return !m_running || !m_playing || m_pcmQueue.size() >= pcmBuffer.size();
+                    });
+                }
+                if (!m_running) {
+                    break;
+                }
+                if (m_pcmQueue.size() >= pcmBuffer.size()) {
+                    for (int i = 0; i < pcmBuffer.size(); ++i) {
+                        pcmBuffer[i] = m_pcmQueue.front();
+                        m_pcmQueue.pop_front();
+                    }
+                    hadAudio = true;
+                }
+            }
+
+            const int16_t* writePtr = hadAudio ? pcmBuffer.constData() : silenceBuffer.constData();
+            int framesRemaining = m_periodFrames;
+            while (framesRemaining > 0 && m_running) {
+                const snd_pcm_sframes_t written = snd_pcm_writei(m_pcm, writePtr, framesRemaining);
+                if (written == -EPIPE) {
+                    m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+                    snd_pcm_prepare(m_pcm);
+                    continue;
+                }
+                if (written < 0) {
+                    const int recovered = snd_pcm_recover(m_pcm, static_cast<int>(written), 1);
+                    if (recovered < 0) {
+                        m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+                        snd_pcm_prepare(m_pcm);
+                    }
+                    continue;
+                }
+                framesRemaining -= static_cast<int>(written);
+                writePtr += written * m_channelCount;
+            }
+
+            if (!hadAudio) {
+                m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+            }
+            m_audioClockSample.fetch_add(m_periodFrames, std::memory_order_release);
+            m_queueCondition.notify_all();
+        }
+    }
+
+    mutable std::mutex m_stateMutex;
+    mutable std::mutex m_queueMutex;
+    std::condition_variable m_stateCondition;
+    std::condition_variable m_decodeCondition;
+    std::condition_variable m_queueCondition;
+    QVector<TimelineClip> m_timelineClips;
+    QHash<QString, AudioClipCacheEntry> m_audioCache;
+    std::deque<QString> m_pendingDecodePaths;
+    QSet<QString> m_pendingDecodeSet;
+    std::deque<int16_t> m_pcmQueue;
+    std::thread m_decodeWorker;
+    std::thread m_mixWorker;
+    std::thread m_outputWorker;
+    snd_pcm_t* m_pcm = nullptr;
+    bool m_initialized = false;
+    bool m_running = false;
+    bool m_playing = false;
+    bool m_muted = false;
+    qreal m_volume = 0.8;
+    int64_t m_timelineSampleCursor = 0;
+    std::atomic<int64_t> m_audioClockSample{0};
+    std::atomic<int> m_underrunCount{0};
+    static constexpr int m_sampleRate = 48000;
+    static constexpr int m_channelCount = 2;
+    static constexpr int m_periodFrames = 1024;
+    static constexpr int m_mixLowWaterFrames = 2048;
+    static constexpr int m_maxQueuedFrames = 8192;
+    static constexpr size_t m_maxQueuedSamples = static_cast<size_t>(m_maxQueuedFrames * m_channelCount);
+};
 
 // ============================================================================
 // PreviewRenderer - GPU-accelerated preview rendering
@@ -281,6 +1130,7 @@ public:
     {
         setMinimumSize(640, 360);
         setAutoFillBackground(true);
+        setMouseTracking(true);
         m_lastPaintMs = nowMs();
         m_repaintTimer.setSingleShot(true);
         m_repaintTimer.setInterval(16);
@@ -333,6 +1183,14 @@ public:
         m_clipCount = count;
         scheduleRepaint();
     }
+
+    void setSelectedClipId(const QString& clipId) {
+        if (m_selectedClipId == clipId) {
+            return;
+        }
+        m_selectedClipId = clipId;
+        scheduleRepaint();
+    }
     
     void setTimelineClips(const QVector<TimelineClip>& clips) {
         playbackTrace(QStringLiteral("PreviewWindow::setTimelineClips"),
@@ -347,6 +1205,9 @@ public:
         // Update cache with new clips
         QSet<QString> registeredIds;
         for (const auto& clip : clips) {
+            if (!clipHasVisuals(clip)) {
+                continue;
+            }
             registeredIds.insert(clip.id);
             if (!m_registeredClips.contains(clip.id)) {
                 m_cache->registerClip(clip.id, clip.filePath, 
@@ -371,6 +1232,33 @@ public:
         return m_renderer->backendName();
     }
 
+    void setAudioMuted(bool muted) {
+        m_audioMuted = muted;
+    }
+
+    void setAudioVolume(qreal volume) {
+        m_audioVolume = qBound<qreal>(0.0, volume, 1.0);
+    }
+
+    bool audioMuted() const {
+        return m_audioMuted;
+    }
+
+    int audioVolumePercent() const {
+        return qRound(m_audioVolume * 100.0);
+    }
+
+    QString activeAudioClipLabel() const {
+        for (const TimelineClip& clip : m_clips) {
+            if (clip.hasAudio &&
+                m_currentFrame >= clip.startFrame &&
+                m_currentFrame < clip.startFrame + clip.durationFrames) {
+                return clip.label;
+            }
+        }
+        return QString();
+    }
+
     bool preparePlaybackAdvance(int64_t targetFrame) {
         if (m_clips.isEmpty()) {
             return true;
@@ -385,12 +1273,15 @@ public:
         bool hasActiveClip = false;
 
         for (const TimelineClip& clip : m_clips) {
+            if (!clipHasVisuals(clip)) {
+                continue;
+            }
             if (targetFrame < clip.startFrame || targetFrame >= clip.startFrame + clip.durationFrames) {
                 continue;
             }
 
             hasActiveClip = true;
-            const int64_t localFrame = targetFrame - clip.startFrame;
+            const int64_t localFrame = clip.sourceInFrame + (targetFrame - clip.startFrame);
             if (m_cache->isFrameCached(clip.id, localFrame)) {
                 continue;
             }
@@ -493,7 +1384,135 @@ protected:
         drawPreviewChrome(&painter, safeRect, activeClips.size());
     }
 
+    void mousePressEvent(QMouseEvent* event) override {
+        if (event->button() != Qt::LeftButton) {
+            QWidget::mousePressEvent(event);
+            return;
+        }
+
+        const PreviewOverlayInfo selectedInfo = m_overlayInfo.value(m_selectedClipId);
+        if (!m_selectedClipId.isEmpty()) {
+            if (selectedInfo.cornerHandle.contains(event->position())) {
+                m_dragMode = PreviewDragMode::ResizeBoth;
+            } else if (selectedInfo.rightHandle.contains(event->position())) {
+                m_dragMode = PreviewDragMode::ResizeX;
+            } else if (selectedInfo.bottomHandle.contains(event->position())) {
+                m_dragMode = PreviewDragMode::ResizeY;
+            }
+            if (m_dragMode != PreviewDragMode::None) {
+                m_dragOriginPos = event->position();
+                m_dragOriginTransform = evaluateTransformForSelectedClip();
+                m_dragOriginBounds = selectedInfo.bounds;
+                event->accept();
+                return;
+            }
+        }
+
+        const QString hitClipId = clipIdAtPosition(event->position());
+        if (!hitClipId.isEmpty()) {
+            m_selectedClipId = hitClipId;
+            if (selectionRequested) {
+                selectionRequested(hitClipId);
+            }
+            updatePreviewCursor(event->position());
+            update();
+            event->accept();
+            return;
+        }
+
+        QWidget::mousePressEvent(event);
+    }
+
+    void mouseMoveEvent(QMouseEvent* event) override {
+        if (m_dragMode != PreviewDragMode::None && (event->buttons() & Qt::LeftButton) &&
+            !m_selectedClipId.isEmpty() && m_dragOriginBounds.width() > 1.0 && m_dragOriginBounds.height() > 1.0) {
+            qreal scaleX = m_dragOriginTransform.scaleX;
+            qreal scaleY = m_dragOriginTransform.scaleY;
+            if (m_dragMode == PreviewDragMode::ResizeX || m_dragMode == PreviewDragMode::ResizeBoth) {
+                scaleX = sanitizeScaleValue(
+                    m_dragOriginTransform.scaleX *
+                    ((m_dragOriginBounds.width() + (event->position().x() - m_dragOriginPos.x())) /
+                     m_dragOriginBounds.width()));
+            }
+            if (m_dragMode == PreviewDragMode::ResizeY || m_dragMode == PreviewDragMode::ResizeBoth) {
+                scaleY = sanitizeScaleValue(
+                    m_dragOriginTransform.scaleY *
+                    ((m_dragOriginBounds.height() + (event->position().y() - m_dragOriginPos.y())) /
+                     m_dragOriginBounds.height()));
+            }
+            if (m_dragMode == PreviewDragMode::ResizeBoth) {
+                const qreal factorX =
+                    (m_dragOriginBounds.width() + (event->position().x() - m_dragOriginPos.x())) /
+                    m_dragOriginBounds.width();
+                const qreal factorY =
+                    (m_dragOriginBounds.height() + (event->position().y() - m_dragOriginPos.y())) /
+                    m_dragOriginBounds.height();
+                const qreal uniformFactor = std::abs(factorX) >= std::abs(factorY) ? factorX : factorY;
+                scaleX = sanitizeScaleValue(m_dragOriginTransform.scaleX * uniformFactor);
+                scaleY = sanitizeScaleValue(m_dragOriginTransform.scaleY * uniformFactor);
+            }
+            if (resizeRequested) {
+                resizeRequested(m_selectedClipId, scaleX, scaleY, false);
+            }
+            event->accept();
+            return;
+        }
+
+        updatePreviewCursor(event->position());
+        QWidget::mouseMoveEvent(event);
+    }
+
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        if (event->button() == Qt::LeftButton && m_dragMode != PreviewDragMode::None) {
+            if (resizeRequested) {
+                const TimelineClip::TransformKeyframe transform = evaluateTransformForSelectedClip();
+                resizeRequested(m_selectedClipId, transform.scaleX, transform.scaleY, true);
+            }
+            m_dragMode = PreviewDragMode::None;
+            m_dragOriginBounds = QRectF();
+            updatePreviewCursor(event->position());
+            event->accept();
+            return;
+        }
+        QWidget::mouseReleaseEvent(event);
+    }
+
+    void wheelEvent(QWheelEvent* event) override {
+        if (event->angleDelta().y() == 0) {
+            QWidget::wheelEvent(event);
+            return;
+        }
+        const qreal factor = event->angleDelta().y() > 0 ? 1.1 : (1.0 / 1.1);
+        m_previewZoom = qBound<qreal>(0.25, m_previewZoom * factor, 4.0);
+        scheduleRepaint();
+        event->accept();
+    }
+
 private:
+    struct PreviewOverlayInfo {
+        QRectF bounds;
+        QRectF rightHandle;
+        QRectF bottomHandle;
+        QRectF cornerHandle;
+    };
+
+    enum class PreviewDragMode {
+        None,
+        ResizeX,
+        ResizeY,
+        ResizeBoth,
+    };
+
+    QRect scaledCanvasRect(const QRect& baseRect) const {
+        const QSize scaledSize(qMax(1, qRound(baseRect.width() * m_previewZoom)),
+                               qMax(1, qRound(baseRect.height() * m_previewZoom)));
+        const QPoint center = baseRect.center();
+        return QRect(center.x() - scaledSize.width() / 2,
+                     center.y() - scaledSize.height() / 2,
+                     scaledSize.width(),
+                     scaledSize.height());
+    }
+
     void ensurePipeline() {
         if (m_cache) {
             return;
@@ -515,7 +1534,10 @@ private:
         m_cache->setPlayheadFrame(m_currentFrame);
         m_registeredClips.clear();
         for (const TimelineClip& clip : m_clips) {
-            m_cache->registerClip(clip.id, clip.filePath, clip.startFrame, clip.durationFrames);
+            if (!clipHasVisuals(clip)) {
+                continue;
+            }
+                m_cache->registerClip(clip.id, clip.filePath, clip.startFrame, clip.durationFrames);
             m_registeredClips.insert(clip.id);
         }
         m_cache->startPrefetching();
@@ -553,7 +1575,7 @@ private:
                 if (a.trackIndex == b.trackIndex) {
                     return a.startFrame < b.startFrame;
                 }
-                return a.trackIndex > b.trackIndex;
+                return a.trackIndex < b.trackIndex;
             });
         return active;
     }
@@ -563,6 +1585,9 @@ private:
         QVector<const TimelineClip*> activeClips;
         activeClips.reserve(m_clips.size());
         for (const TimelineClip& clip : m_clips) {
+            if (!clipHasVisuals(clip)) {
+                continue;
+            }
             if (m_currentFrame >= clip.startFrame &&
                 m_currentFrame < clip.startFrame + clip.durationFrames) {
                 activeClips.push_back(&clip);
@@ -596,7 +1621,7 @@ private:
         }
 
         for (const TimelineClip* clip : activeClips) {
-            const int64_t localFrame = m_currentFrame - clip->startFrame;
+            const int64_t localFrame = clip->sourceInFrame + (m_currentFrame - clip->startFrame);
             const bool cached = m_cache->isFrameCached(clip->id, localFrame);
             playbackTrace(QStringLiteral("PreviewWindow::visible-request"),
                           QStringLiteral("clip=%1 localFrame=%2 cached=%3")
@@ -638,6 +1663,8 @@ private:
     void drawCompositedPreview(QPainter* painter, const QRect& safeRect, 
                                const QList<TimelineClip>& activeClips) {
         painter->save();
+        m_overlayInfo.clear();
+        m_paintOrder.clear();
         
         // Draw background panel
         painter->setPen(QPen(QColor(255, 255, 255, 40), 1.5));
@@ -645,17 +1672,30 @@ private:
         painter->drawRoundedRect(safeRect, 18, 18);
         
         if (activeClips.isEmpty()) {
-            drawEmptyState(painter, safeRect);
+            QList<TimelineClip> activeAudioClips;
+            for (const TimelineClip& clip : m_clips) {
+                if (clipIsAudioOnly(clip) &&
+                    m_currentFrame >= clip.startFrame &&
+                    m_currentFrame < clip.startFrame + clip.durationFrames) {
+                    activeAudioClips.push_back(clip);
+                }
+            }
+            if (!activeAudioClips.isEmpty()) {
+                drawAudioPlaceholder(painter, safeRect, activeAudioClips);
+            } else {
+                drawEmptyState(painter, safeRect);
+            }
             painter->restore();
             return;
         }
 
-        const QRect compositeRect = safeRect.adjusted(12, 12, -12, -12);
+        const QRect compositeRect = scaledCanvasRect(safeRect.adjusted(12, 12, -12, -12));
+        painter->fillRect(compositeRect, Qt::black);
         bool drewAnyFrame = false;
         bool waitingForFrame = false;
 
         for (const TimelineClip& clip : activeClips) {
-            const int64_t localFrame = m_currentFrame - clip.startFrame;
+            const int64_t localFrame = clip.sourceInFrame + (m_currentFrame - clip.startFrame);
             const FrameHandle frame = m_cache ? m_cache->getBestCachedFrame(clip.id, localFrame) : FrameHandle();
             if (frame.isNull()) {
                 waitingForFrame = true;
@@ -682,6 +1722,18 @@ private:
                               Qt::AlignLeft | Qt::AlignVCenter,
                               QStringLiteral("Overlay loading..."));
             painter->restore();
+        }
+
+        QList<TimelineClip> activeAudioClips;
+        for (const TimelineClip& clip : m_clips) {
+            if (clipIsAudioOnly(clip) &&
+                m_currentFrame >= clip.startFrame &&
+                m_currentFrame < clip.startFrame + clip.durationFrames) {
+                activeAudioClips.push_back(clip);
+            }
+        }
+        if (!activeAudioClips.isEmpty()) {
+            drawAudioBadge(painter, compositeRect, activeAudioClips);
         }
         
         painter->restore();
@@ -717,7 +1769,52 @@ private:
         if (!frame.isNull() && frame.hasCpuImage()) {
             const QImage img = applyClipGrade(frame.cpuImage(), clip);
             const QRect fitted = fitRect(img.size(), targetRect);
-            painter->drawImage(fitted, img);
+            const TimelineClip::TransformKeyframe transform = evaluateClipTransformAtFrame(clip, m_currentFrame);
+            painter->translate(fitted.center().x() + transform.translationX,
+                               fitted.center().y() + transform.translationY);
+            painter->rotate(transform.rotation);
+            painter->scale(transform.scaleX, transform.scaleY);
+            const QRectF drawRect(-fitted.width() / 2.0,
+                                  -fitted.height() / 2.0,
+                                  fitted.width(),
+                                  fitted.height());
+            painter->drawImage(drawRect, img);
+
+            QTransform overlayTransform;
+            overlayTransform.translate(fitted.center().x() + transform.translationX,
+                                       fitted.center().y() + transform.translationY);
+            overlayTransform.rotate(transform.rotation);
+            overlayTransform.scale(transform.scaleX, transform.scaleY);
+            const QRectF bounds = overlayTransform.mapRect(drawRect);
+            PreviewOverlayInfo info;
+            info.bounds = bounds;
+            constexpr qreal kHandleSize = 12.0;
+            info.rightHandle = QRectF(bounds.right() - kHandleSize,
+                                      bounds.center().y() - kHandleSize,
+                                      kHandleSize,
+                                      kHandleSize * 2.0);
+            info.bottomHandle = QRectF(bounds.center().x() - kHandleSize,
+                                       bounds.bottom() - kHandleSize,
+                                       kHandleSize * 2.0,
+                                       kHandleSize);
+            info.cornerHandle = QRectF(bounds.right() - kHandleSize * 1.5,
+                                       bounds.bottom() - kHandleSize * 1.5,
+                                       kHandleSize * 1.5,
+                                       kHandleSize * 1.5);
+            m_overlayInfo.insert(clip.id, info);
+            m_paintOrder.push_back(clip.id);
+
+            painter->resetTransform();
+            painter->setClipping(false);
+            if (clip.id == m_selectedClipId) {
+                painter->setPen(QPen(QColor(QStringLiteral("#fff4c2")), 2.0));
+                painter->setBrush(Qt::NoBrush);
+                painter->drawRect(bounds);
+                painter->setBrush(QColor(QStringLiteral("#fff4c2")));
+                painter->drawRect(info.rightHandle);
+                painter->drawRect(info.bottomHandle);
+                painter->drawRect(info.cornerHandle);
+            }
         }
 
         painter->setPen(QPen(QColor(255, 255, 255, 36), 1.0));
@@ -756,6 +1853,66 @@ private:
                               .arg(message));
         painter->restore();
     }
+
+    void drawAudioPlaceholder(QPainter* painter, const QRect& safeRect,
+                              const QList<TimelineClip>& activeAudioClips) {
+        painter->save();
+        painter->setPen(QPen(QColor(255, 255, 255, 40), 1.5));
+        painter->setBrush(QColor(255, 255, 255, 18));
+        painter->drawRoundedRect(safeRect, 18, 18);
+
+        const QRect panel = safeRect.adjusted(12, 12, -12, -12);
+        QLinearGradient gradient(panel.topLeft(), panel.bottomRight());
+        gradient.setColorAt(0.0, QColor(QStringLiteral("#13222d")));
+        gradient.setColorAt(1.0, QColor(QStringLiteral("#0a1218")));
+        painter->fillRect(panel, gradient);
+
+        QFont titleFont = painter->font();
+        titleFont.setBold(true);
+        titleFont.setPointSize(titleFont.pointSize() + 5);
+        painter->setFont(titleFont);
+        painter->setPen(QColor(QStringLiteral("#eef5fb")));
+        painter->drawText(panel.adjusted(20, 22, -20, -20),
+                          Qt::AlignTop | Qt::AlignLeft,
+                          QStringLiteral("Audio Monitor"));
+
+        QFont bodyFont = painter->font();
+        bodyFont.setBold(false);
+        bodyFont.setPointSize(qMax(10, bodyFont.pointSize() - 2));
+        painter->setFont(bodyFont);
+        painter->setPen(QColor(QStringLiteral("#c8d5e0")));
+        painter->drawText(panel.adjusted(20, 60, -20, -20),
+                          Qt::AlignTop | Qt::AlignLeft,
+                          QStringLiteral("Active audio clip: %1\nTransport audio: %2")
+                              .arg(activeAudioClips.constFirst().label)
+                              .arg(m_playing ? QStringLiteral("live") : QStringLiteral("paused")));
+
+        const QRect waveRect = panel.adjusted(24, 120, -24, -36);
+        painter->setPen(Qt::NoPen);
+        for (int x = waveRect.left(); x < waveRect.right(); x += 10) {
+            const int idx = (x - waveRect.left()) / 10;
+            const qreal phase = static_cast<qreal>((idx * 13 + m_currentFrame) % 100) / 99.0;
+            const int barHeight = qMax(12, qRound((0.2 + std::sin(phase * 6.28318) * 0.4 + 0.4) * waveRect.height()));
+            const QRect barRect(x, waveRect.center().y() - barHeight / 2, 6, barHeight);
+            painter->setBrush(QColor(QStringLiteral("#58c4dd")));
+            painter->drawRoundedRect(barRect, 3, 3);
+        }
+        painter->restore();
+    }
+
+    void drawAudioBadge(QPainter* painter, const QRect& targetRect,
+                        const QList<TimelineClip>& activeAudioClips) {
+        painter->save();
+        const QRect badgeRect(targetRect.left() + 16, targetRect.bottom() - 46, 240, 30);
+        painter->setPen(Qt::NoPen);
+        painter->setBrush(QColor(7, 11, 17, 176));
+        painter->drawRoundedRect(badgeRect, 10, 10);
+        painter->setPen(QColor(QStringLiteral("#dff8ff")));
+        painter->drawText(badgeRect.adjusted(12, 0, -12, 0),
+                          Qt::AlignLeft | Qt::AlignVCenter,
+                          QStringLiteral("Audio  %1").arg(activeAudioClips.constFirst().label));
+        painter->restore();
+    }
     
     QRect fitRect(const QSize& source, const QRect& bounds) const {
         if (source.isEmpty() || bounds.isEmpty()) {
@@ -792,12 +1949,56 @@ private:
                               .arg(m_renderer->backendName()));
         painter->restore();
     }
-    
+
+    QString clipIdAtPosition(const QPointF& position) const {
+        for (int i = m_paintOrder.size() - 1; i >= 0; --i) {
+            const QString& clipId = m_paintOrder[i];
+            if (m_overlayInfo.value(clipId).bounds.contains(position)) {
+                return clipId;
+            }
+        }
+        return QString();
+    }
+
+    TimelineClip::TransformKeyframe evaluateTransformForSelectedClip() const {
+        for (const TimelineClip& clip : m_clips) {
+            if (clip.id == m_selectedClipId) {
+                return evaluateClipTransformAtFrame(clip, m_currentFrame);
+            }
+        }
+        return TimelineClip::TransformKeyframe();
+    }
+
+    void updatePreviewCursor(const QPointF& position) {
+        const PreviewOverlayInfo info = m_overlayInfo.value(m_selectedClipId);
+        if (!m_selectedClipId.isEmpty()) {
+            if (info.cornerHandle.contains(position)) {
+                setCursor(Qt::SizeFDiagCursor);
+                return;
+            }
+            if (info.rightHandle.contains(position)) {
+                setCursor(Qt::SizeHorCursor);
+                return;
+            }
+            if (info.bottomHandle.contains(position)) {
+                setCursor(Qt::SizeVerCursor);
+                return;
+            }
+            if (info.bounds.contains(position)) {
+                setCursor(Qt::ArrowCursor);
+                return;
+            }
+        }
+        unsetCursor();
+    }
+
     std::unique_ptr<PreviewRenderer> m_renderer;
     std::unique_ptr<AsyncDecoder> m_decoder;
     std::unique_ptr<TimelineCache> m_cache;
     
     bool m_playing = false;
+    bool m_audioMuted = false;
+    qreal m_audioVolume = 0.8;
     int64_t m_currentFrame = 0;
     int m_clipCount = 0;
     QVector<TimelineClip> m_clips;
@@ -807,6 +2008,18 @@ private:
     qint64 m_lastFrameReadyMs = 0;
     qint64 m_lastPaintMs = 0;
     qint64 m_lastRepaintScheduleMs = 0;
+    QString m_selectedClipId;
+    qreal m_previewZoom = 1.0;
+    QHash<QString, PreviewOverlayInfo> m_overlayInfo;
+    QVector<QString> m_paintOrder;
+    PreviewDragMode m_dragMode = PreviewDragMode::None;
+    QPointF m_dragOriginPos;
+    QRectF m_dragOriginBounds;
+    TimelineClip::TransformKeyframe m_dragOriginTransform;
+
+public:
+    std::function<void(const QString&)> selectionRequested;
+    std::function<void(const QString&, qreal, qreal, bool)> resizeRequested;
 };
 
 // ============================================================================
@@ -824,6 +2037,8 @@ public:
         QPalette pal = palette();
         pal.setColor(QPalette::Window, QColor(QStringLiteral("#0f1216")));
         setPalette(pal);
+        ensureTrackCount(1);
+        updateMinimumTimelineHeight();
     }
     
     void setCurrentFrame(int64_t frame) {
@@ -844,22 +2059,170 @@ public:
     void addClipFromFile(const QString& filePath, int64_t startFrame = -1);
     
     const QVector<TimelineClip>& clips() const { return m_clips; }
-    
+    const QVector<TimelineTrack>& tracks() const { return m_tracks; }
+
     void setClips(const QVector<TimelineClip>& clips) {
         m_clips = clips;
         normalizeTrackIndices();
         sortClips();
+        ensureTrackCount(trackCount());
+        if (!selectedClip()) {
+            m_selectedClipId.clear();
+        }
+        updateMinimumTimelineHeight();
         update();
+    }
+
+    void setTracks(const QVector<TimelineTrack>& tracks) {
+        m_tracks = tracks;
+        for (int i = 0; i < m_tracks.size(); ++i) {
+            if (m_tracks[i].name.trimmed().isEmpty()) {
+                m_tracks[i].name = defaultTrackName(i);
+            }
+            m_tracks[i].height = qMax(kMinTrackHeight, m_tracks[i].height);
+        }
+        ensureTrackCount(trackCount());
+        updateMinimumTimelineHeight();
+        update();
+    }
+
+    QString selectedClipId() const { return m_selectedClipId; }
+
+    const TimelineClip* selectedClip() const {
+        for (const TimelineClip& clip : m_clips) {
+            if (clip.id == m_selectedClipId) {
+                return &clip;
+            }
+        }
+        return nullptr;
+    }
+
+    void setSelectedClipId(const QString& clipId) {
+        if (m_selectedClipId == clipId) {
+            return;
+        }
+        m_selectedClipId = clipId;
+        if (selectionChanged) {
+            selectionChanged();
+        }
+        update();
+    }
+
+    bool updateClipById(const QString& clipId, const std::function<void(TimelineClip&)>& updater) {
+        for (TimelineClip& clip : m_clips) {
+            if (clip.id == clipId) {
+                updater(clip);
+                update();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool deleteSelectedClip() {
+        if (m_selectedClipId.isEmpty()) {
+            return false;
+        }
+
+        for (int i = 0; i < m_clips.size(); ++i) {
+            if (m_clips[i].id != m_selectedClipId) {
+                continue;
+            }
+
+            m_clips.removeAt(i);
+            m_selectedClipId.clear();
+            normalizeTrackIndices();
+            sortClips();
+            if (selectionChanged) {
+                selectionChanged();
+            }
+            if (clipsChanged) {
+                clipsChanged();
+            }
+            update();
+            return true;
+        }
+
+        m_selectedClipId.clear();
+        if (selectionChanged) {
+            selectionChanged();
+        }
+        update();
+        return false;
+    }
+
+    bool splitSelectedClipAtFrame(int64_t frame) {
+        if (m_selectedClipId.isEmpty()) {
+            return false;
+        }
+
+        for (int i = 0; i < m_clips.size(); ++i) {
+            TimelineClip& clip = m_clips[i];
+            if (clip.id != m_selectedClipId) {
+                continue;
+            }
+            if (frame <= clip.startFrame || frame >= clip.startFrame + clip.durationFrames) {
+                return false;
+            }
+
+            const int64_t leftDuration = frame - clip.startFrame;
+            const int64_t rightDuration = clip.durationFrames - leftDuration;
+            if (leftDuration <= 0 || rightDuration <= 0) {
+                return false;
+            }
+
+            TimelineClip rightClip = clip;
+            rightClip.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            rightClip.startFrame = frame;
+            rightClip.sourceInFrame = clip.sourceInFrame + leftDuration;
+            rightClip.durationFrames = rightDuration;
+            rightClip.transformKeyframes.clear();
+            for (const TimelineClip::TransformKeyframe& keyframe : clip.transformKeyframes) {
+                if (keyframe.frame >= leftDuration) {
+                    TimelineClip::TransformKeyframe shifted = keyframe;
+                    shifted.frame -= leftDuration;
+                    rightClip.transformKeyframes.push_back(shifted);
+                }
+            }
+
+            QVector<TimelineClip::TransformKeyframe> leftKeyframes;
+            for (const TimelineClip::TransformKeyframe& keyframe : clip.transformKeyframes) {
+                if (keyframe.frame < leftDuration) {
+                    leftKeyframes.push_back(keyframe);
+                }
+            }
+            clip.transformKeyframes = leftKeyframes;
+
+            clip.durationFrames = leftDuration;
+            normalizeClipTransformKeyframes(clip);
+            normalizeClipTransformKeyframes(rightClip);
+            m_clips.insert(i + 1, rightClip);
+            m_selectedClipId = rightClip.id;
+            sortClips();
+            if (selectionChanged) {
+                selectionChanged();
+            }
+            if (clipsChanged) {
+                clipsChanged();
+            }
+            update();
+            return true;
+        }
+
+        return false;
     }
     
     std::function<void(int64_t)> seekRequested;
     std::function<void()> clipsChanged;
+    std::function<void()> selectionChanged;
+    std::function<void()> gradingRequested;
 
 protected:
     void dragEnterEvent(QDragEnterEvent* event) override;
     void dragMoveEvent(QDragMoveEvent* event) override;
     void dragLeaveEvent(QDragLeaveEvent* event) override;
     void dropEvent(QDropEvent* event) override;
+    void mouseDoubleClickEvent(QMouseEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
@@ -868,11 +2231,24 @@ protected:
     void paintEvent(QPaintEvent*) override;
 
 private:
-    static constexpr int kTimelineFps = 30;
-    
+    enum class ClipDragMode {
+        None,
+        Move,
+        TrimLeft,
+        TrimRight,
+    };
+
+    static constexpr int kDefaultTrackHeight = 44;
+    static constexpr int kMinTrackHeight = 28;
+    static constexpr int kTrackResizeHandleHalfHeight = 4;
+
     void sortClips();
     int clipIndexAt(const QPoint& pos) const;
+    ClipDragMode clipDragModeAt(const TimelineClip& clip, const QPoint& pos) const;
+    void updateHoverCursor(const QPoint& pos);
     int trackIndexAt(const QPoint& pos) const;
+    int trackIndexAtY(int y, bool allowAppendTrack = false) const;
+    int trackDividerAt(const QPoint& pos) const;
     int64_t frameFromX(qreal x) const;
     int xFromFrame(int64_t frame) const;
     int widthForFrames(int64_t frames) const;
@@ -881,10 +2257,16 @@ private:
     bool hasFileUrls(const QMimeData* mimeData) const;
     int64_t guessDurationFrames(const QString& suffix) const;
     QColor colorForPath(const QString& path) const;
+    TimelineClip buildClipFromFile(const QString& filePath, int64_t startFrame, int trackIndex) const;
     
     int trackCount() const;
     int nextTrackIndex() const;
     void normalizeTrackIndices();
+    void ensureTrackCount(int count);
+    QString defaultTrackName(int trackIndex) const;
+    int trackTop(int trackIndex) const;
+    int trackHeight(int trackIndex) const;
+    void updateMinimumTimelineHeight();
     QRect drawRect() const;
     QRect rulerRect() const;
     QRect trackRect() const;
@@ -893,24 +2275,35 @@ private:
     QRect clipRectFor(const TimelineClip& clip) const;
     
     QVector<TimelineClip> m_clips;
+    QVector<TimelineTrack> m_tracks;
     int64_t m_currentFrame = 0;
     int64_t m_dropFrame = -1;
     int m_draggedClipIndex = -1;
+    ClipDragMode m_dragMode = ClipDragMode::None;
+    int64_t m_dragOriginalStartFrame = 0;
+    int64_t m_dragOriginalDurationFrames = 0;
+    int64_t m_dragOriginalSourceInFrame = 0;
+    QVector<TimelineClip::TransformKeyframe> m_dragOriginalTransformKeyframes;
     int64_t m_dragOffsetFrames = 0;
     int m_draggedTrackIndex = -1;
     int m_trackDropIndex = -1;
+    int m_resizingTrackIndex = -1;
+    int m_resizeOriginY = 0;
+    int m_resizeOriginHeight = 0;
     qreal m_pixelsPerFrame = 4.0;
     int64_t m_frameOffset = 0;
+    QString m_selectedClipId;
 };
 
 namespace {
 constexpr int kTimelineOuterMargin = 16;
 constexpr int kTimelineRulerHeight = 28;
 constexpr int kTimelineTrackGap = 12;
-constexpr int kTimelineTrackRowHeight = 44;
 constexpr int kTimelineClipHeight = 32;
 constexpr int kTimelineLabelWidth = 52;
 constexpr int kTimelineLabelGap = 12;
+constexpr int kTimelineTrackInnerPadding = 12;
+constexpr int kTimelineClipVerticalPadding = 6;
 }
 
 void TimelineWidget::sortClips() {
@@ -931,7 +2324,7 @@ int TimelineWidget::trackCount() const {
     for (const TimelineClip& clip : m_clips) {
         maxTrack = qMax(maxTrack, clip.trackIndex);
     }
-    return qMax(1, maxTrack + 1);
+    return qMax(1, qMax(m_tracks.size(), maxTrack + 1));
 }
 
 int TimelineWidget::nextTrackIndex() const {
@@ -939,22 +2332,100 @@ int TimelineWidget::nextTrackIndex() const {
 }
 
 void TimelineWidget::normalizeTrackIndices() {
-    QSet<int> tracks;
+    int maxTrackIndex = -1;
     for (const TimelineClip& clip : m_clips) {
-        tracks.insert(clip.trackIndex);
-    }
-
-    QList<int> sortedTracks = tracks.values();
-    std::sort(sortedTracks.begin(), sortedTracks.end());
-
-    QHash<int, int> remap;
-    for (int i = 0; i < sortedTracks.size(); ++i) {
-        remap.insert(sortedTracks[i], i);
+        maxTrackIndex = qMax(maxTrackIndex, clip.trackIndex);
     }
 
     for (TimelineClip& clip : m_clips) {
-        clip.trackIndex = remap.value(clip.trackIndex, 0);
+        clip.trackIndex = qMax(0, clip.trackIndex);
     }
+
+    ensureTrackCount(qMax(1, qMax(m_tracks.size(), maxTrackIndex + 1)));
+    updateMinimumTimelineHeight();
+}
+
+void TimelineWidget::ensureTrackCount(int count) {
+    const int desired = qMax(1, count);
+    while (m_tracks.size() < desired) {
+        TimelineTrack track;
+        track.name = defaultTrackName(m_tracks.size());
+        track.height = kDefaultTrackHeight;
+        m_tracks.push_back(track);
+    }
+    for (int i = 0; i < m_tracks.size(); ++i) {
+        if (m_tracks[i].name.trimmed().isEmpty()) {
+            m_tracks[i].name = defaultTrackName(i);
+        }
+        m_tracks[i].height = qMax(kMinTrackHeight, m_tracks[i].height);
+    }
+}
+
+QString TimelineWidget::defaultTrackName(int trackIndex) const {
+    return QStringLiteral("Track %1").arg(trackIndex + 1);
+}
+
+int TimelineWidget::trackTop(int trackIndex) const {
+    const QRect tracks = trackRect();
+    int y = tracks.top() + kTimelineTrackInnerPadding;
+    for (int i = 0; i < trackIndex && i < m_tracks.size(); ++i) {
+        y += trackHeight(i);
+    }
+    return y;
+}
+
+int TimelineWidget::trackHeight(int trackIndex) const {
+    if (trackIndex >= 0 && trackIndex < m_tracks.size()) {
+        return qMax(kMinTrackHeight, m_tracks[trackIndex].height);
+    }
+    return kDefaultTrackHeight;
+}
+
+int TimelineWidget::trackIndexAtY(int y, bool allowAppendTrack) const {
+    if (m_tracks.isEmpty()) {
+        return 0;
+    }
+
+    for (int i = 0; i < trackCount(); ++i) {
+        const int top = trackTop(i);
+        const int bottom = top + trackHeight(i);
+        if (y >= top && y < bottom) {
+            return i;
+        }
+    }
+
+    const int lastTrackBottom = trackTop(trackCount() - 1) + trackHeight(trackCount() - 1);
+    if (allowAppendTrack && y >= lastTrackBottom) {
+        return trackCount();
+    }
+    if (y < trackTop(0)) {
+        return 0;
+    }
+    return trackCount() - 1;
+}
+
+int TimelineWidget::trackDividerAt(const QPoint& pos) const {
+    const QRect tracks = trackRect();
+    if (!tracks.contains(pos)) {
+        return -1;
+    }
+
+    for (int i = 0; i < trackCount(); ++i) {
+        const int dividerY = trackTop(i) + trackHeight(i);
+        if (std::abs(pos.y() - dividerY) <= kTrackResizeHandleHalfHeight) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void TimelineWidget::updateMinimumTimelineHeight() {
+    int trackAreaHeight = kTimelineTrackInnerPadding * 2;
+    for (int i = 0; i < trackCount(); ++i) {
+        trackAreaHeight += trackHeight(i);
+    }
+    const int minimum = (kTimelineOuterMargin * 2) + kTimelineRulerHeight + kTimelineTrackGap + trackAreaHeight;
+    setMinimumHeight(qMax(150, minimum));
 }
 
 QRect TimelineWidget::drawRect() const {
@@ -983,9 +2454,8 @@ QRect TimelineWidget::timelineContentRect() const {
 }
 
 QRect TimelineWidget::trackLabelRect(int trackIndex) const {
-    const QRect tracks = trackRect();
-    return QRect(tracks.left() + 6,
-                 tracks.top() + 12 + trackIndex * kTimelineTrackRowHeight,
+    return QRect(trackRect().left() + 6,
+                 trackTop(trackIndex) + qMax(0, (trackHeight(trackIndex) - kTimelineClipHeight) / 2),
                  kTimelineLabelWidth - 12,
                  kTimelineClipHeight);
 }
@@ -993,8 +2463,10 @@ QRect TimelineWidget::trackLabelRect(int trackIndex) const {
 QRect TimelineWidget::clipRectFor(const TimelineClip& clip) const {
     const int clipX = xFromFrame(clip.startFrame);
     const int clipW = qMax(40, widthForFrames(clip.durationFrames));
-    const int clipY = trackRect().top() + 12 + clip.trackIndex * kTimelineTrackRowHeight;
-    return QRect(clipX, clipY, clipW, kTimelineClipHeight);
+    const int visualHeight =
+        qMax(kTimelineClipHeight, trackHeight(clip.trackIndex) - (kTimelineClipVerticalPadding * 2));
+    const int clipY = trackTop(clip.trackIndex) + qMax(0, (trackHeight(clip.trackIndex) - visualHeight) / 2);
+    return QRect(clipX, clipY, clipW, visualHeight);
 }
 
 int TimelineWidget::trackIndexAt(const QPoint& pos) const {
@@ -1013,6 +2485,39 @@ int TimelineWidget::clipIndexAt(const QPoint& pos) const {
         }
     }
     return -1;
+}
+
+TimelineWidget::ClipDragMode TimelineWidget::clipDragModeAt(const TimelineClip& clip, const QPoint& pos) const {
+    const QRect rect = clipRectFor(clip);
+    if (!rect.contains(pos)) {
+        return ClipDragMode::None;
+    }
+    const int edgeThreshold = qMin(10, qMax(4, rect.width() / 5));
+    if (pos.x() <= rect.left() + edgeThreshold) {
+        return ClipDragMode::TrimLeft;
+    }
+    if (pos.x() >= rect.right() - edgeThreshold) {
+        return ClipDragMode::TrimRight;
+    }
+    return ClipDragMode::Move;
+}
+
+void TimelineWidget::updateHoverCursor(const QPoint& pos) {
+    if (trackDividerAt(pos) >= 0) {
+        setCursor(Qt::SizeVerCursor);
+        return;
+    }
+    const int clipIndex = clipIndexAt(pos);
+    if (clipIndex < 0) {
+        unsetCursor();
+        return;
+    }
+    const ClipDragMode mode = clipDragModeAt(m_clips[clipIndex], pos);
+    if (mode == ClipDragMode::TrimLeft || mode == ClipDragMode::TrimRight) {
+        setCursor(Qt::SizeHorCursor);
+        return;
+    }
+    setCursor(Qt::ArrowCursor);
 }
 
 int64_t TimelineWidget::frameFromX(qreal x) const {
@@ -1039,9 +2544,8 @@ QString TimelineWidget::timecodeForFrame(int64_t frame) const {
 }
 
 int64_t TimelineWidget::mediaDurationFrames(const QFileInfo& info) const {
-    // Will be updated with async decoder info
-    QString suffix = info.suffix().toLower();
-    return guessDurationFrames(suffix);
+    const QString suffix = info.suffix().toLower();
+    return probeMediaFile(info.absoluteFilePath(), guessDurationFrames(suffix)).durationFrames;
 }
 
 bool TimelineWidget::hasFileUrls(const QMimeData* mimeData) const {
@@ -1071,19 +2575,36 @@ QColor TimelineWidget::colorForPath(const QString& path) const {
     return QColor::fromHsv(static_cast<int>(hash % 360), 160, 220, 220);
 }
 
-void TimelineWidget::addClipFromFile(const QString& filePath, int64_t startFrame) {
+TimelineClip TimelineWidget::buildClipFromFile(const QString& filePath,
+                                               int64_t startFrame,
+                                               int trackIndex) const {
     const QFileInfo info(filePath);
-    if (!info.exists() || !info.isFile()) return;
-    
+    const MediaProbeResult probe = probeMediaFile(filePath, guessDurationFrames(info.suffix().toLower()));
+
     TimelineClip clip;
     clip.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     clip.filePath = filePath;
     clip.label = info.fileName();
-    clip.startFrame = startFrame >= 0 ? startFrame : totalFrames();
-    clip.durationFrames = mediaDurationFrames(info);
-    clip.trackIndex = nextTrackIndex();
+    clip.mediaType = probe.mediaType;
+    clip.hasAudio = probe.hasAudio;
+    clip.sourceDurationFrames = probe.durationFrames;
+    clip.startFrame = startFrame;
+    clip.durationFrames = probe.durationFrames;
+    clip.trackIndex = trackIndex;
     clip.color = colorForPath(filePath);
-    
+    if (clip.mediaType == ClipMediaType::Audio) {
+        clip.color = QColor(QStringLiteral("#2f7f93"));
+    }
+    return clip;
+}
+
+void TimelineWidget::addClipFromFile(const QString& filePath, int64_t startFrame) {
+    const QFileInfo info(filePath);
+    if (!info.exists() || !info.isFile()) return;
+
+    TimelineClip clip = buildClipFromFile(filePath,
+                                          startFrame >= 0 ? startFrame : totalFrames(),
+                                          nextTrackIndex());
     m_clips.push_back(clip);
     normalizeTrackIndices();
     sortClips();
@@ -1103,6 +2624,7 @@ void TimelineWidget::dragEnterEvent(QDragEnterEvent* event) {
 void TimelineWidget::dragMoveEvent(QDragMoveEvent* event) {
     if (hasFileUrls(event->mimeData())) {
         m_dropFrame = frameFromX(event->position().x());
+        m_trackDropIndex = trackIndexAtY(event->position().toPoint().y(), true);
         event->acceptProposedAction();
         update();
         return;
@@ -1112,6 +2634,7 @@ void TimelineWidget::dragMoveEvent(QDragMoveEvent* event) {
 
 void TimelineWidget::dragLeaveEvent(QDragLeaveEvent* event) {
     m_dropFrame = -1;
+    m_trackDropIndex = -1;
     QWidget::dragLeaveEvent(event);
     update();
 }
@@ -1123,6 +2646,10 @@ void TimelineWidget::dropEvent(QDropEvent* event) {
     }
     
     int64_t insertFrame = frameFromX(event->position().x());
+    int targetTrack = trackIndexAtY(event->position().toPoint().y(), true);
+    if (targetTrack < 0) {
+        targetTrack = nextTrackIndex();
+    }
     
     for (const QUrl& url : event->mimeData()->urls()) {
         if (!url.isLocalFile()) continue;
@@ -1131,15 +2658,11 @@ void TimelineWidget::dropEvent(QDropEvent* event) {
         const QFileInfo info(filePath);
         if (!info.exists() || info.isDir()) continue;
         
-        TimelineClip clip;
-        clip.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
-        clip.filePath = filePath;
-        clip.label = info.fileName();
-        clip.startFrame = insertFrame;
-        clip.durationFrames = mediaDurationFrames(info);
-        clip.trackIndex = nextTrackIndex();
-        clip.color = colorForPath(filePath);
-        
+        if (targetTrack >= trackCount()) {
+            ensureTrackCount(targetTrack + 1);
+            updateMinimumTimelineHeight();
+        }
+        TimelineClip clip = buildClipFromFile(filePath, insertFrame, targetTrack);
         m_clips.push_back(clip);
         insertFrame += clip.durationFrames + 6;
     }
@@ -1147,14 +2670,53 @@ void TimelineWidget::dropEvent(QDropEvent* event) {
     normalizeTrackIndices();
     sortClips();
     m_dropFrame = -1;
+    m_trackDropIndex = -1;
     event->acceptProposedAction();
     
     if (clipsChanged) clipsChanged();
     update();
 }
 
+void TimelineWidget::mouseDoubleClickEvent(QMouseEvent* event) {
+    if (event->button() == Qt::LeftButton) {
+        const int trackHit = trackIndexAt(event->position().toPoint());
+        if (trackHit >= 0) {
+            const QString currentName =
+                (trackHit >= 0 && trackHit < m_tracks.size()) ? m_tracks[trackHit].name : defaultTrackName(trackHit);
+            bool accepted = false;
+            const QString nextName = QInputDialog::getText(
+                this,
+                QStringLiteral("Rename Track"),
+                QStringLiteral("Track name"),
+                QLineEdit::Normal,
+                currentName,
+                &accepted);
+            if (accepted) {
+                ensureTrackCount(trackHit + 1);
+                m_tracks[trackHit].name = nextName.trimmed().isEmpty() ? defaultTrackName(trackHit) : nextName.trimmed();
+                if (clipsChanged) {
+                    clipsChanged();
+                }
+                update();
+            }
+            event->accept();
+            return;
+        }
+    }
+    QWidget::mouseDoubleClickEvent(event);
+}
+
 void TimelineWidget::mousePressEvent(QMouseEvent* event) {
     if (event->button() == Qt::LeftButton) {
+        const int dividerHit = trackDividerAt(event->position().toPoint());
+        if (dividerHit >= 0) {
+            m_resizingTrackIndex = dividerHit;
+            m_resizeOriginY = event->position().toPoint().y();
+            m_resizeOriginHeight = trackHeight(dividerHit);
+            setCursor(Qt::SizeVerCursor);
+            event->accept();
+            return;
+        }
         const int trackHit = trackIndexAt(event->position().toPoint());
         if (trackHit >= 0) {
             m_draggedTrackIndex = trackHit;
@@ -1164,7 +2726,13 @@ void TimelineWidget::mousePressEvent(QMouseEvent* event) {
         }
         const int hitIndex = clipIndexAt(event->position().toPoint());
         if (hitIndex >= 0) {
+            setSelectedClipId(m_clips[hitIndex].id);
+            m_dragMode = clipDragModeAt(m_clips[hitIndex], event->position().toPoint());
             m_draggedClipIndex = hitIndex;
+            m_dragOriginalStartFrame = m_clips[hitIndex].startFrame;
+            m_dragOriginalDurationFrames = m_clips[hitIndex].durationFrames;
+            m_dragOriginalSourceInFrame = m_clips[hitIndex].sourceInFrame;
+            m_dragOriginalTransformKeyframes = m_clips[hitIndex].transformKeyframes;
             m_dragOffsetFrames = frameFromX(event->position().x()) - m_clips[hitIndex].startFrame;
             m_currentFrame = m_clips[hitIndex].startFrame;
             update();
@@ -1181,32 +2749,98 @@ void TimelineWidget::mousePressEvent(QMouseEvent* event) {
 }
 
 void TimelineWidget::mouseMoveEvent(QMouseEvent* event) {
-    if (m_draggedTrackIndex >= 0 && (event->buttons() & Qt::LeftButton)) {
-        const QRect tracks = trackRect();
-        const int relativeY = event->position().toPoint().y() - (tracks.top() + 12);
-        const int proposed = qBound(0, relativeY / kTimelineTrackRowHeight, trackCount() - 1);
+        if (m_draggedTrackIndex >= 0 && (event->buttons() & Qt::LeftButton)) {
+        const int proposed = qBound(0, trackIndexAtY(event->position().toPoint().y(), false), trackCount() - 1);
         if (proposed != m_trackDropIndex) {
             m_trackDropIndex = proposed;
             update();
         }
         return;
     }
-    if (m_draggedClipIndex >= 0 && (event->buttons() & Qt::LeftButton)) {
-        TimelineClip& clip = m_clips[m_draggedClipIndex];
-        const int64_t newStartFrame = qMax<int64_t>(0, frameFromX(event->position().x()) - m_dragOffsetFrames);
-        clip.startFrame = newStartFrame;
-        m_currentFrame = newStartFrame;
+    if (m_resizingTrackIndex >= 0 && (event->buttons() & Qt::LeftButton)) {
+        ensureTrackCount(m_resizingTrackIndex + 1);
+        const int delta = event->position().toPoint().y() - m_resizeOriginY;
+        m_tracks[m_resizingTrackIndex].height = qMax(kMinTrackHeight, m_resizeOriginHeight + delta);
+        updateMinimumTimelineHeight();
         update();
         return;
     }
+    if (m_draggedClipIndex >= 0 && (event->buttons() & Qt::LeftButton)) {
+        TimelineClip& clip = m_clips[m_draggedClipIndex];
+        const int64_t pointerFrame = frameFromX(event->position().x());
+        static constexpr int64_t kMinClipFrames = 1;
+        if (m_dragMode == ClipDragMode::Move) {
+            const int64_t newStartFrame = qMax<int64_t>(0, pointerFrame - m_dragOffsetFrames);
+            clip.startFrame = newStartFrame;
+            const int proposedTrack = trackIndexAtY(event->position().toPoint().y(), true);
+            if (proposedTrack >= 0) {
+                if (proposedTrack >= trackCount()) {
+                    ensureTrackCount(proposedTrack + 1);
+                    updateMinimumTimelineHeight();
+                }
+                clip.trackIndex = proposedTrack;
+                m_trackDropIndex = proposedTrack;
+            }
+            m_currentFrame = newStartFrame;
+        } else if (m_dragMode == ClipDragMode::TrimLeft) {
+            const int64_t maxStartFrame = m_dragOriginalStartFrame + m_dragOriginalDurationFrames - kMinClipFrames;
+            const int64_t newStartFrame = qBound<int64_t>(0, pointerFrame, maxStartFrame);
+            const int64_t trimDelta = newStartFrame - m_dragOriginalStartFrame;
+            clip.startFrame = newStartFrame;
+            clip.sourceInFrame = m_dragOriginalSourceInFrame + trimDelta;
+            clip.durationFrames = m_dragOriginalDurationFrames - trimDelta;
+            clip.transformKeyframes.clear();
+            for (const TimelineClip::TransformKeyframe& keyframe : m_dragOriginalTransformKeyframes) {
+                if (keyframe.frame < trimDelta) {
+                    continue;
+                }
+                TimelineClip::TransformKeyframe shifted = keyframe;
+                shifted.frame -= trimDelta;
+                clip.transformKeyframes.push_back(shifted);
+            }
+            normalizeClipTransformKeyframes(clip);
+            m_currentFrame = newStartFrame;
+        } else if (m_dragMode == ClipDragMode::TrimRight) {
+            const int64_t minEndFrame = m_dragOriginalStartFrame + kMinClipFrames;
+            const int64_t maxEndFrame =
+                m_dragOriginalStartFrame +
+                qMax<int64_t>(kMinClipFrames,
+                              mediaDurationFrames(QFileInfo(clip.filePath)) - m_dragOriginalSourceInFrame);
+            const int64_t newEndFrame = qBound<int64_t>(minEndFrame, pointerFrame, maxEndFrame);
+            clip.durationFrames = newEndFrame - m_dragOriginalStartFrame;
+            clip.transformKeyframes.clear();
+            for (const TimelineClip::TransformKeyframe& keyframe : m_dragOriginalTransformKeyframes) {
+                if (keyframe.frame < clip.durationFrames) {
+                    clip.transformKeyframes.push_back(keyframe);
+                }
+            }
+            normalizeClipTransformKeyframes(clip);
+            m_currentFrame = newEndFrame;
+        }
+        update();
+        return;
+    }
+    updateHoverCursor(event->position().toPoint());
     QWidget::mouseMoveEvent(event);
 }
 
 void TimelineWidget::mouseReleaseEvent(QMouseEvent* event) {
+    if (event->button() == Qt::LeftButton && m_resizingTrackIndex >= 0) {
+        m_resizingTrackIndex = -1;
+        m_resizeOriginY = 0;
+        m_resizeOriginHeight = 0;
+        if (clipsChanged) {
+            clipsChanged();
+        }
+        updateHoverCursor(event->position().toPoint());
+        update();
+        return;
+    }
     if (event->button() == Qt::LeftButton && m_draggedTrackIndex >= 0) {
         const int fromTrack = m_draggedTrackIndex;
         const int toTrack = qBound(0, m_trackDropIndex, trackCount() - 1);
         if (fromTrack != toTrack) {
+            ensureTrackCount(trackCount());
             for (TimelineClip& clip : m_clips) {
                 if (clip.trackIndex == fromTrack) {
                     clip.trackIndex = toTrack;
@@ -1215,6 +2849,10 @@ void TimelineWidget::mouseReleaseEvent(QMouseEvent* event) {
                 } else if (fromTrack > toTrack && clip.trackIndex >= toTrack && clip.trackIndex < fromTrack) {
                     clip.trackIndex += 1;
                 }
+            }
+            if (fromTrack >= 0 && fromTrack < m_tracks.size() && toTrack >= 0 && toTrack < m_tracks.size()) {
+                TimelineTrack movedTrack = m_tracks.takeAt(fromTrack);
+                m_tracks.insert(toTrack, movedTrack);
             }
             normalizeTrackIndices();
             sortClips();
@@ -1229,8 +2867,15 @@ void TimelineWidget::mouseReleaseEvent(QMouseEvent* event) {
         normalizeTrackIndices();
         sortClips();
         m_draggedClipIndex = -1;
+        m_dragMode = ClipDragMode::None;
+        m_trackDropIndex = -1;
         m_dragOffsetFrames = 0;
+        m_dragOriginalStartFrame = 0;
+        m_dragOriginalDurationFrames = 0;
+        m_dragOriginalSourceInFrame = 0;
+        m_dragOriginalTransformKeyframes.clear();
         if (clipsChanged) clipsChanged();
+        updateHoverCursor(event->position().toPoint());
         update();
         return;
     }
@@ -1245,6 +2890,7 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
     }
     
     QMenu menu(this);
+    setSelectedClipId(m_clips[clipIndex].id);
     QAction* deleteAction = menu.addAction(QStringLiteral("Delete"));
     QAction* gradingAction = menu.addAction(QStringLiteral("Grading..."));
     QAction* resetGradingAction = menu.addAction(QStringLiteral("Reset Grading"));
@@ -1254,59 +2900,22 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
     if (!selected) return;
     
     if (selected == deleteAction) {
+        const QString deletedId = m_clips[clipIndex].id;
         m_clips.removeAt(clipIndex);
+        if (m_selectedClipId == deletedId) {
+            m_selectedClipId.clear();
+            if (selectionChanged) {
+                selectionChanged();
+            }
+        }
         if (clipsChanged) clipsChanged();
         update();
         return;
     }
 
     if (selected == gradingAction) {
-        TimelineClip& clip = m_clips[clipIndex];
-        QDialog dialog(this);
-        dialog.setWindowTitle(QStringLiteral("Clip Grading"));
-        auto* layout = new QFormLayout(&dialog);
-
-        auto* brightnessSpin = new QDoubleSpinBox(&dialog);
-        brightnessSpin->setRange(-1.0, 1.0);
-        brightnessSpin->setSingleStep(0.05);
-        brightnessSpin->setDecimals(2);
-        brightnessSpin->setValue(clip.brightness);
-
-        auto* contrastSpin = new QDoubleSpinBox(&dialog);
-        contrastSpin->setRange(0.0, 3.0);
-        contrastSpin->setSingleStep(0.05);
-        contrastSpin->setDecimals(2);
-        contrastSpin->setValue(clip.contrast);
-
-        auto* saturationSpin = new QDoubleSpinBox(&dialog);
-        saturationSpin->setRange(0.0, 3.0);
-        saturationSpin->setSingleStep(0.05);
-        saturationSpin->setDecimals(2);
-        saturationSpin->setValue(clip.saturation);
-
-        auto* opacitySpin = new QDoubleSpinBox(&dialog);
-        opacitySpin->setRange(0.0, 1.0);
-        opacitySpin->setSingleStep(0.05);
-        opacitySpin->setDecimals(2);
-        opacitySpin->setValue(clip.opacity);
-
-        layout->addRow(QStringLiteral("Brightness"), brightnessSpin);
-        layout->addRow(QStringLiteral("Contrast"), contrastSpin);
-        layout->addRow(QStringLiteral("Saturation"), saturationSpin);
-        layout->addRow(QStringLiteral("Opacity"), opacitySpin);
-
-        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
-        layout->addRow(buttons);
-        QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-        QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-
-        if (dialog.exec() == QDialog::Accepted) {
-            clip.brightness = brightnessSpin->value();
-            clip.contrast = contrastSpin->value();
-            clip.saturation = saturationSpin->value();
-            clip.opacity = opacitySpin->value();
-            if (clipsChanged) clipsChanged();
-            update();
+        if (gradingRequested) {
+            gradingRequested();
         }
         return;
     }
@@ -1325,10 +2934,12 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
     if (selected == propertiesAction) {
         const TimelineClip& clip = m_clips[clipIndex];
         QMessageBox::information(this, QStringLiteral("Clip Properties"),
-            QStringLiteral("Name: %1\nPath: %2\nStart: %3\nDuration: %4 frames\nBrightness: %5\nContrast: %6\nSaturation: %7\nOpacity: %8")
+            QStringLiteral("Name: %1\nPath: %2\nType: %3\nStart: %4\nSource In: %5\nDuration: %6 frames\nBrightness: %7\nContrast: %8\nSaturation: %9\nOpacity: %10")
                 .arg(clip.label)
                 .arg(QDir::toNativeSeparators(clip.filePath))
+                .arg(clipMediaTypeLabel(clip.mediaType))
                 .arg(timecodeForFrame(clip.startFrame))
+                .arg(timecodeForFrame(clip.sourceInFrame))
                 .arg(clip.durationFrames)
                 .arg(clip.brightness, 0, 'f', 2)
                 .arg(clip.contrast, 0, 'f', 2)
@@ -1363,12 +2974,25 @@ void TimelineWidget::wheelEvent(QWheelEvent* event) {
     const qreal oldPixelsPerFrame = m_pixelsPerFrame;
     const qreal cursorFrame = frameFromX(event->position().x());
     const qreal zoomFactor = steps > 0 ? 1.15 : (1.0 / 1.15);
-    m_pixelsPerFrame = qBound(0.25, m_pixelsPerFrame * std::pow(zoomFactor, std::abs(steps)), 24.0);
+    const QRect contentRect = timelineContentRect();
+    const int64_t fullTimelineFrames = qMax<int64_t>(1, totalFrames());
+    const qreal fitAllPixelsPerFrame =
+        contentRect.width() > 0
+            ? static_cast<qreal>(contentRect.width()) / static_cast<qreal>(fullTimelineFrames)
+            : 0.01;
+    const qreal minPixelsPerFrame = qMin<qreal>(0.25, fitAllPixelsPerFrame);
+    m_pixelsPerFrame = qBound(minPixelsPerFrame, m_pixelsPerFrame * std::pow(zoomFactor, std::abs(steps)), 24.0);
     
     const qreal localX = event->position().x() - 16.0;
     if (m_pixelsPerFrame > 0.0) {
         const qreal newOffset = cursorFrame - qMax<qreal>(0.0, localX) / m_pixelsPerFrame;
-        m_frameOffset = qMax<int64_t>(0, qRound(newOffset));
+        const int64_t visibleFrames = qMax<int64_t>(1, qRound(static_cast<qreal>(contentRect.width()) / m_pixelsPerFrame));
+        const int64_t maxOffset = qMax<int64_t>(0, totalFrames() - visibleFrames);
+        m_frameOffset = qBound<int64_t>(0, static_cast<int64_t>(qRound(newOffset)), maxOffset);
+    }
+
+    if (m_pixelsPerFrame <= fitAllPixelsPerFrame + 0.0001) {
+        m_frameOffset = 0;
     }
     
     if (!qFuzzyCompare(oldPixelsPerFrame, m_pixelsPerFrame)) {
@@ -1415,23 +3039,85 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
                                            : QColor(QStringLiteral("#202a34"))));
         painter.drawRoundedRect(labelRect, 8, 8);
         painter.setPen(QColor(QStringLiteral("#eef4fa")));
-        painter.drawText(labelRect, Qt::AlignCenter, QString::number(track + 1));
+        painter.drawText(labelRect.adjusted(4, 0, -4, 0),
+                         Qt::AlignCenter,
+                         painter.fontMetrics().elidedText(m_tracks.value(track).name, Qt::ElideRight, labelRect.width() - 8));
         painter.setPen(QColor(QStringLiteral("#24303c")));
-        const int dividerY = labelRect.bottom() + ((kTimelineTrackRowHeight - kTimelineClipHeight) / 2);
+        const int dividerY = trackTop(track) + trackHeight(track);
         painter.drawLine(content.left() - 8, dividerY, tracks.right() - 10, dividerY);
     }
     
     for (const TimelineClip& clip : m_clips) {
         const QRect clipRect = clipRectFor(clip);
+        const bool audioOnly = clipIsAudioOnly(clip);
+        const int64_t ghostStartFrame = qMax<int64_t>(0, clip.startFrame - clip.sourceInFrame);
+        const int64_t ghostDurationFrames = qMax<int64_t>(clip.durationFrames, clip.sourceDurationFrames);
+        const QRect ghostRect(xFromFrame(ghostStartFrame),
+                              clipRect.y(),
+                              qMax(40, widthForFrames(ghostDurationFrames)),
+                              clipRect.height());
+
+        if (ghostRect != clipRect) {
+            painter.setPen(QColor(255, 255, 255, 20));
+            painter.setBrush(clip.color.lighter(130));
+            painter.setOpacity(0.18);
+            painter.drawRoundedRect(ghostRect, 7, 7);
+            painter.setOpacity(1.0);
+        }
         
         painter.setPen(QColor(255, 255, 255, 32));
         painter.setBrush(clip.color);
         painter.drawRoundedRect(clipRect, 7, 7);
+
+        if (audioOnly) {
+            painter.save();
+            const int verticalInset = qMax(5, clipRect.height() / 10);
+            const QRect envelopeRect = clipRect.adjusted(8, verticalInset, -8, -verticalInset);
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(QColor(QStringLiteral("#163946")));
+            painter.drawRoundedRect(envelopeRect, 5, 5);
+            painter.setClipRect(envelopeRect);
+            painter.setPen(QPen(QColor(QStringLiteral("#9fe7f4")), 2));
+            painter.drawLine(envelopeRect.left(), envelopeRect.center().y(),
+                             envelopeRect.right(), envelopeRect.center().y());
+            painter.setPen(Qt::NoPen);
+            for (int x = envelopeRect.left(); x < envelopeRect.right(); x += 6) {
+                const int idx = (x - envelopeRect.left()) / 6;
+                const qreal phase = static_cast<qreal>((idx * 17 + clip.startFrame + clip.sourceInFrame) % 100) / 99.0;
+                const qreal shaped = 0.2 + std::abs(std::sin(phase * 6.28318)) * 0.8;
+                const int barHeight = qMax(8, qRound(shaped * envelopeRect.height()));
+                const QRect barRect(x, envelopeRect.center().y() - barHeight / 2, 4, barHeight);
+                painter.setBrush(QColor(QStringLiteral("#f2feff")));
+                painter.drawRoundedRect(barRect, 2, 2);
+            }
+            painter.restore();
+        }
         
         painter.setPen(QColor(QStringLiteral("#f4f7fb")));
+        if (clip.id == m_selectedClipId) {
+            painter.setPen(QPen(QColor(QStringLiteral("#fff4c2")), 2));
+            if (audioOnly) {
+                painter.setBrush(Qt::NoBrush);
+                painter.drawRoundedRect(clipRect.adjusted(1, 1, -1, -1), 7, 7);
+            } else {
+                painter.setBrush(clip.color.lighter(108));
+                painter.drawRoundedRect(clipRect, 7, 7);
+            }
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(QColor(QStringLiteral("#fff4c2")));
+            const int handleInset = qMax(5, clipRect.height() / 10);
+            const QRect leftHandle(clipRect.left() + 2, clipRect.top() + handleInset, 4, clipRect.height() - (handleInset * 2));
+            const QRect rightHandle(clipRect.right() - 5, clipRect.top() + handleInset, 4, clipRect.height() - (handleInset * 2));
+            painter.drawRoundedRect(leftHandle, 2, 2);
+            painter.drawRoundedRect(rightHandle, 2, 2);
+            painter.setPen(QColor(QStringLiteral("#f4f7fb")));
+        }
+        const QString clipTitle = audioOnly
+            ? QStringLiteral("AUDIO  %1").arg(clip.label)
+            : clip.label;
         painter.drawText(clipRect.adjusted(10, 0, -10, 0),
                         Qt::AlignLeft | Qt::AlignVCenter,
-                        painter.fontMetrics().elidedText(clip.label, Qt::ElideRight, 
+                        painter.fontMetrics().elidedText(clipTitle, Qt::ElideRight, 
                                                          clipRect.width() - 20));
     }
     
@@ -1439,6 +3125,12 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
         const int x = xFromFrame(m_dropFrame);
         painter.setPen(QPen(QColor(QStringLiteral("#f7b955")), 2, Qt::DashLine));
         painter.drawLine(x, tracks.top() + 2, x, tracks.bottom() - 2);
+    }
+
+    if (m_trackDropIndex == trackCount() && (m_draggedClipIndex >= 0 || m_dropFrame >= 0)) {
+        const int bottom = trackTop(trackCount() - 1) + trackHeight(trackCount() - 1);
+        painter.setPen(QPen(QColor(QStringLiteral("#f7b955")), 2, Qt::DashLine));
+        painter.drawLine(content.left() - 8, bottom + 6, tracks.right() - 10, bottom + 6);
     }
     
     const int playheadX = xFromFrame(m_currentFrame);
@@ -1482,15 +3174,37 @@ public:
         editorPaneTimer.start();
         splitter->addWidget(buildEditorPane());
         qDebug() << "[STARTUP] Editor pane built in" << editorPaneTimer.elapsed() << "ms";
+        splitter->addWidget(buildInspectorPane());
         
         splitter->setStretchFactor(0, 0);
         splitter->setStretchFactor(1, 1);
-        splitter->setSizes({320, 1180});
+        splitter->setStretchFactor(2, 0);
+        splitter->setSizes({320, 900, 280});
 
         setCentralWidget(central);
 
         connect(&m_playbackTimer, &QTimer::timeout, this, &EditorWindow::advanceFrame);
         m_playbackTimer.setInterval(33);
+        auto* undoShortcut = new QShortcut(QKeySequence::Undo, this);
+        connect(undoShortcut, &QShortcut::activated, this, [this]() { undoHistory(); });
+        auto* splitShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+B")), this);
+        connect(splitShortcut, &QShortcut::activated, this, [this]() {
+            if (!m_timeline) {
+                return;
+            }
+            if (m_timeline->splitSelectedClipAtFrame(m_timeline->currentFrame())) {
+                refreshInspector();
+            }
+        });
+        auto* deleteShortcut = new QShortcut(QKeySequence::Delete, this);
+        connect(deleteShortcut, &QShortcut::activated, this, [this]() {
+            if (!m_timeline) {
+                return;
+            }
+            if (m_timeline->deleteSelectedClip()) {
+                refreshInspector();
+            }
+        });
         m_mainThreadHeartbeatTimer.setInterval(100);
         connect(&m_mainThreadHeartbeatTimer, &QTimer::timeout, this, [this]() {
             m_lastMainThreadHeartbeatMs.store(nowMs());
@@ -1529,6 +3243,37 @@ public:
             this);
         m_controlServer->start(controlPort);
         qDebug() << "[STARTUP] ControlServer started in" << ctorTimer.elapsed() << "ms";
+        m_audioEngine = std::make_unique<AudioEngine>();
+
+        auto connectGradeLive = [this](QDoubleSpinBox* spin) {
+            connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double) {
+                applySelectedClipGradeFromInspector(false);
+            });
+            connect(spin, &QDoubleSpinBox::editingFinished, this, [this]() {
+                applySelectedClipGradeFromInspector(true);
+            });
+        };
+        connectGradeLive(m_brightnessSpin);
+        connectGradeLive(m_contrastSpin);
+        connectGradeLive(m_saturationSpin);
+        connectGradeLive(m_opacitySpin);
+
+        auto connectVideoKeyframeLive = [this](QDoubleSpinBox* spin) {
+            connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double) {
+                applySelectedVideoKeyframeFromInspector(false);
+            });
+            connect(spin, &QDoubleSpinBox::editingFinished, this, [this]() {
+                applySelectedVideoKeyframeFromInspector(true);
+            });
+        };
+        connectVideoKeyframeLive(m_videoTranslationXSpin);
+        connectVideoKeyframeLive(m_videoTranslationYSpin);
+        connectVideoKeyframeLive(m_videoRotationSpin);
+        connectVideoKeyframeLive(m_videoScaleXSpin);
+        connectVideoKeyframeLive(m_videoScaleYSpin);
+        connect(m_videoInterpolationCombo, &QComboBox::currentIndexChanged, this, [this](int) {
+            applySelectedVideoKeyframeFromInspector(true);
+        });
 
         QTimer::singleShot(0, this, [this]() {
             loadState();
@@ -1548,6 +3293,19 @@ protected:
 
 private slots:
     void advanceFrame() {
+        if (m_audioEngine && m_audioEngine->hasPlayableAudio()) {
+            const int64_t audioFrame = qBound<int64_t>(0, m_audioEngine->currentFrame(), m_timeline->totalFrames());
+            if (m_preview && !m_preview->preparePlaybackAdvance(audioFrame)) {
+                playbackTrace(QStringLiteral("EditorWindow::advanceFrame.wait"),
+                              QStringLiteral("audio=%1").arg(audioFrame));
+                return;
+            }
+            playbackTrace(QStringLiteral("EditorWindow::advanceFrame"),
+                          QStringLiteral("clock=audio frame=%1").arg(audioFrame));
+            setCurrentFrame(audioFrame, false);
+            return;
+        }
+
         const int64_t nextFrame = m_timeline->currentFrame() + 1;
         const int64_t wrapped = nextFrame > m_timeline->totalFrames() ? 0 : nextFrame;
         if (m_preview && !m_preview->preparePlaybackAdvance(wrapped)) {
@@ -1556,8 +3314,8 @@ private slots:
             return;
         }
         playbackTrace(QStringLiteral("EditorWindow::advanceFrame"),
-                      QStringLiteral("current=%1 next=%2").arg(m_timeline->currentFrame()).arg(wrapped));
-        setCurrentFrame(wrapped);
+                      QStringLiteral("clock=video current=%1 next=%2").arg(m_timeline->currentFrame()).arg(wrapped));
+        setCurrentFrame(wrapped, false);
     }
 
 private:
@@ -1565,11 +3323,16 @@ private:
         return QDir(QDir::currentPath()).filePath(QStringLiteral("editor_state.json"));
     }
 
+    QString historyFilePath() const {
+        return QDir(QDir::currentPath()).filePath(QStringLiteral("editor_history.json"));
+    }
+
     QJsonObject buildStateJson() const {
         QJsonObject root;
         root[QStringLiteral("explorerRoot")] = m_currentRootPath;
         root[QStringLiteral("currentFrame")] = static_cast<qint64>(m_timeline ? m_timeline->currentFrame() : 0);
         root[QStringLiteral("playing")] = m_playbackTimer.isActive();
+        root[QStringLiteral("selectedClipId")] = m_timeline ? m_timeline->selectedClipId() : QString();
 
         QJsonArray timeline;
         if (m_timeline) {
@@ -1578,6 +3341,17 @@ private:
             }
         }
         root[QStringLiteral("timeline")] = timeline;
+
+        QJsonArray tracks;
+        if (m_timeline) {
+            for (const TimelineTrack& track : m_timeline->tracks()) {
+                QJsonObject trackObj;
+                trackObj[QStringLiteral("name")] = track.name;
+                trackObj[QStringLiteral("height")] = track.height;
+                tracks.push_back(trackObj);
+            }
+        }
+        root[QStringLiteral("tracks")] = tracks;
         return root;
     }
 
@@ -1621,6 +3395,124 @@ private:
 
         m_lastSavedState = serializedState;
     }
+
+    void saveHistoryNow() {
+        QJsonObject root;
+        root[QStringLiteral("index")] = m_historyIndex;
+        root[QStringLiteral("entries")] = m_historyEntries;
+
+        QSaveFile file(historyFilePath());
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            return;
+        }
+
+        const QByteArray payload = QJsonDocument(root).toJson(QJsonDocument::Indented);
+        if (file.write(payload) != payload.size()) {
+            file.cancelWriting();
+            return;
+        }
+        file.commit();
+    }
+
+    void pushHistorySnapshot() {
+        if (m_loadingState || m_restoringHistory || !m_timeline) {
+            return;
+        }
+
+        const QJsonObject snapshot = buildStateJson();
+        if (m_historyIndex >= 0 && m_historyIndex < m_historyEntries.size() &&
+            m_historyEntries.at(m_historyIndex).toObject() == snapshot) {
+            return;
+        }
+
+        while (m_historyEntries.size() > m_historyIndex + 1) {
+            m_historyEntries.removeAt(m_historyEntries.size() - 1);
+        }
+        m_historyEntries.append(snapshot);
+        if (m_historyEntries.size() > 200) {
+            m_historyEntries.removeAt(0);
+        }
+        m_historyIndex = m_historyEntries.size() - 1;
+        saveHistoryNow();
+    }
+
+    void applyStateJson(const QJsonObject& root) {
+        m_loadingState = true;
+
+        QString rootPath = root.value(QStringLiteral("explorerRoot")).toString(QDir::currentPath());
+        QVector<TimelineClip> loadedClips;
+        const int64_t currentFrame = root.value(QStringLiteral("currentFrame")).toVariant().toLongLong();
+        const QString selectedClipId = root.value(QStringLiteral("selectedClipId")).toString();
+        QVector<TimelineTrack> loadedTracks;
+
+        const QJsonArray clips = root.value(QStringLiteral("timeline")).toArray();
+        loadedClips.reserve(clips.size());
+        for (const QJsonValue& value : clips) {
+            if (!value.isObject()) continue;
+            TimelineClip clip = clipFromJson(value.toObject());
+            if (clip.trackIndex < 0) {
+                clip.trackIndex = loadedClips.size();
+            }
+            if (!clip.filePath.isEmpty()) {
+                loadedClips.push_back(clip);
+            }
+        }
+
+        const QJsonArray tracks = root.value(QStringLiteral("tracks")).toArray();
+        loadedTracks.reserve(tracks.size());
+        for (int i = 0; i < tracks.size(); ++i) {
+            const QJsonObject obj = tracks.at(i).toObject();
+            TimelineTrack track;
+            track.name = obj.value(QStringLiteral("name")).toString(QStringLiteral("Track %1").arg(i + 1));
+            track.height = qMax(28, obj.value(QStringLiteral("height")).toInt(44));
+            loadedTracks.push_back(track);
+        }
+
+        const QString resolvedRootPath = QDir(rootPath).absolutePath();
+        m_currentRootPath = resolvedRootPath;
+        if (m_rootPathLabel) {
+            m_rootPathLabel->setText(resolvedRootPath);
+        }
+
+        m_timeline->setTracks(loadedTracks);
+        m_timeline->setClips(loadedClips);
+        m_timeline->setSelectedClipId(selectedClipId);
+        syncSliderRange();
+        m_preview->setClipCount(m_timeline->clips().size());
+        m_preview->setTimelineClips(m_timeline->clips());
+        m_preview->setSelectedClipId(selectedClipId);
+        if (m_audioEngine) {
+            m_audioEngine->setTimelineClips(m_timeline->clips());
+            m_audioEngine->seek(currentFrame);
+        }
+        setCurrentFrame(currentFrame);
+
+        m_playbackTimer.stop();
+        m_fastPlaybackActive.store(false);
+        m_preview->setPlaybackState(false);
+        if (m_audioEngine) {
+            m_audioEngine->stop();
+        }
+
+        m_loadingState = false;
+        QTimer::singleShot(0, this, [this, resolvedRootPath]() {
+            setExplorerRootPath(resolvedRootPath, false);
+            refreshInspector();
+        });
+    }
+
+    void undoHistory() {
+        if (m_historyIndex <= 0 || m_historyEntries.isEmpty()) {
+            return;
+        }
+
+        m_restoringHistory = true;
+        m_historyIndex -= 1;
+        applyStateJson(m_historyEntries.at(m_historyIndex).toObject());
+        m_restoringHistory = false;
+        saveHistoryNow();
+        scheduleSaveState();
+    }
     
     void setExplorerRootPath(const QString& path, bool saveAfterChange = true) {
         if (!m_fsModel || !m_tree) {
@@ -1642,6 +3534,7 @@ private:
         
         if (saveAfterChange) {
             scheduleSaveState();
+            pushHistorySnapshot();
         }
     }
     
@@ -1661,6 +3554,10 @@ private:
         obj[QStringLiteral("id")] = clip.id;
         obj[QStringLiteral("filePath")] = clip.filePath;
         obj[QStringLiteral("label")] = clip.label;
+        obj[QStringLiteral("mediaType")] = clipMediaTypeToString(clip.mediaType);
+        obj[QStringLiteral("hasAudio")] = clip.hasAudio;
+        obj[QStringLiteral("sourceDurationFrames")] = static_cast<qint64>(clip.sourceDurationFrames);
+        obj[QStringLiteral("sourceInFrame")] = static_cast<qint64>(clip.sourceInFrame);
         obj[QStringLiteral("startFrame")] = static_cast<qint64>(clip.startFrame);
         obj[QStringLiteral("durationFrames")] = static_cast<qint64>(clip.durationFrames);
         obj[QStringLiteral("trackIndex")] = clip.trackIndex;
@@ -1669,6 +3566,24 @@ private:
         obj[QStringLiteral("contrast")] = clip.contrast;
         obj[QStringLiteral("saturation")] = clip.saturation;
         obj[QStringLiteral("opacity")] = clip.opacity;
+        obj[QStringLiteral("baseTranslationX")] = clip.baseTranslationX;
+        obj[QStringLiteral("baseTranslationY")] = clip.baseTranslationY;
+        obj[QStringLiteral("baseRotation")] = clip.baseRotation;
+        obj[QStringLiteral("baseScaleX")] = clip.baseScaleX;
+        obj[QStringLiteral("baseScaleY")] = clip.baseScaleY;
+        QJsonArray keyframes;
+        for (const TimelineClip::TransformKeyframe& keyframe : clip.transformKeyframes) {
+            QJsonObject keyframeObj;
+            keyframeObj[QStringLiteral("frame")] = static_cast<qint64>(keyframe.frame);
+            keyframeObj[QStringLiteral("translationX")] = keyframe.translationX;
+            keyframeObj[QStringLiteral("translationY")] = keyframe.translationY;
+            keyframeObj[QStringLiteral("rotation")] = keyframe.rotation;
+            keyframeObj[QStringLiteral("scaleX")] = keyframe.scaleX;
+            keyframeObj[QStringLiteral("scaleY")] = keyframe.scaleY;
+            keyframeObj[QStringLiteral("interpolated")] = keyframe.interpolated;
+            keyframes.push_back(keyframeObj);
+        }
+        obj[QStringLiteral("transformKeyframes")] = keyframes;
         return obj;
     }
     
@@ -1677,73 +3592,85 @@ private:
         clip.id = obj.value(QStringLiteral("id")).toString();
         clip.filePath = obj.value(QStringLiteral("filePath")).toString();
         clip.label = obj.value(QStringLiteral("label")).toString(QFileInfo(clip.filePath).fileName());
+        clip.mediaType = clipMediaTypeFromString(obj.value(QStringLiteral("mediaType")).toString());
+        clip.hasAudio = obj.value(QStringLiteral("hasAudio")).toBool(false);
+        clip.sourceDurationFrames = obj.value(QStringLiteral("sourceDurationFrames")).toVariant().toLongLong();
+        clip.sourceInFrame = obj.value(QStringLiteral("sourceInFrame")).toVariant().toLongLong();
         clip.startFrame = obj.value(QStringLiteral("startFrame")).toVariant().toLongLong();
         clip.durationFrames = obj.value(QStringLiteral("durationFrames")).toVariant().toLongLong();
         clip.trackIndex = obj.value(QStringLiteral("trackIndex")).toInt(-1);
         if (clip.durationFrames == 0) clip.durationFrames = 120;
+        if (clip.mediaType == ClipMediaType::Unknown && !clip.filePath.isEmpty()) {
+            const MediaProbeResult probe = probeMediaFile(clip.filePath, clip.durationFrames);
+            clip.mediaType = probe.mediaType;
+            clip.hasAudio = probe.hasAudio;
+            clip.durationFrames = probe.durationFrames;
+            clip.sourceDurationFrames = probe.durationFrames;
+        }
+        if (clip.sourceDurationFrames <= 0) {
+            clip.sourceDurationFrames = clip.sourceInFrame + clip.durationFrames;
+        }
         clip.color = QColor(obj.value(QStringLiteral("color")).toString());
         if (!clip.color.isValid()) {
             clip.color = QColor::fromHsv(static_cast<int>(qHash(clip.filePath) % 360), 160, 220, 220);
+        }
+        if (clip.mediaType == ClipMediaType::Audio) {
+            clip.color = QColor(QStringLiteral("#2f7f93"));
         }
         clip.brightness = obj.value(QStringLiteral("brightness")).toDouble(0.0);
         clip.contrast = obj.value(QStringLiteral("contrast")).toDouble(1.0);
         clip.saturation = obj.value(QStringLiteral("saturation")).toDouble(1.0);
         clip.opacity = obj.value(QStringLiteral("opacity")).toDouble(1.0);
+        clip.baseTranslationX = obj.value(QStringLiteral("baseTranslationX")).toDouble(0.0);
+        clip.baseTranslationY = obj.value(QStringLiteral("baseTranslationY")).toDouble(0.0);
+        clip.baseRotation = obj.value(QStringLiteral("baseRotation")).toDouble(0.0);
+        clip.baseScaleX = obj.value(QStringLiteral("baseScaleX")).toDouble(1.0);
+        clip.baseScaleY = obj.value(QStringLiteral("baseScaleY")).toDouble(1.0);
+        const QJsonArray keyframes = obj.value(QStringLiteral("transformKeyframes")).toArray();
+        for (const QJsonValue& value : keyframes) {
+            if (!value.isObject()) {
+                continue;
+            }
+            const QJsonObject keyframeObj = value.toObject();
+            TimelineClip::TransformKeyframe keyframe;
+            keyframe.frame = keyframeObj.value(QStringLiteral("frame")).toVariant().toLongLong();
+            keyframe.translationX = keyframeObj.value(QStringLiteral("translationX")).toDouble(0.0);
+            keyframe.translationY = keyframeObj.value(QStringLiteral("translationY")).toDouble(0.0);
+            keyframe.rotation = keyframeObj.value(QStringLiteral("rotation")).toDouble(0.0);
+            keyframe.scaleX = keyframeObj.value(QStringLiteral("scaleX")).toDouble(1.0);
+            keyframe.scaleY = keyframeObj.value(QStringLiteral("scaleY")).toDouble(1.0);
+            keyframe.interpolated = keyframeObj.value(QStringLiteral("interpolated")).toBool(true);
+            clip.transformKeyframes.push_back(keyframe);
+        }
+        normalizeClipTransformKeyframes(clip);
         return clip;
     }
     
     void loadState() {
-        m_loadingState = true;
-        
-        QString rootPath = QDir::currentPath();
-        QVector<TimelineClip> loadedClips;
-        int64_t currentFrame = 0;
-        bool playing = false;
-        
-        QFile file(stateFilePath());
-        if (file.open(QIODevice::ReadOnly)) {
-            const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
-            const QJsonObject root = doc.object();
-            
-            rootPath = root.value(QStringLiteral("explorerRoot")).toString(rootPath);
-            currentFrame = root.value(QStringLiteral("currentFrame")).toVariant().toLongLong();
-            playing = root.value(QStringLiteral("playing")).toBool(false);
-            
-            const QJsonArray clips = root.value(QStringLiteral("timeline")).toArray();
-            loadedClips.reserve(clips.size());
-            for (const QJsonValue& value : clips) {
-                if (!value.isObject()) continue;
-                TimelineClip clip = clipFromJson(value.toObject());
-                if (clip.trackIndex < 0) {
-                    clip.trackIndex = loadedClips.size();
-                }
-                if (!clip.filePath.isEmpty()) {
-                    loadedClips.push_back(clip);
-                }
+        QJsonObject root;
+        QFile historyFile(historyFilePath());
+        if (historyFile.open(QIODevice::ReadOnly)) {
+            const QJsonObject historyRoot = QJsonDocument::fromJson(historyFile.readAll()).object();
+            m_historyEntries = historyRoot.value(QStringLiteral("entries")).toArray();
+            m_historyIndex = historyRoot.value(QStringLiteral("index")).toInt(m_historyEntries.size() - 1);
+            if (!m_historyEntries.isEmpty()) {
+                m_historyIndex = qBound(0, m_historyIndex, m_historyEntries.size() - 1);
+                root = m_historyEntries.at(m_historyIndex).toObject();
             }
         }
-        
-        const QString resolvedRootPath = QDir(rootPath).absolutePath();
-        m_currentRootPath = resolvedRootPath;
-        if (m_rootPathLabel) {
-            m_rootPathLabel->setText(resolvedRootPath);
+
+        if (root.isEmpty()) {
+            QFile file(stateFilePath());
+            if (file.open(QIODevice::ReadOnly)) {
+                root = QJsonDocument::fromJson(file.readAll()).object();
+            }
         }
 
-        m_timeline->setClips(loadedClips);
-        syncSliderRange();
-        m_preview->setClipCount(m_timeline->clips().size());
-        m_preview->setTimelineClips(m_timeline->clips());
-        setCurrentFrame(currentFrame);
-        
-        Q_UNUSED(playing)
-        m_playbackTimer.stop();
-        m_fastPlaybackActive.store(false);
-        m_preview->setPlaybackState(false);
-        
-        m_loadingState = false;
-        QTimer::singleShot(0, this, [this, resolvedRootPath]() {
-            setExplorerRootPath(resolvedRootPath, false);
-        });
+        applyStateJson(root);
+        if (m_historyEntries.isEmpty()) {
+            pushHistorySnapshot();
+        }
+
         if (m_pendingSaveAfterLoad) {
             m_pendingSaveAfterLoad = false;
             scheduleSaveState();
@@ -1824,10 +3751,15 @@ private:
         
         auto* layout = new QVBoxLayout(pane);
         layout->setContentsMargins(18, 18, 18, 18);
-        layout->setSpacing(14);
+        layout->setSpacing(0);
+
+        auto* verticalSplitter = new QSplitter(Qt::Vertical, pane);
+        verticalSplitter->setObjectName(QStringLiteral("layout.editor_splitter"));
+        verticalSplitter->setChildrenCollapsible(false);
+        layout->addWidget(verticalSplitter, 1);
         
         auto* previewFrame = new QFrame;
-        previewFrame->setMinimumHeight(360);
+        previewFrame->setMinimumHeight(240);
         previewFrame->setFrameShape(QFrame::NoFrame);
         previewFrame->setStyleSheet(QStringLiteral("QFrame { background: #05080c; border: 1px solid #202934; border-radius: 14px; }"));
         auto* previewLayout = new QVBoxLayout(previewFrame);
@@ -1868,7 +3800,13 @@ private:
         stack->addWidget(m_preview);
         stack->addWidget(overlay);
         previewLayout->addLayout(stack);
-        layout->addWidget(previewFrame, 3);
+        verticalSplitter->addWidget(previewFrame);
+
+        auto* timelinePane = new QWidget;
+        timelinePane->setMinimumHeight(220);
+        auto* timelineLayout = new QVBoxLayout(timelinePane);
+        timelineLayout->setContentsMargins(0, 14, 0, 0);
+        timelineLayout->setSpacing(14);
         
         auto* transport = new QWidget;
         auto* transportLayout = new QHBoxLayout(transport);
@@ -1893,6 +3831,18 @@ private:
         m_timecodeLabel = new QLabel;
         m_timecodeLabel->setObjectName(QStringLiteral("transport.timecode"));
         m_timecodeLabel->setMinimumWidth(96);
+
+        m_audioMuteButton = new QToolButton;
+        m_audioMuteButton->setObjectName(QStringLiteral("transport.audio_mute"));
+        m_audioMuteButton->setText(QStringLiteral("Mute"));
+        m_audioVolumeSlider = new QSlider(Qt::Horizontal);
+        m_audioVolumeSlider->setObjectName(QStringLiteral("transport.audio_volume"));
+        m_audioVolumeSlider->setRange(0, 100);
+        m_audioVolumeSlider->setValue(80);
+        m_audioVolumeSlider->setFixedWidth(110);
+        m_audioNowPlayingLabel = new QLabel(QStringLiteral("Audio idle"));
+        m_audioNowPlayingLabel->setObjectName(QStringLiteral("transport.audio_status"));
+        m_audioNowPlayingLabel->setMinimumWidth(180);
         
         fprintf(stderr, "[DEBUG] Adding transport widgets...\n");
         fflush(stderr);
@@ -1902,7 +3852,10 @@ private:
         transportLayout->addWidget(endButton);
         transportLayout->addWidget(m_seekSlider, 1);
         transportLayout->addWidget(m_timecodeLabel);
-        layout->addWidget(transport, 0);
+        transportLayout->addWidget(m_audioMuteButton);
+        transportLayout->addWidget(m_audioVolumeSlider);
+        transportLayout->addWidget(m_audioNowPlayingLabel);
+        timelineLayout->addWidget(transport, 0);
         fprintf(stderr, "[DEBUG] Transport widgets added\n");
         fflush(stderr);
         
@@ -1912,9 +3865,16 @@ private:
         fprintf(stderr, "[DEBUG] TimelineWidget created\n");
         fflush(stderr);
         m_timeline->setObjectName(QStringLiteral("timeline.widget"));
-        layout->addWidget(m_timeline, 2);
+        timelineLayout->addWidget(m_timeline, 1);
+        verticalSplitter->addWidget(timelinePane);
+        verticalSplitter->setStretchFactor(0, 3);
+        verticalSplitter->setStretchFactor(1, 2);
+        verticalSplitter->setSizes({540, 320});
         
         connect(m_playButton, &QPushButton::clicked, this, [this]() {
+            if (m_audioEngine && m_audioEngine->hasPlayableAudio()) {
+                m_audioEngine->start(m_timeline->currentFrame());
+            }
             m_playbackTimer.start();
             m_fastPlaybackActive.store(true);
             m_preview->setPlaybackState(true);
@@ -1922,6 +3882,9 @@ private:
             scheduleSaveState();
         });
         connect(pauseButton, &QPushButton::clicked, this, [this]() {
+            if (m_audioEngine) {
+                m_audioEngine->stop();
+            }
             m_playbackTimer.stop();
             m_fastPlaybackActive.store(false);
             m_preview->setPlaybackState(false);
@@ -1938,6 +3901,22 @@ private:
             if (m_ignoreSeekSignal) return;
             setCurrentFrame(value);
         });
+        connect(m_audioMuteButton, &QToolButton::clicked, this, [this]() {
+            const bool nextMuted = !m_preview->audioMuted();
+            m_preview->setAudioMuted(nextMuted);
+            if (m_audioEngine) {
+                m_audioEngine->setMuted(nextMuted);
+            }
+            refreshInspector();
+            scheduleSaveState();
+        });
+        connect(m_audioVolumeSlider, &QSlider::valueChanged, this, [this](int value) {
+            m_preview->setAudioVolume(value / 100.0);
+            if (m_audioEngine) {
+                m_audioEngine->setVolume(value / 100.0);
+            }
+            refreshInspector();
+        });
         
         m_timeline->seekRequested = [this](int64_t frame) {
             setCurrentFrame(frame);
@@ -1946,11 +3925,304 @@ private:
             syncSliderRange();
             m_preview->setClipCount(m_timeline->clips().size());
             m_preview->setTimelineClips(m_timeline->clips());
+            m_preview->setSelectedClipId(m_timeline->selectedClipId());
+            if (m_audioEngine) {
+                m_audioEngine->setTimelineClips(m_timeline->clips());
+            }
             refreshInspector();
             scheduleSaveState();
+            pushHistorySnapshot();
+        };
+        m_timeline->selectionChanged = [this]() {
+            m_preview->setSelectedClipId(m_timeline->selectedClipId());
+            refreshInspector();
+        };
+        m_timeline->gradingRequested = [this]() {
+            focusGradingTab();
+            refreshInspector();
+        };
+        m_preview->selectionRequested = [this](const QString& clipId) {
+            if (!m_timeline) {
+                return;
+            }
+            m_timeline->setSelectedClipId(clipId);
+        };
+        m_preview->resizeRequested = [this](const QString& clipId, qreal scaleX, qreal scaleY, bool finalize) {
+            if (!m_timeline) {
+                return;
+            }
+            const int64_t currentFrame = m_timeline->currentFrame();
+            const bool updated = m_timeline->updateClipById(clipId, [this, currentFrame, scaleX, scaleY](TimelineClip& clip) {
+                if (!clipHasVisuals(clip)) {
+                    return;
+                }
+                const TimelineClip::TransformKeyframe offset = evaluateClipKeyframeOffsetAtFrame(clip, currentFrame);
+                const qreal offsetScaleX = sanitizeScaleValue(offset.scaleX);
+                const qreal offsetScaleY = sanitizeScaleValue(offset.scaleY);
+                if (m_keyframeModeCheckBox && !m_keyframeModeCheckBox->isChecked()) {
+                    clip.baseScaleX = sanitizeScaleValue(scaleX / offsetScaleX);
+                    clip.baseScaleY = sanitizeScaleValue(scaleY / offsetScaleY);
+                } else {
+                    const int64_t keyframeFrame =
+                        qBound<int64_t>(0, currentFrame - clip.startFrame, qMax<int64_t>(0, clip.durationFrames - 1));
+                    TimelineClip::TransformKeyframe keyframe = offset;
+                    keyframe.frame = keyframeFrame;
+                    keyframe.scaleX = sanitizeScaleValue(scaleX / sanitizeScaleValue(clip.baseScaleX));
+                    keyframe.scaleY = sanitizeScaleValue(scaleY / sanitizeScaleValue(clip.baseScaleY));
+                    bool replaced = false;
+                    for (TimelineClip::TransformKeyframe& existing : clip.transformKeyframes) {
+                        if (existing.frame == keyframeFrame) {
+                            existing = keyframe;
+                            replaced = true;
+                            break;
+                        }
+                    }
+                    if (!replaced) {
+                        clip.transformKeyframes.push_back(keyframe);
+                    }
+                }
+                normalizeClipTransformKeyframes(clip);
+            });
+            if (!updated) {
+                return;
+            }
+            m_preview->setTimelineClips(m_timeline->clips());
+            refreshInspector();
+            scheduleSaveState();
+            if (finalize) {
+                pushHistorySnapshot();
+            }
         };
         fprintf(stderr, "[DEBUG] buildEditorPane() returning\n");
         fflush(stderr);
+        return pane;
+    }
+
+    QWidget* buildInspectorPane() {
+        auto* pane = new QFrame;
+        pane->setFrameShape(QFrame::NoFrame);
+        pane->setMinimumWidth(300);
+        pane->setStyleSheet(
+            QStringLiteral("QFrame { background: #11161c; color: #e8edf2; }"
+                           "QLabel#inspectorTitle { color: #dce5ee; font-weight: 700; letter-spacing: 0.08em; }"
+                           "QLabel#inspectorMeta { color: #91a3b4; }"
+                           "QDoubleSpinBox, QSpinBox, QComboBox { background: #1b2430; border: 1px solid #2e3b4a; border-radius: 6px; padding: 6px; color: #edf2f7; }"
+                           "QTabWidget::pane { border: 1px solid #222c36; border-radius: 8px; }"
+                           "QTabBar::tab { background: #17202a; color: #f4f7fb; padding: 8px 12px; margin-right: 2px; }"
+                           "QTabBar::tab:selected { background: #24303c; color: #ffffff; }"));
+
+        auto* layout = new QVBoxLayout(pane);
+        layout->setContentsMargins(14, 14, 14, 14);
+        layout->setSpacing(10);
+
+        m_inspectorTabs = new QTabWidget(pane);
+        m_inspectorTabs->setObjectName(QStringLiteral("inspector.tabs"));
+
+        auto* gradingTab = new QWidget(m_inspectorTabs);
+        auto* gradingLayout = new QVBoxLayout(gradingTab);
+        gradingLayout->setContentsMargins(12, 12, 12, 12);
+        gradingLayout->setSpacing(10);
+
+        m_gradingClipLabel = new QLabel(QStringLiteral("No clip selected"), gradingTab);
+        m_gradingClipLabel->setObjectName(QStringLiteral("inspectorTitle"));
+        m_gradingPathLabel = new QLabel(QStringLiteral("Select a clip in the timeline to grade it."), gradingTab);
+        m_gradingPathLabel->setObjectName(QStringLiteral("inspectorMeta"));
+        m_gradingPathLabel->setWordWrap(true);
+        gradingLayout->addWidget(m_gradingClipLabel);
+        gradingLayout->addWidget(m_gradingPathLabel);
+
+        auto* form = new QFormLayout;
+        m_brightnessSpin = new QDoubleSpinBox(gradingTab);
+        m_brightnessSpin->setRange(-1.0, 1.0);
+        m_brightnessSpin->setSingleStep(0.05);
+        m_brightnessSpin->setDecimals(2);
+        form->addRow(QStringLiteral("Brightness"), m_brightnessSpin);
+
+        m_contrastSpin = new QDoubleSpinBox(gradingTab);
+        m_contrastSpin->setRange(0.0, 3.0);
+        m_contrastSpin->setSingleStep(0.05);
+        m_contrastSpin->setDecimals(2);
+        form->addRow(QStringLiteral("Contrast"), m_contrastSpin);
+
+        m_saturationSpin = new QDoubleSpinBox(gradingTab);
+        m_saturationSpin->setRange(0.0, 3.0);
+        m_saturationSpin->setSingleStep(0.05);
+        m_saturationSpin->setDecimals(2);
+        form->addRow(QStringLiteral("Saturation"), m_saturationSpin);
+
+        m_opacitySpin = new QDoubleSpinBox(gradingTab);
+        m_opacitySpin->setRange(0.0, 1.0);
+        m_opacitySpin->setSingleStep(0.05);
+        m_opacitySpin->setDecimals(2);
+        form->addRow(QStringLiteral("Opacity"), m_opacitySpin);
+        gradingLayout->addLayout(form);
+        gradingLayout->addStretch(1);
+
+        m_inspectorTabs->addTab(gradingTab, QStringLiteral("Grading"));
+
+        auto* videoTab = new QWidget(m_inspectorTabs);
+        auto* videoLayout = new QVBoxLayout(videoTab);
+        videoLayout->setContentsMargins(12, 12, 12, 12);
+        videoLayout->setSpacing(10);
+        m_videoInspectorClipLabel = new QLabel(QStringLiteral("Video output"), videoTab);
+        m_videoInspectorClipLabel->setObjectName(QStringLiteral("inspectorTitle"));
+        m_videoInspectorDetailsLabel = new QLabel(QStringLiteral("Configure output dimensions and format for rendering."), videoTab);
+        m_videoInspectorDetailsLabel->setObjectName(QStringLiteral("inspectorMeta"));
+        m_videoInspectorDetailsLabel->setWordWrap(true);
+        videoLayout->addWidget(m_videoInspectorClipLabel);
+        videoLayout->addWidget(m_videoInspectorDetailsLabel);
+
+        auto* videoForm = new QFormLayout;
+        m_outputWidthSpin = new QSpinBox(videoTab);
+        m_outputWidthSpin->setRange(16, 7680);
+        m_outputWidthSpin->setSingleStep(16);
+        m_outputWidthSpin->setValue(1080);
+        videoForm->addRow(QStringLiteral("Width"), m_outputWidthSpin);
+
+        m_outputHeightSpin = new QSpinBox(videoTab);
+        m_outputHeightSpin->setRange(16, 7680);
+        m_outputHeightSpin->setSingleStep(16);
+        m_outputHeightSpin->setValue(1920);
+        videoForm->addRow(QStringLiteral("Height"), m_outputHeightSpin);
+
+        m_outputFormatCombo = new QComboBox(videoTab);
+        m_outputFormatCombo->addItem(QStringLiteral("MP4 (H.264)"), QStringLiteral("mp4"));
+        m_outputFormatCombo->addItem(QStringLiteral("MOV (ProRes)"), QStringLiteral("mov"));
+        m_outputFormatCombo->addItem(QStringLiteral("MKV (FFV1)"), QStringLiteral("mkv"));
+        m_outputFormatCombo->addItem(QStringLiteral("WebM (VP9)"), QStringLiteral("webm"));
+        videoForm->addRow(QStringLiteral("Output Format"), m_outputFormatCombo);
+
+        m_videoTranslationXSpin = new QDoubleSpinBox(videoTab);
+        m_videoTranslationXSpin->setRange(-4000.0, 4000.0);
+        m_videoTranslationXSpin->setDecimals(1);
+        m_videoTranslationXSpin->setSingleStep(10.0);
+        videoForm->addRow(QStringLiteral("Translate X"), m_videoTranslationXSpin);
+
+        m_videoTranslationYSpin = new QDoubleSpinBox(videoTab);
+        m_videoTranslationYSpin->setRange(-4000.0, 4000.0);
+        m_videoTranslationYSpin->setDecimals(1);
+        m_videoTranslationYSpin->setSingleStep(10.0);
+        videoForm->addRow(QStringLiteral("Translate Y"), m_videoTranslationYSpin);
+
+        m_videoRotationSpin = new QDoubleSpinBox(videoTab);
+        m_videoRotationSpin->setRange(-3600.0, 3600.0);
+        m_videoRotationSpin->setDecimals(1);
+        m_videoRotationSpin->setSingleStep(5.0);
+        videoForm->addRow(QStringLiteral("Rotation"), m_videoRotationSpin);
+
+        m_videoScaleXSpin = new QDoubleSpinBox(videoTab);
+        m_videoScaleXSpin->setRange(-20.0, 20.0);
+        m_videoScaleXSpin->setDecimals(3);
+        m_videoScaleXSpin->setSingleStep(0.05);
+        m_videoScaleXSpin->setValue(1.0);
+        videoForm->addRow(QStringLiteral("Scale X"), m_videoScaleXSpin);
+
+        m_videoScaleYSpin = new QDoubleSpinBox(videoTab);
+        m_videoScaleYSpin->setRange(-20.0, 20.0);
+        m_videoScaleYSpin->setDecimals(3);
+        m_videoScaleYSpin->setSingleStep(0.05);
+        m_videoScaleYSpin->setValue(1.0);
+        videoForm->addRow(QStringLiteral("Scale Y"), m_videoScaleYSpin);
+
+        m_videoInterpolationCombo = new QComboBox(videoTab);
+        m_videoInterpolationCombo->addItem(QStringLiteral("Interpolated"));
+        m_videoInterpolationCombo->addItem(QStringLiteral("Sudden"));
+        videoForm->addRow(QStringLiteral("To This Keyframe"), m_videoInterpolationCombo);
+        videoLayout->addLayout(videoForm);
+
+        m_addVideoKeyframeButton = new QPushButton(QStringLiteral("Add/Update Keyframe"), videoTab);
+        videoLayout->addWidget(m_addVideoKeyframeButton, 0, Qt::AlignLeft);
+
+        m_renderButton = new QPushButton(QStringLiteral("Render"), videoTab);
+        m_renderButton->setObjectName(QStringLiteral("video.render"));
+        videoLayout->addWidget(m_renderButton, 0, Qt::AlignLeft);
+        videoLayout->addStretch(1);
+        m_inspectorTabs->addTab(videoTab, QStringLiteral("Video"));
+
+        auto* keyframesTab = new QWidget(m_inspectorTabs);
+        auto* keyframesLayout = new QVBoxLayout(keyframesTab);
+        keyframesLayout->setContentsMargins(12, 12, 12, 12);
+        keyframesLayout->setSpacing(10);
+        m_keyframesInspectorClipLabel = new QLabel(QStringLiteral("No visual clip selected"), keyframesTab);
+        m_keyframesInspectorClipLabel->setObjectName(QStringLiteral("inspectorTitle"));
+        m_keyframesInspectorDetailsLabel = new QLabel(QStringLiteral("Select a visual clip to inspect its keyframes."), keyframesTab);
+        m_keyframesInspectorDetailsLabel->setObjectName(QStringLiteral("inspectorMeta"));
+        m_keyframesInspectorDetailsLabel->setWordWrap(true);
+        keyframesLayout->addWidget(m_keyframesInspectorClipLabel);
+        keyframesLayout->addWidget(m_keyframesInspectorDetailsLabel);
+        m_keyframeModeCheckBox = new QCheckBox(QStringLiteral("Keyframe Mode"), keyframesTab);
+        m_keyframeModeCheckBox->setChecked(true);
+        keyframesLayout->addWidget(m_keyframeModeCheckBox);
+        m_videoKeyframeList = new QListWidget(keyframesTab);
+        m_videoKeyframeList->setSelectionMode(QAbstractItemView::SingleSelection);
+        keyframesLayout->addWidget(m_videoKeyframeList, 1);
+        m_removeVideoKeyframeButton = new QPushButton(QStringLiteral("Delete Keyframe"), keyframesTab);
+        keyframesLayout->addWidget(m_removeVideoKeyframeButton, 0, Qt::AlignLeft);
+        m_inspectorTabs->addTab(keyframesTab, QStringLiteral("Keyframes"));
+
+        auto* audioTab = new QWidget(m_inspectorTabs);
+        auto* audioLayout = new QVBoxLayout(audioTab);
+        audioLayout->setContentsMargins(12, 12, 12, 12);
+        audioLayout->setSpacing(10);
+        m_audioInspectorClipLabel = new QLabel(QStringLiteral("No audio clip selected"), audioTab);
+        m_audioInspectorClipLabel->setObjectName(QStringLiteral("inspectorTitle"));
+        m_audioInspectorDetailsLabel = new QLabel(QStringLiteral("Select an audio clip to inspect playback details."), audioTab);
+        m_audioInspectorDetailsLabel->setObjectName(QStringLiteral("inspectorMeta"));
+        m_audioInspectorDetailsLabel->setWordWrap(true);
+        audioLayout->addWidget(m_audioInspectorClipLabel);
+        audioLayout->addWidget(m_audioInspectorDetailsLabel);
+        audioLayout->addStretch(1);
+        m_inspectorTabs->addTab(audioTab, QStringLiteral("Audio"));
+        layout->addWidget(m_inspectorTabs, 1);
+
+        connect(m_outputWidthSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) {
+            refreshInspector();
+        });
+        connect(m_outputHeightSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) {
+            refreshInspector();
+        });
+        connect(m_outputFormatCombo, &QComboBox::currentIndexChanged, this, [this](int) {
+            refreshInspector();
+        });
+        connect(m_videoKeyframeList, &QListWidget::currentRowChanged, this, [this](int row) {
+            if (m_updatingVideoInspector) {
+                return;
+            }
+            QListWidgetItem* item = row >= 0 ? m_videoKeyframeList->item(row) : nullptr;
+            m_selectedVideoKeyframeFrame = item ? item->data(Qt::UserRole).toLongLong() : -1;
+            refreshInspector();
+        });
+        connect(m_keyframeModeCheckBox, &QCheckBox::toggled, this, [this](bool) {
+            refreshInspector();
+        });
+        connect(m_addVideoKeyframeButton, &QPushButton::clicked, this, [this]() {
+            upsertSelectedClipVideoKeyframe();
+        });
+        connect(m_removeVideoKeyframeButton, &QPushButton::clicked, this, [this]() {
+            removeSelectedClipVideoKeyframe();
+        });
+        connect(m_renderButton, &QPushButton::clicked, this, [this]() {
+            const QString extension =
+                m_outputFormatCombo ? m_outputFormatCombo->currentData().toString() : QStringLiteral("mp4");
+            const QString selectedPath = QFileDialog::getSaveFileName(
+                this,
+                QStringLiteral("Render Output"),
+                QDir(m_currentRootPath.isEmpty() ? QDir::currentPath() : m_currentRootPath)
+                    .filePath(QStringLiteral("render_output.%1").arg(extension)),
+                QStringLiteral("Video Files (*.%1)").arg(extension));
+            if (selectedPath.isEmpty()) {
+                return;
+            }
+            QMessageBox::information(
+                this,
+                QStringLiteral("Render Queued"),
+                QStringLiteral("Render settings\n\nOutput: %1\nResolution: %2x%3\nFormat: %4\nTimeline clips: %5")
+                    .arg(QDir::toNativeSeparators(selectedPath))
+                    .arg(m_outputWidthSpin ? m_outputWidthSpin->value() : 1080)
+                    .arg(m_outputHeightSpin ? m_outputHeightSpin->value() : 1920)
+                    .arg(m_outputFormatCombo ? m_outputFormatCombo->currentText() : QStringLiteral("MP4 (H.264)"))
+                    .arg(m_timeline ? m_timeline->clips().size() : 0));
+        });
         return pane;
     }
     
@@ -1965,8 +4237,183 @@ private:
         const int64_t maxFrame = m_timeline->totalFrames();
         m_seekSlider->setRange(0, static_cast<int>(qMin<int64_t>(maxFrame, INT_MAX)));
     }
+
+    void focusGradingTab() {
+        if (m_inspectorTabs) {
+            m_inspectorTabs->setCurrentIndex(0);
+        }
+    }
+
+    int selectedVideoKeyframeIndex(const TimelineClip& clip) const {
+        for (int i = 0; i < clip.transformKeyframes.size(); ++i) {
+            if (clip.transformKeyframes[i].frame == m_selectedVideoKeyframeFrame) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    int nearestVideoKeyframeIndex(const TimelineClip& clip) const {
+        if (!m_timeline || clip.transformKeyframes.isEmpty()) {
+            return -1;
+        }
+        const int64_t localFrame =
+            qBound<int64_t>(0, m_timeline->currentFrame() - clip.startFrame, qMax<int64_t>(0, clip.durationFrames - 1));
+        int nearestIndex = 0;
+        int64_t nearestDistance = std::numeric_limits<int64_t>::max();
+        for (int i = 0; i < clip.transformKeyframes.size(); ++i) {
+            const int64_t distance = std::abs(clip.transformKeyframes[i].frame - localFrame);
+            if (distance < nearestDistance) {
+                nearestDistance = distance;
+                nearestIndex = i;
+            }
+        }
+        return nearestIndex;
+    }
+
+    void applySelectedVideoKeyframeFromInspector(bool pushHistoryAfterChange = false) {
+        if (m_updatingVideoInspector || !m_timeline) {
+            return;
+        }
+
+        const QString clipId = m_timeline->selectedClipId();
+        if (clipId.isEmpty() || m_selectedVideoKeyframeFrame < 0) {
+            return;
+        }
+
+        const bool updated = m_timeline->updateClipById(clipId, [this](TimelineClip& clip) {
+            const int index = selectedVideoKeyframeIndex(clip);
+            if (index < 0) {
+                return;
+            }
+            TimelineClip::TransformKeyframe& keyframe = clip.transformKeyframes[index];
+            keyframe.translationX = m_videoTranslationXSpin->value();
+            keyframe.translationY = m_videoTranslationYSpin->value();
+            keyframe.rotation = m_videoRotationSpin->value();
+            keyframe.scaleX = m_videoScaleXSpin->value();
+            keyframe.scaleY = m_videoScaleYSpin->value();
+            keyframe.interpolated = m_videoInterpolationCombo->currentIndex() == 0;
+            normalizeClipTransformKeyframes(clip);
+        });
+
+        if (!updated) {
+            return;
+        }
+
+        m_preview->setTimelineClips(m_timeline->clips());
+        refreshInspector();
+        scheduleSaveState();
+        if (pushHistoryAfterChange) {
+            pushHistorySnapshot();
+        }
+    }
+
+    void upsertSelectedClipVideoKeyframe() {
+        if (!m_timeline) {
+            return;
+        }
+        const TimelineClip* clip = m_timeline->selectedClip();
+        if (!clip || !clipHasVisuals(*clip)) {
+            return;
+        }
+
+        const int64_t keyframeFrame =
+            qBound<int64_t>(0, m_timeline->currentFrame() - clip->startFrame, qMax<int64_t>(0, clip->durationFrames - 1));
+        m_selectedVideoKeyframeFrame = keyframeFrame;
+
+        const bool updated = m_timeline->updateClipById(clip->id, [this, keyframeFrame](TimelineClip& editableClip) {
+            TimelineClip::TransformKeyframe keyframe;
+            keyframe.frame = keyframeFrame;
+            keyframe.translationX = m_videoTranslationXSpin->value();
+            keyframe.translationY = m_videoTranslationYSpin->value();
+            keyframe.rotation = m_videoRotationSpin->value();
+            keyframe.scaleX = m_videoScaleXSpin->value();
+            keyframe.scaleY = m_videoScaleYSpin->value();
+            keyframe.interpolated = m_videoInterpolationCombo->currentIndex() == 0;
+
+            bool replaced = false;
+            for (TimelineClip::TransformKeyframe& existing : editableClip.transformKeyframes) {
+                if (existing.frame == keyframeFrame) {
+                    existing = keyframe;
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) {
+                editableClip.transformKeyframes.push_back(keyframe);
+            }
+            normalizeClipTransformKeyframes(editableClip);
+        });
+
+        if (!updated) {
+            return;
+        }
+
+        m_preview->setTimelineClips(m_timeline->clips());
+        refreshInspector();
+        scheduleSaveState();
+        pushHistorySnapshot();
+    }
+
+    void removeSelectedClipVideoKeyframe() {
+        if (!m_timeline || m_selectedVideoKeyframeFrame < 0) {
+            return;
+        }
+        const QString clipId = m_timeline->selectedClipId();
+        if (clipId.isEmpty()) {
+            return;
+        }
+
+        const bool updated = m_timeline->updateClipById(clipId, [this](TimelineClip& clip) {
+            for (int i = 0; i < clip.transformKeyframes.size(); ++i) {
+                if (clip.transformKeyframes[i].frame == m_selectedVideoKeyframeFrame) {
+                    clip.transformKeyframes.removeAt(i);
+                    break;
+                }
+            }
+            normalizeClipTransformKeyframes(clip);
+        });
+
+        if (!updated) {
+            return;
+        }
+
+        m_selectedVideoKeyframeFrame = -1;
+        m_preview->setTimelineClips(m_timeline->clips());
+        refreshInspector();
+        scheduleSaveState();
+        pushHistorySnapshot();
+    }
+
+    void applySelectedClipGradeFromInspector(bool pushHistoryAfterChange = false) {
+        if (!m_timeline) {
+            return;
+        }
+        const QString clipId = m_timeline->selectedClipId();
+        if (clipId.isEmpty()) {
+            return;
+        }
+
+        const bool updated = m_timeline->updateClipById(clipId, [this](TimelineClip& clip) {
+            clip.brightness = m_brightnessSpin->value();
+            clip.contrast = m_contrastSpin->value();
+            clip.saturation = m_saturationSpin->value();
+            clip.opacity = m_opacitySpin->value();
+        });
+
+        if (!updated) {
+            return;
+        }
+
+        m_preview->setTimelineClips(m_timeline->clips());
+        refreshInspector();
+        scheduleSaveState();
+        if (pushHistoryAfterChange) {
+            pushHistorySnapshot();
+        }
+    }
     
-    void setCurrentFrame(int64_t frame) {
+    void setCurrentFrame(int64_t frame, bool syncAudio = true) {
         const int64_t bounded = qBound<int64_t>(0, frame, m_timeline->totalFrames());
         playbackTrace(QStringLiteral("EditorWindow::setCurrentFrame"),
                       QStringLiteral("requested=%1 bounded=%2").arg(frame).arg(bounded));
@@ -1974,6 +4421,9 @@ private:
             m_lastPlayheadAdvanceMs.store(nowMs());
         }
         m_fastCurrentFrame.store(bounded);
+        if (syncAudio && m_audioEngine && m_audioEngine->hasPlayableAudio()) {
+            m_audioEngine->seek(bounded);
+        }
         m_timeline->setCurrentFrame(bounded);
         m_preview->setCurrentFrame(bounded);
         
@@ -2003,12 +4453,209 @@ private:
         const bool playing = m_playbackTimer.isActive();
         const QString state = playing ? QStringLiteral("PLAYING") : QStringLiteral("PAUSED");
         const int clipCount = m_timeline ? m_timeline->clips().size() : 0;
+        const QString activeAudio = m_preview ? m_preview->activeAudioClipLabel() : QString();
         
         m_statusBadge->setText(QStringLiteral("%1  |  %2 clips").arg(state).arg(clipCount));
-        m_previewInfo->setText(QStringLiteral("Professional pipeline with libavcodec\nBackend: %1\nSeek: %2\nDrag files from explorer to timeline")
+        if (m_preview && m_timeline) {
+            m_preview->setSelectedClipId(m_timeline->selectedClipId());
+        }
+        m_previewInfo->setText(QStringLiteral("Professional pipeline with libavcodec\nBackend: %1\nSeek: %2\nAudio: %3")
                                    .arg(m_preview ? m_preview->backendName() : QStringLiteral("unknown"))
-                                   .arg(frameToTimecode(m_timeline ? m_timeline->currentFrame() : 0)));
+                                   .arg(frameToTimecode(m_timeline ? m_timeline->currentFrame() : 0))
+                                   .arg(activeAudio.isEmpty() ? QStringLiteral("idle") : activeAudio));
         m_playButton->setText(playing ? QStringLiteral("Playing") : QStringLiteral("Play"));
+        m_audioMuteButton->setText(m_preview && m_preview->audioMuted()
+                                       ? QStringLiteral("Unmute")
+                                       : QStringLiteral("Mute"));
+        m_audioNowPlayingLabel->setText(activeAudio.isEmpty()
+                                            ? QStringLiteral("Audio idle")
+                                            : QStringLiteral("Audio  %1").arg(activeAudio));
+
+        const TimelineClip* clip = m_timeline ? m_timeline->selectedClip() : nullptr;
+        const bool enabled = clip != nullptr && clipHasVisuals(*clip);
+        m_brightnessSpin->setEnabled(enabled);
+        m_contrastSpin->setEnabled(enabled);
+        m_saturationSpin->setEnabled(enabled);
+        m_opacitySpin->setEnabled(enabled);
+        m_videoTranslationXSpin->setEnabled(enabled);
+        m_videoTranslationYSpin->setEnabled(enabled);
+        m_videoRotationSpin->setEnabled(enabled);
+        m_videoScaleXSpin->setEnabled(enabled);
+        m_videoScaleYSpin->setEnabled(enabled);
+        m_videoInterpolationCombo->setEnabled(enabled);
+        m_addVideoKeyframeButton->setEnabled(enabled);
+        m_videoKeyframeList->setEnabled(enabled);
+
+        if (!clip) {
+            m_gradingClipLabel->setText(QStringLiteral("No clip selected"));
+            m_gradingPathLabel->setText(QStringLiteral("Select a clip in the timeline to grade it live."));
+            m_videoInspectorClipLabel->setText(QStringLiteral("Video output"));
+            m_videoInspectorDetailsLabel->setText(
+                QStringLiteral("Render %1 clips at %2x%3 as %4.")
+                    .arg(m_timeline ? m_timeline->clips().size() : 0)
+                    .arg(m_outputWidthSpin ? m_outputWidthSpin->value() : 1080)
+                    .arg(m_outputHeightSpin ? m_outputHeightSpin->value() : 1920)
+                    .arg(m_outputFormatCombo ? m_outputFormatCombo->currentText() : QStringLiteral("MP4 (H.264)")));
+            m_keyframesInspectorClipLabel->setText(QStringLiteral("No visual clip selected"));
+            m_keyframesInspectorDetailsLabel->setText(QStringLiteral("Select a visual clip to inspect its keyframes."));
+            m_keyframeModeCheckBox->setEnabled(false);
+            m_audioInspectorClipLabel->setText(QStringLiteral("No audio clip selected"));
+            m_audioInspectorDetailsLabel->setText(QStringLiteral("Select an audio clip to inspect playback details."));
+            m_updatingVideoInspector = true;
+            m_videoKeyframeList->clear();
+            m_removeVideoKeyframeButton->setEnabled(false);
+            {
+                QSignalBlocker videoBlock1(m_videoTranslationXSpin);
+                QSignalBlocker videoBlock2(m_videoTranslationYSpin);
+                QSignalBlocker videoBlock3(m_videoRotationSpin);
+                QSignalBlocker videoBlock4(m_videoScaleXSpin);
+                QSignalBlocker videoBlock5(m_videoScaleYSpin);
+                QSignalBlocker videoBlock6(m_videoInterpolationCombo);
+                m_videoTranslationXSpin->setValue(0.0);
+                m_videoTranslationYSpin->setValue(0.0);
+                m_videoRotationSpin->setValue(0.0);
+                m_videoScaleXSpin->setValue(1.0);
+                m_videoScaleYSpin->setValue(1.0);
+                m_videoInterpolationCombo->setCurrentIndex(0);
+            }
+            m_updatingVideoInspector = false;
+            m_selectedVideoKeyframeFrame = -1;
+            {
+                QSignalBlocker block1(m_brightnessSpin);
+                QSignalBlocker block2(m_contrastSpin);
+                QSignalBlocker block3(m_saturationSpin);
+                QSignalBlocker block4(m_opacitySpin);
+                m_brightnessSpin->setValue(0.0);
+                m_contrastSpin->setValue(1.0);
+                m_saturationSpin->setValue(1.0);
+                m_opacitySpin->setValue(1.0);
+            }
+            return;
+        }
+
+        m_gradingClipLabel->setText(QStringLiteral("Track %1  %2").arg(clip->trackIndex + 1).arg(clip->label));
+        m_videoInspectorClipLabel->setText(QStringLiteral("Output  %1x%2")
+                                               .arg(m_outputWidthSpin ? m_outputWidthSpin->value() : 1080)
+                                               .arg(m_outputHeightSpin ? m_outputHeightSpin->value() : 1920));
+        m_videoInspectorDetailsLabel->setText(
+            QStringLiteral("Selected clip: %1\nOutput format: %2\nTimeline length: %3")
+                .arg(clip->label)
+                .arg(m_outputFormatCombo ? m_outputFormatCombo->currentText() : QStringLiteral("MP4 (H.264)"))
+                .arg(frameToTimecode(m_timeline ? m_timeline->totalFrames() : 0)));
+        m_keyframesInspectorClipLabel->setText(QStringLiteral("Keyframes  %1").arg(clip->label));
+        m_keyframeModeCheckBox->setEnabled(enabled);
+        m_updatingVideoInspector = true;
+        m_videoKeyframeList->clear();
+        if (clip->transformKeyframes.isEmpty()) {
+            m_keyframesInspectorDetailsLabel->setText(
+                QStringLiteral("Mode: %1\nNo keyframes yet at this clip.\nBase scale: %2 x %3")
+                    .arg(m_keyframeModeCheckBox->isChecked() ? QStringLiteral("Keyframing") : QStringLiteral("Base Sizing"))
+                    .arg(clip->baseScaleX, 0, 'f', 3)
+                    .arg(clip->baseScaleY, 0, 'f', 3));
+            m_selectedVideoKeyframeFrame = -1;
+        } else {
+            const int nearestIndex = nearestVideoKeyframeIndex(*clip);
+            if (selectedVideoKeyframeIndex(*clip) < 0 && nearestIndex >= 0) {
+                m_selectedVideoKeyframeFrame = clip->transformKeyframes[nearestIndex].frame;
+            }
+            const int64_t localFrame =
+                m_timeline
+                    ? qBound<int64_t>(0, m_timeline->currentFrame() - clip->startFrame, qMax<int64_t>(0, clip->durationFrames - 1))
+                    : 0;
+            m_keyframesInspectorDetailsLabel->setText(
+                QStringLiteral("Mode: %1\nCurrent clip frame: %2\nNearest keyframe: %3\nBase scale: %4 x %5")
+                    .arg(m_keyframeModeCheckBox->isChecked() ? QStringLiteral("Keyframing") : QStringLiteral("Base Sizing"))
+                    .arg(frameToTimecode(localFrame))
+                    .arg(nearestIndex >= 0 ? frameToTimecode(clip->transformKeyframes[nearestIndex].frame)
+                                           : QStringLiteral("none"))
+                    .arg(clip->baseScaleX, 0, 'f', 3)
+                    .arg(clip->baseScaleY, 0, 'f', 3));
+            for (int i = 0; i < clip->transformKeyframes.size(); ++i) {
+                const TimelineClip::TransformKeyframe& keyframe = clip->transformKeyframes[i];
+                const bool nearest = i == nearestIndex;
+                const QString label =
+                    QStringLiteral("%1%2  |  X %3 Y %4  |  R %5  |  SX %6 SY %7  |  %8")
+                        .arg(nearest ? QStringLiteral("* ") : QString())
+                        .arg(frameToTimecode(keyframe.frame))
+                        .arg(keyframe.translationX, 0, 'f', 1)
+                        .arg(keyframe.translationY, 0, 'f', 1)
+                        .arg(keyframe.rotation, 0, 'f', 1)
+                        .arg(keyframe.scaleX, 0, 'f', 3)
+                        .arg(keyframe.scaleY, 0, 'f', 3)
+                        .arg(transformInterpolationLabel(keyframe.interpolated));
+                auto* item = new QListWidgetItem(label, m_videoKeyframeList);
+                item->setData(Qt::UserRole, QVariant::fromValue(static_cast<qint64>(keyframe.frame)));
+                if (nearest) {
+                    item->setBackground(QColor(QStringLiteral("#2a3948")));
+                    item->setForeground(QColor(QStringLiteral("#ffffff")));
+                }
+            }
+        }
+        int selectedRow = -1;
+        for (int i = 0; i < m_videoKeyframeList->count(); ++i) {
+            QListWidgetItem* item = m_videoKeyframeList->item(i);
+            if (item && item->data(Qt::UserRole).toLongLong() == m_selectedVideoKeyframeFrame) {
+                selectedRow = i;
+                break;
+            }
+        }
+        if (selectedRow >= 0) {
+            m_videoKeyframeList->setCurrentRow(selectedRow);
+        }
+        const int keyframeIndex = selectedVideoKeyframeIndex(*clip);
+        m_removeVideoKeyframeButton->setEnabled(enabled && keyframeIndex >= 0);
+        {
+            QSignalBlocker videoBlock1(m_videoTranslationXSpin);
+            QSignalBlocker videoBlock2(m_videoTranslationYSpin);
+            QSignalBlocker videoBlock3(m_videoRotationSpin);
+            QSignalBlocker videoBlock4(m_videoScaleXSpin);
+            QSignalBlocker videoBlock5(m_videoScaleYSpin);
+            QSignalBlocker videoBlock6(m_videoInterpolationCombo);
+            if (keyframeIndex >= 0) {
+                const TimelineClip::TransformKeyframe& keyframe = clip->transformKeyframes[keyframeIndex];
+                m_videoTranslationXSpin->setValue(keyframe.translationX);
+                m_videoTranslationYSpin->setValue(keyframe.translationY);
+                m_videoRotationSpin->setValue(keyframe.rotation);
+                m_videoScaleXSpin->setValue(keyframe.scaleX);
+                m_videoScaleYSpin->setValue(keyframe.scaleY);
+                m_videoInterpolationCombo->setCurrentIndex(keyframe.interpolated ? 0 : 1);
+            } else {
+                m_videoTranslationXSpin->setValue(0.0);
+                m_videoTranslationYSpin->setValue(0.0);
+                m_videoRotationSpin->setValue(0.0);
+                m_videoScaleXSpin->setValue(1.0);
+                m_videoScaleYSpin->setValue(1.0);
+                m_videoInterpolationCombo->setCurrentIndex(0);
+            }
+        }
+        m_updatingVideoInspector = false;
+        if (clipHasVisuals(*clip)) {
+            m_gradingPathLabel->setText(QDir::toNativeSeparators(clip->filePath));
+        } else {
+            m_gradingPathLabel->setText(QStringLiteral("Audio clips do not use visual grading controls."));
+        }
+        if (clipIsAudioOnly(*clip)) {
+            m_audioInspectorClipLabel->setText(QStringLiteral("Track %1  %2").arg(clip->trackIndex + 1).arg(clip->label));
+            m_audioInspectorDetailsLabel->setText(
+                QStringLiteral("Path: %1\nDuration: %2\nTransport volume: %3%%\nMuted: %4")
+                    .arg(QDir::toNativeSeparators(clip->filePath))
+                    .arg(frameToTimecode(clip->durationFrames))
+                    .arg(m_preview ? m_preview->audioVolumePercent() : 0)
+                    .arg(m_preview && m_preview->audioMuted() ? QStringLiteral("yes") : QStringLiteral("no")));
+        } else {
+            m_audioInspectorClipLabel->setText(QStringLiteral("No audio clip selected"));
+            m_audioInspectorDetailsLabel->setText(QStringLiteral("Select an audio clip to inspect playback details."));
+        }
+        {
+            QSignalBlocker block1(m_brightnessSpin);
+            QSignalBlocker block2(m_contrastSpin);
+            QSignalBlocker block3(m_saturationSpin);
+            QSignalBlocker block4(m_opacitySpin);
+            m_brightnessSpin->setValue(clip->brightness);
+            m_contrastSpin->setValue(clip->contrast);
+            m_saturationSpin->setValue(clip->saturation);
+            m_opacitySpin->setValue(clip->opacity);
+        }
     }
 
     QJsonObject profilingSnapshot() const {
@@ -2040,17 +4687,53 @@ private:
     QPushButton* m_playButton = nullptr;
     QSlider* m_seekSlider = nullptr;
     QLabel* m_timecodeLabel = nullptr;
+    QToolButton* m_audioMuteButton = nullptr;
+    QSlider* m_audioVolumeSlider = nullptr;
+    QLabel* m_audioNowPlayingLabel = nullptr;
     QLabel* m_statusBadge = nullptr;
     QLabel* m_previewInfo = nullptr;
+    QTabWidget* m_inspectorTabs = nullptr;
+    QLabel* m_gradingClipLabel = nullptr;
+    QLabel* m_gradingPathLabel = nullptr;
+    QLabel* m_videoInspectorClipLabel = nullptr;
+    QLabel* m_videoInspectorDetailsLabel = nullptr;
+    QLabel* m_keyframesInspectorClipLabel = nullptr;
+    QLabel* m_keyframesInspectorDetailsLabel = nullptr;
+    QLabel* m_audioInspectorClipLabel = nullptr;
+    QLabel* m_audioInspectorDetailsLabel = nullptr;
+    QDoubleSpinBox* m_brightnessSpin = nullptr;
+    QDoubleSpinBox* m_contrastSpin = nullptr;
+    QDoubleSpinBox* m_saturationSpin = nullptr;
+    QDoubleSpinBox* m_opacitySpin = nullptr;
+    QSpinBox* m_outputWidthSpin = nullptr;
+    QSpinBox* m_outputHeightSpin = nullptr;
+    QComboBox* m_outputFormatCombo = nullptr;
+    QDoubleSpinBox* m_videoTranslationXSpin = nullptr;
+    QDoubleSpinBox* m_videoTranslationYSpin = nullptr;
+    QDoubleSpinBox* m_videoRotationSpin = nullptr;
+    QDoubleSpinBox* m_videoScaleXSpin = nullptr;
+    QDoubleSpinBox* m_videoScaleYSpin = nullptr;
+    QComboBox* m_videoInterpolationCombo = nullptr;
+    QCheckBox* m_keyframeModeCheckBox = nullptr;
+    QListWidget* m_videoKeyframeList = nullptr;
+    QPushButton* m_addVideoKeyframeButton = nullptr;
+    QPushButton* m_removeVideoKeyframeButton = nullptr;
+    QPushButton* m_renderButton = nullptr;
     std::unique_ptr<ControlServer> m_controlServer;
+    std::unique_ptr<AudioEngine> m_audioEngine;
     QTimer m_playbackTimer;
     QTimer m_mainThreadHeartbeatTimer;
     QTimer m_stateSaveTimer;
     bool m_ignoreSeekSignal = false;
     bool m_loadingState = false;
     bool m_pendingSaveAfterLoad = false;
+    bool m_restoringHistory = false;
     QString m_currentRootPath;
     QByteArray m_lastSavedState;
+    QJsonArray m_historyEntries;
+    int m_historyIndex = -1;
+    bool m_updatingVideoInspector = false;
+    int64_t m_selectedVideoKeyframeFrame = -1;
     std::atomic<qint64> m_fastCurrentFrame{0};
     std::atomic<bool> m_fastPlaybackActive{false};
     std::atomic<qint64> m_lastMainThreadHeartbeatMs{0};

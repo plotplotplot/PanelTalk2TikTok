@@ -4,6 +4,7 @@
 #include <QApplication>
 #include <QBuffer>
 #include <QCoreApplication>
+#include <QContextMenuEvent>
 #include <QEvent>
 #include <QHash>
 #include <QJsonArray>
@@ -182,7 +183,12 @@ bool sendSyntheticClick(QWidget* window, const QPoint& pos, Qt::MouseButton butt
 
     const bool pressOk = QApplication::sendEvent(target, &pressEvent);
     const bool releaseOk = QApplication::sendEvent(target, &releaseEvent);
-    return pressOk && releaseOk;
+    bool contextOk = true;
+    if (button == Qt::RightButton) {
+        QContextMenuEvent contextEvent(QContextMenuEvent::Mouse, localPos, globalPos);
+        contextOk = QApplication::sendEvent(target, &contextEvent);
+    }
+    return pressOk && releaseOk && contextOk;
 }
 
 bool sendSyntheticClick(QWidget* window, const QPoint& pos) {
@@ -435,6 +441,7 @@ private:
             const QUrlQuery query(request.url);
             int x = query.queryItemValue(QStringLiteral("x")).toInt();
             int y = query.queryItemValue(QStringLiteral("y")).toInt();
+            QString buttonName = query.queryItemValue(QStringLiteral("button"));
             if (request.method == QStringLiteral("POST")) {
                 QString error;
                 const QJsonObject body = parseJsonObject(request.body, &error);
@@ -444,21 +451,91 @@ private:
                 }
                 x = body.value(QStringLiteral("x")).toInt(x);
                 y = body.value(QStringLiteral("y")).toInt(y);
+                buttonName = body.value(QStringLiteral("button")).toString(buttonName);
             }
+            const Qt::MouseButton button = parseMouseButton(buttonName);
 
             QJsonObject result;
-            if (!invokeOnUiThread(m_window, kUiInvokeTimeoutMs, &result, [this, x, y]() {
-                    const bool clicked = sendSyntheticClick(m_window, QPoint(x, y));
+            if (!invokeOnUiThread(m_window, kUiInvokeTimeoutMs, &result, [this, x, y, button, buttonName]() {
+                    const bool clicked = sendSyntheticClick(m_window, QPoint(x, y), button);
                     return QJsonObject{
                         {QStringLiteral("ok"), clicked},
                         {QStringLiteral("x"), x},
-                        {QStringLiteral("y"), y}
+                        {QStringLiteral("y"), y},
+                        {QStringLiteral("button"), buttonName.isEmpty() ? QStringLiteral("left") : buttonName}
                     };
                 })) {
                 writeError(socket, 503, QStringLiteral("timed out waiting for click"));
                 return;
             }
             writeJson(socket, result.value(QStringLiteral("ok")).toBool() ? 200 : 500, result);
+            return;
+        }
+
+        if (request.method == QStringLiteral("GET") && request.url.path() == QStringLiteral("/menu")) {
+            QJsonObject response;
+            if (!invokeOnUiThread(m_window, kUiInvokeTimeoutMs, &response, []() {
+                    return menuSnapshot(activePopupMenu());
+                })) {
+                writeError(socket, 503, QStringLiteral("timed out waiting for menu"));
+                return;
+            }
+            writeJson(socket, response.value(QStringLiteral("ok")).toBool() ? 200 : 404, response);
+            return;
+        }
+
+        if (request.method == QStringLiteral("POST") && request.url.path() == QStringLiteral("/menu")) {
+            QString error;
+            const QJsonObject body = parseJsonObject(request.body, &error);
+            if (!error.isEmpty()) {
+                writeError(socket, 400, error);
+                return;
+            }
+            const QString text = body.value(QStringLiteral("text")).toString();
+            if (text.isEmpty()) {
+                writeError(socket, 400, QStringLiteral("missing text"));
+                return;
+            }
+
+            QJsonObject response;
+            if (!invokeOnUiThread(m_window, kUiInvokeTimeoutMs, &response, [text]() {
+                    QMenu* menu = activePopupMenu();
+                    if (!menu) {
+                        return QJsonObject{
+                            {QStringLiteral("ok"), false},
+                            {QStringLiteral("error"), QStringLiteral("no active popup menu")}
+                        };
+                    }
+
+                    for (QAction* action : menu->actions()) {
+                        if (!action || action->isSeparator()) {
+                            continue;
+                        }
+                        if (action->text() == text) {
+                            const bool enabled = action->isEnabled();
+                            if (enabled) {
+                                action->trigger();
+                            }
+                            return QJsonObject{
+                                {QStringLiteral("ok"), enabled},
+                                {QStringLiteral("text"), text},
+                                {QStringLiteral("enabled"), enabled}
+                            };
+                        }
+                    }
+
+                    return QJsonObject{
+                        {QStringLiteral("ok"), false},
+                        {QStringLiteral("error"), QStringLiteral("menu action not found")},
+                        {QStringLiteral("text"), text},
+                        {QStringLiteral("menu"), menuSnapshot(menu)}
+                    };
+                })) {
+                writeError(socket, 503, QStringLiteral("timed out waiting for menu action"));
+                return;
+            }
+
+            writeJson(socket, response.value(QStringLiteral("ok")).toBool() ? 200 : 404, response);
             return;
         }
 
