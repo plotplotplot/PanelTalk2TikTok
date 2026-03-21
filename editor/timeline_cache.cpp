@@ -3,6 +3,7 @@
 #include <QDebug>
 #include <QDateTime>
 #include <QElapsedTimer>
+#include <QFileInfo>
 #include <QHash>
 #include <QPointer>
 #include <algorithm>
@@ -38,6 +39,20 @@ void cacheTrace(const QString& stage, const QString& detail = QString()) {
                               .arg(now, 6)
                               .arg(stage)
                               .arg(detail.isEmpty() ? QString() : QStringLiteral(" | ") + detail);
+}
+
+bool isSingleFramePath(const QString& path) {
+    static const QSet<QString> suffixes = {
+        QStringLiteral("png"),
+        QStringLiteral("jpg"),
+        QStringLiteral("jpeg"),
+        QStringLiteral("bmp"),
+        QStringLiteral("gif"),
+        QStringLiteral("webp"),
+        QStringLiteral("tif"),
+        QStringLiteral("tiff")
+    };
+    return suffixes.contains(QFileInfo(path).suffix().toLower());
 }
 }
 
@@ -219,6 +234,7 @@ void TimelineCache::registerClip(const QString& id, const QString& path,
     info.path = path;
     info.startFrame = startFrame;
     info.duration = duration;
+    info.isSingleFrame = isSingleFramePath(path);
     
     m_clips[id] = info;
     m_caches[id] = new ClipCache(path, duration);
@@ -257,77 +273,85 @@ void TimelineCache::requestFrame(const QString& clipId, int64_t frameNumber,
                                  std::function<void(FrameHandle)> callback) {
     m_requests++;
     const qint64 requestedAt = cacheTraceMs();
+    const int64_t normalizedFrame = normalizeFrameNumber(clipId, frameNumber);
     
     // Check cache first
-    FrameHandle cached = getCachedFrame(clipId, frameNumber);
+    FrameHandle cached = getCachedFrame(clipId, normalizedFrame);
     if (!cached.isNull()) {
         m_hits++;
         cacheTrace(QStringLiteral("TimelineCache::requestFrame.hit"),
-                   QStringLiteral("clip=%1 frame=%2").arg(clipId).arg(frameNumber));
+                   QStringLiteral("clip=%1 frame=%2 normalized=%3")
+                       .arg(clipId)
+                       .arg(frameNumber)
+                       .arg(normalizedFrame));
         callback(cached);
         return;
     }
     cacheTrace(QStringLiteral("TimelineCache::requestFrame.miss"),
-               QStringLiteral("clip=%1 frame=%2").arg(clipId).arg(frameNumber));
+               QStringLiteral("clip=%1 frame=%2 normalized=%3")
+                   .arg(clipId)
+                   .arg(frameNumber)
+                   .arg(normalizedFrame));
 
-    const QString key = requestKey(clipId, frameNumber);
-    {
-        QMutexLocker pendingLock(&m_pendingMutex);
-        auto existing = m_pendingVisibleRequests.find(key);
-        if (existing != m_pendingVisibleRequests.end()) {
-            cacheTrace(QStringLiteral("TimelineCache::requestFrame.dedup"),
-                       QStringLiteral("clip=%1 frame=%2 listeners=%3")
-                           .arg(clipId)
-                           .arg(frameNumber)
-                           .arg(existing->callbacks.size()));
-            return;
-        }
-    }
-    
     QMutexLocker lock(&m_clipsMutex);
     auto it = m_clips.find(clipId);
     if (it == m_clips.end()) {
         cacheTrace(QStringLiteral("TimelineCache::requestFrame.missing-clip"),
-                   QStringLiteral("clip=%1 frame=%2").arg(clipId).arg(frameNumber));
+                   QStringLiteral("clip=%1 frame=%2").arg(clipId).arg(normalizedFrame));
         callback(FrameHandle());
         return;
     }
     
-    const ClipInfo& info = it.value();
+    const ClipInfo info = it.value();
     lock.unlock();
+    const int64_t canonicalFrame = normalizeFrameNumber(info, normalizedFrame);
+    const QString key = requestKey(clipId, canonicalFrame);
+
+    {
+        QMutexLocker pendingLock(&m_pendingMutex);
+        auto existing = m_pendingVisibleRequests.find(key);
+        if (existing != m_pendingVisibleRequests.end()) {
+            existing->callbacks.push_back(std::move(callback));
+            cacheTrace(QStringLiteral("TimelineCache::requestFrame.dedup"),
+                       QStringLiteral("clip=%1 frame=%2 normalized=%3 listeners=%4")
+                           .arg(clipId)
+                           .arg(frameNumber)
+                           .arg(canonicalFrame)
+                           .arg(existing->callbacks.size()));
+            return;
+        }
+
+        PendingVisibleRequest pending;
+        pending.callbacks.push_back(std::move(callback));
+        m_pendingVisibleRequests.insert(key, std::move(pending));
+        m_pendingPrefetchRequests.remove(key);
+    }
     
     // Request from decoder
     if (m_decoder) {
-        int priority = calculatePriority(frameNumber);
+        int priority = calculatePriority(canonicalFrame);
         QPointer<TimelineCache> self(this);
         const std::shared_ptr<std::atomic<bool>> aliveToken = m_aliveToken;
         cacheTrace(QStringLiteral("TimelineCache::requestFrame.dispatch"),
-                   QStringLiteral("clip=%1 frame=%2 priority=%3")
+                   QStringLiteral("clip=%1 frame=%2 normalized=%3 priority=%4")
                        .arg(clipId)
                        .arg(frameNumber)
+                       .arg(canonicalFrame)
                        .arg(priority));
-
-        {
-            QMutexLocker pendingLock(&m_pendingMutex);
-            PendingVisibleRequest pending;
-            pending.callbacks.push_back(std::move(callback));
-            m_pendingVisibleRequests.insert(key, std::move(pending));
-            m_pendingPrefetchRequests.remove(key);
-        }
         
-        m_decoder->requestFrame(info.path, frameNumber, priority, 10000,
-            [self, aliveToken, clipId, frameNumber, requestedAt, key](FrameHandle frame) {
+        m_decoder->requestFrame(info.path, canonicalFrame, priority, 10000,
+            [self, aliveToken, clipId, canonicalFrame, requestedAt, key](FrameHandle frame) {
                 if (!aliveToken->load() || !self) {
                     return;
                 }
-                QMetaObject::invokeMethod(self, [self, aliveToken, clipId, frameNumber, requestedAt, key, frame]() {
+                QMetaObject::invokeMethod(self, [self, aliveToken, clipId, canonicalFrame, requestedAt, key, frame]() {
                     if (!aliveToken->load() || !self) {
                         return;
                     }
                     if (!frame.isNull()) {
                         auto* cache = self->getOrCreateClipCache(clipId);
                         if (cache) {
-                            cache->insert(frameNumber, frame);
+                            cache->insert(canonicalFrame, frame);
                         }
                     }
 
@@ -343,7 +367,7 @@ void TimelineCache::requestFrame(const QString& clipId, int64_t frameNumber,
                     cacheTrace(QStringLiteral("TimelineCache::requestFrame.complete"),
                                QStringLiteral("clip=%1 frame=%2 null=%3 waitMs=%4")
                                    .arg(clipId)
-                                   .arg(frameNumber)
+                                   .arg(canonicalFrame)
                                    .arg(frame.isNull())
                                    .arg(cacheTraceMs() - requestedAt));
                     for (const auto& cb : callbacks) {
@@ -357,6 +381,7 @@ void TimelineCache::requestFrame(const QString& clipId, int64_t frameNumber,
 }
 
 FrameHandle TimelineCache::getCachedFrame(const QString& clipId, int64_t frameNumber) {
+    frameNumber = normalizeFrameNumber(clipId, frameNumber);
     QMutexLocker lock(&m_clipsMutex);
     
     auto it = m_caches.find(clipId);
@@ -368,6 +393,7 @@ FrameHandle TimelineCache::getCachedFrame(const QString& clipId, int64_t frameNu
 }
 
 FrameHandle TimelineCache::getBestCachedFrame(const QString& clipId, int64_t frameNumber) {
+    frameNumber = normalizeFrameNumber(clipId, frameNumber);
     QMutexLocker lock(&m_clipsMutex);
 
     auto it = m_caches.find(clipId);
@@ -379,6 +405,7 @@ FrameHandle TimelineCache::getBestCachedFrame(const QString& clipId, int64_t fra
 }
 
 bool TimelineCache::isFrameCached(const QString& clipId, int64_t frameNumber) const {
+    frameNumber = normalizeFrameNumber(clipId, frameNumber);
     QMutexLocker lock(&m_clipsMutex);
     
     auto it = m_caches.find(clipId);
@@ -430,6 +457,7 @@ int TimelineCache::pendingVisibleRequestCount() const {
 }
 
 bool TimelineCache::isVisibleRequestPending(const QString& clipId, int64_t frameNumber) const {
+    frameNumber = normalizeFrameNumber(clipId, frameNumber);
     QMutexLocker pendingLock(&m_pendingMutex);
     return m_pendingVisibleRequests.contains(requestKey(clipId, frameNumber));
 }
@@ -467,19 +495,24 @@ void TimelineCache::preloadRange(const QString& clipId, int64_t startFrame, int6
     const int kStep = 5;  // Load every 5th frame
     
     for (int64_t f = startFrame; f < endFrame; f += kStep) {
-        if (isFrameCached(clipId, f)) continue;
+        const int64_t normalizedFrame = normalizeFrameNumber(info, f);
+        if (isFrameCached(clipId, normalizedFrame)) continue;
         
-        m_decoder->requestFrame(info.path, f, 5, 30000, 
-            [this, clipId, f](FrameHandle frame) {
-                QMetaObject::invokeMethod(this, [this, clipId, f, frame]() {
+        m_decoder->requestFrame(info.path, normalizedFrame, 5, 30000, 
+            [this, clipId, normalizedFrame](FrameHandle frame) {
+                QMetaObject::invokeMethod(this, [this, clipId, normalizedFrame, frame]() {
                     if (!frame.isNull()) {
                         auto* cache = getOrCreateClipCache(clipId);
                         if (cache) {
-                            cache->insert(f, frame);
+                            cache->insert(normalizedFrame, frame);
                         }
                     }
                 }, Qt::QueuedConnection);
             });
+
+        if (info.isSingleFrame) {
+            break;
+        }
     }
 }
 
@@ -505,7 +538,7 @@ void TimelineCache::dropStaleRequestsForPlayhead(int64_t playheadFrame) {
             if (playheadFrame < info.startFrame || playheadFrame >= info.startFrame + info.duration) {
                 continue;
             }
-            activeLocalFrames.insert(it.key(), playheadFrame - info.startFrame);
+            activeLocalFrames.insert(it.key(), normalizeFrameNumber(info, playheadFrame - info.startFrame));
         }
     }
 
@@ -630,13 +663,13 @@ void TimelineCache::schedulePredictiveLoads() {
             continue;  // Clip not visible
         }
         
-        int64_t localFrame = playhead - info.startFrame;
+        int64_t localFrame = normalizeFrameNumber(info, playhead - info.startFrame);
         if (localFrame < 0 || localFrame >= info.duration) continue;
         
         // Schedule loads for upcoming frames
         int step = dir == Direction::Forward ? 1 : -1;
         for (int i = 1; i <= lookahead; ++i) {
-            int64_t targetFrame = localFrame + (i * step);
+            int64_t targetFrame = normalizeFrameNumber(info, localFrame + (i * step));
             if (targetFrame < 0 || targetFrame >= info.duration) continue;
             if (scheduledThisTick >= kMaxPrefetchPerTick) return;
             if (m_decoder->pendingRequestCount() >= kMaxPrefetchQueueDepth ||
@@ -718,6 +751,22 @@ int TimelineCache::calculatePriority(int64_t frameNumber) const {
 
 QString TimelineCache::requestKey(const QString& clipId, int64_t frameNumber) const {
     return clipId + QLatin1Char(':') + QString::number(frameNumber);
+}
+
+int64_t TimelineCache::normalizeFrameNumber(const QString& clipId, int64_t frameNumber) const {
+    QMutexLocker lock(&m_clipsMutex);
+    const auto it = m_clips.find(clipId);
+    if (it == m_clips.end()) {
+        return frameNumber;
+    }
+    return normalizeFrameNumber(it.value(), frameNumber);
+}
+
+int64_t TimelineCache::normalizeFrameNumber(const ClipInfo& info, int64_t frameNumber) const {
+    if (info.isSingleFrame) {
+        return 0;
+    }
+    return frameNumber;
 }
 
 ClipCache* TimelineCache::getOrCreateClipCache(const QString& clipId) {

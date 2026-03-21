@@ -18,6 +18,7 @@
 #include <QDropEvent>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFileIconProvider>
 #include <QFile>
 #include <QFileSystemModel>
 #include <QFormLayout>
@@ -57,6 +58,7 @@
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <QStackedLayout>
+#include <QStackedWidget>
 #include <QPointer>
 #include <QElapsedTimer>
 
@@ -82,6 +84,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/opt.h>
+#include <libswscale/swscale.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/avutil.h>
 #include <libswresample/swresample.h>
@@ -1398,6 +1401,8 @@ protected:
                 m_dragMode = PreviewDragMode::ResizeX;
             } else if (selectedInfo.bottomHandle.contains(event->position())) {
                 m_dragMode = PreviewDragMode::ResizeY;
+            } else if (selectedInfo.bounds.contains(event->position())) {
+                m_dragMode = PreviewDragMode::Move;
             }
             if (m_dragMode != PreviewDragMode::None) {
                 m_dragOriginPos = event->position();
@@ -1426,6 +1431,16 @@ protected:
     void mouseMoveEvent(QMouseEvent* event) override {
         if (m_dragMode != PreviewDragMode::None && (event->buttons() & Qt::LeftButton) &&
             !m_selectedClipId.isEmpty() && m_dragOriginBounds.width() > 1.0 && m_dragOriginBounds.height() > 1.0) {
+            if (m_dragMode == PreviewDragMode::Move) {
+                if (moveRequested) {
+                    moveRequested(m_selectedClipId,
+                                  m_dragOriginTransform.translationX + ((event->position().x() - m_dragOriginPos.x()) / m_previewZoom),
+                                  m_dragOriginTransform.translationY + ((event->position().y() - m_dragOriginPos.y()) / m_previewZoom),
+                                  false);
+                }
+                event->accept();
+                return;
+            }
             qreal scaleX = m_dragOriginTransform.scaleX;
             qreal scaleY = m_dragOriginTransform.scaleY;
             if (m_dragMode == PreviewDragMode::ResizeX || m_dragMode == PreviewDragMode::ResizeBoth) {
@@ -1464,8 +1479,12 @@ protected:
 
     void mouseReleaseEvent(QMouseEvent* event) override {
         if (event->button() == Qt::LeftButton && m_dragMode != PreviewDragMode::None) {
-            if (resizeRequested) {
-                const TimelineClip::TransformKeyframe transform = evaluateTransformForSelectedClip();
+            const TimelineClip::TransformKeyframe transform = evaluateTransformForSelectedClip();
+            if (m_dragMode == PreviewDragMode::Move) {
+                if (moveRequested) {
+                    moveRequested(m_selectedClipId, transform.translationX, transform.translationY, true);
+                }
+            } else if (resizeRequested) {
                 resizeRequested(m_selectedClipId, transform.scaleX, transform.scaleY, true);
             }
             m_dragMode = PreviewDragMode::None;
@@ -1482,8 +1501,20 @@ protected:
             QWidget::wheelEvent(event);
             return;
         }
+        const QRect baseRect = previewCanvasBaseRect();
+        const QRect oldRect = scaledCanvasRect(baseRect);
         const qreal factor = event->angleDelta().y() > 0 ? 1.1 : (1.0 / 1.1);
-        m_previewZoom = qBound<qreal>(0.25, m_previewZoom * factor, 4.0);
+        const qreal nextZoom = qBound<qreal>(0.25, m_previewZoom * factor, 4.0);
+        const QPointF anchor =
+            QPointF((event->position().x() - oldRect.left()) / qMax(1.0, static_cast<qreal>(oldRect.width())),
+                    (event->position().y() - oldRect.top()) / qMax(1.0, static_cast<qreal>(oldRect.height())));
+        m_previewZoom = nextZoom;
+        const QSizeF newSize(baseRect.width() * m_previewZoom, baseRect.height() * m_previewZoom);
+        const QPointF centeredTopLeft(baseRect.center().x() - (newSize.width() / 2.0),
+                                      baseRect.center().y() - (newSize.height() / 2.0));
+        const QPointF anchoredTopLeft(event->position().x() - (anchor.x() * newSize.width()),
+                                      event->position().y() - (anchor.y() * newSize.height()));
+        m_previewPanOffset = anchoredTopLeft - centeredTopLeft;
         scheduleRepaint();
         event->accept();
     }
@@ -1498,17 +1529,22 @@ private:
 
     enum class PreviewDragMode {
         None,
+        Move,
         ResizeX,
         ResizeY,
         ResizeBoth,
     };
 
+    QRect previewCanvasBaseRect() const {
+        return rect().adjusted(36, 36, -36, -36);
+    }
+
     QRect scaledCanvasRect(const QRect& baseRect) const {
         const QSize scaledSize(qMax(1, qRound(baseRect.width() * m_previewZoom)),
                                qMax(1, qRound(baseRect.height() * m_previewZoom)));
         const QPoint center = baseRect.center();
-        return QRect(center.x() - scaledSize.width() / 2,
-                     center.y() - scaledSize.height() / 2,
+        return QRect(qRound(center.x() - scaledSize.width() / 2.0 + m_previewPanOffset.x()),
+                     qRound(center.y() - scaledSize.height() / 2.0 + m_previewPanOffset.y()),
                      scaledSize.width(),
                      scaledSize.height());
     }
@@ -1689,7 +1725,7 @@ private:
             return;
         }
 
-        const QRect compositeRect = scaledCanvasRect(safeRect.adjusted(12, 12, -12, -12));
+        const QRect compositeRect = scaledCanvasRect(previewCanvasBaseRect());
         painter->fillRect(compositeRect, Qt::black);
         bool drewAnyFrame = false;
         bool waitingForFrame = false;
@@ -1770,8 +1806,8 @@ private:
             const QImage img = applyClipGrade(frame.cpuImage(), clip);
             const QRect fitted = fitRect(img.size(), targetRect);
             const TimelineClip::TransformKeyframe transform = evaluateClipTransformAtFrame(clip, m_currentFrame);
-            painter->translate(fitted.center().x() + transform.translationX,
-                               fitted.center().y() + transform.translationY);
+            painter->translate(fitted.center().x() + (transform.translationX * m_previewZoom),
+                               fitted.center().y() + (transform.translationY * m_previewZoom));
             painter->rotate(transform.rotation);
             painter->scale(transform.scaleX, transform.scaleY);
             const QRectF drawRect(-fitted.width() / 2.0,
@@ -1781,8 +1817,8 @@ private:
             painter->drawImage(drawRect, img);
 
             QTransform overlayTransform;
-            overlayTransform.translate(fitted.center().x() + transform.translationX,
-                                       fitted.center().y() + transform.translationY);
+            overlayTransform.translate(fitted.center().x() + (transform.translationX * m_previewZoom),
+                                       fitted.center().y() + (transform.translationY * m_previewZoom));
             overlayTransform.rotate(transform.rotation);
             overlayTransform.scale(transform.scaleX, transform.scaleY);
             const QRectF bounds = overlayTransform.mapRect(drawRect);
@@ -1985,7 +2021,7 @@ private:
                 return;
             }
             if (info.bounds.contains(position)) {
-                setCursor(Qt::ArrowCursor);
+                setCursor(m_dragMode == PreviewDragMode::Move ? Qt::ClosedHandCursor : Qt::OpenHandCursor);
                 return;
             }
         }
@@ -2010,6 +2046,7 @@ private:
     qint64 m_lastRepaintScheduleMs = 0;
     QString m_selectedClipId;
     qreal m_previewZoom = 1.0;
+    QPointF m_previewPanOffset;
     QHash<QString, PreviewOverlayInfo> m_overlayInfo;
     QVector<QString> m_paintOrder;
     PreviewDragMode m_dragMode = PreviewDragMode::None;
@@ -2020,6 +2057,7 @@ private:
 public:
     std::function<void(const QString&)> selectionRequested;
     std::function<void(const QString&, qreal, qreal, bool)> resizeRequested;
+    std::function<void(const QString&, qreal, qreal, bool)> moveRequested;
 };
 
 // ============================================================================
@@ -2248,6 +2286,7 @@ private:
     void updateHoverCursor(const QPoint& pos);
     int trackIndexAt(const QPoint& pos) const;
     int trackIndexAtY(int y, bool allowAppendTrack = false) const;
+    int trackDropTargetAtY(int y, bool* insertsTrack) const;
     int trackDividerAt(const QPoint& pos) const;
     int64_t frameFromX(qreal x) const;
     int xFromFrame(int64_t frame) const;
@@ -2263,6 +2302,7 @@ private:
     int nextTrackIndex() const;
     void normalizeTrackIndices();
     void ensureTrackCount(int count);
+    void insertTrackAt(int trackIndex);
     QString defaultTrackName(int trackIndex) const;
     int trackTop(int trackIndex) const;
     int trackHeight(int trackIndex) const;
@@ -2287,6 +2327,7 @@ private:
     int64_t m_dragOffsetFrames = 0;
     int m_draggedTrackIndex = -1;
     int m_trackDropIndex = -1;
+    bool m_trackDropInGap = false;
     int m_resizingTrackIndex = -1;
     int m_resizeOriginY = 0;
     int m_resizeOriginHeight = 0;
@@ -2304,6 +2345,7 @@ constexpr int kTimelineLabelWidth = 52;
 constexpr int kTimelineLabelGap = 12;
 constexpr int kTimelineTrackInnerPadding = 12;
 constexpr int kTimelineClipVerticalPadding = 6;
+constexpr int kTimelineTrackSpacing = 10;
 }
 
 void TimelineWidget::sortClips() {
@@ -2369,7 +2411,7 @@ int TimelineWidget::trackTop(int trackIndex) const {
     const QRect tracks = trackRect();
     int y = tracks.top() + kTimelineTrackInnerPadding;
     for (int i = 0; i < trackIndex && i < m_tracks.size(); ++i) {
-        y += trackHeight(i);
+        y += trackHeight(i) + kTimelineTrackSpacing;
     }
     return y;
 }
@@ -2404,6 +2446,46 @@ int TimelineWidget::trackIndexAtY(int y, bool allowAppendTrack) const {
     return trackCount() - 1;
 }
 
+int TimelineWidget::trackDropTargetAtY(int y, bool* insertsTrack) const {
+    if (insertsTrack) {
+        *insertsTrack = false;
+    }
+    if (m_tracks.isEmpty()) {
+        if (insertsTrack) {
+            *insertsTrack = true;
+        }
+        return 0;
+    }
+
+    const int firstTop = trackTop(0);
+    if (y < firstTop) {
+        if (insertsTrack) {
+            *insertsTrack = true;
+        }
+        return 0;
+    }
+
+    for (int i = 0; i < trackCount(); ++i) {
+        const int top = trackTop(i);
+        const int bottom = top + trackHeight(i);
+        if (y >= top && y < bottom) {
+            return i;
+        }
+        const int nextTop = (i + 1 < trackCount()) ? trackTop(i + 1) : bottom + kTimelineTrackSpacing;
+        if (y >= bottom && y < nextTop) {
+            if (insertsTrack) {
+                *insertsTrack = true;
+            }
+            return i + 1;
+        }
+    }
+
+    if (insertsTrack) {
+        *insertsTrack = true;
+    }
+    return trackCount();
+}
+
 int TimelineWidget::trackDividerAt(const QPoint& pos) const {
     const QRect tracks = trackRect();
     if (!tracks.contains(pos)) {
@@ -2424,8 +2506,29 @@ void TimelineWidget::updateMinimumTimelineHeight() {
     for (int i = 0; i < trackCount(); ++i) {
         trackAreaHeight += trackHeight(i);
     }
+    trackAreaHeight += qMax(0, trackCount() - 1) * kTimelineTrackSpacing;
     const int minimum = (kTimelineOuterMargin * 2) + kTimelineRulerHeight + kTimelineTrackGap + trackAreaHeight;
     setMinimumHeight(qMax(150, minimum));
+}
+
+void TimelineWidget::insertTrackAt(int trackIndex) {
+    const int insertAt = qBound(0, trackIndex, trackCount());
+    ensureTrackCount(trackCount());
+    for (TimelineClip& clip : m_clips) {
+        if (clip.trackIndex >= insertAt) {
+            clip.trackIndex += 1;
+        }
+    }
+    TimelineTrack track;
+    track.name = defaultTrackName(insertAt);
+    track.height = kDefaultTrackHeight;
+    m_tracks.insert(insertAt, track);
+    for (int i = insertAt + 1; i < m_tracks.size(); ++i) {
+        if (m_tracks[i].name.startsWith(QStringLiteral("Track "))) {
+            m_tracks[i].name = defaultTrackName(i);
+        }
+    }
+    updateMinimumTimelineHeight();
 }
 
 QRect TimelineWidget::drawRect() const {
@@ -2624,7 +2727,7 @@ void TimelineWidget::dragEnterEvent(QDragEnterEvent* event) {
 void TimelineWidget::dragMoveEvent(QDragMoveEvent* event) {
     if (hasFileUrls(event->mimeData())) {
         m_dropFrame = frameFromX(event->position().x());
-        m_trackDropIndex = trackIndexAtY(event->position().toPoint().y(), true);
+        m_trackDropIndex = trackDropTargetAtY(event->position().toPoint().y(), &m_trackDropInGap);
         event->acceptProposedAction();
         update();
         return;
@@ -2635,6 +2738,7 @@ void TimelineWidget::dragMoveEvent(QDragMoveEvent* event) {
 void TimelineWidget::dragLeaveEvent(QDragLeaveEvent* event) {
     m_dropFrame = -1;
     m_trackDropIndex = -1;
+    m_trackDropInGap = false;
     QWidget::dragLeaveEvent(event);
     update();
 }
@@ -2646,9 +2750,14 @@ void TimelineWidget::dropEvent(QDropEvent* event) {
     }
     
     int64_t insertFrame = frameFromX(event->position().x());
-    int targetTrack = trackIndexAtY(event->position().toPoint().y(), true);
+    bool insertsTrack = false;
+    int targetTrack = trackDropTargetAtY(event->position().toPoint().y(), &insertsTrack);
     if (targetTrack < 0) {
         targetTrack = nextTrackIndex();
+        insertsTrack = true;
+    }
+    if (insertsTrack) {
+        insertTrackAt(targetTrack);
     }
     
     for (const QUrl& url : event->mimeData()->urls()) {
@@ -2658,10 +2767,7 @@ void TimelineWidget::dropEvent(QDropEvent* event) {
         const QFileInfo info(filePath);
         if (!info.exists() || info.isDir()) continue;
         
-        if (targetTrack >= trackCount()) {
-            ensureTrackCount(targetTrack + 1);
-            updateMinimumTimelineHeight();
-        }
+        ensureTrackCount(targetTrack + 1);
         TimelineClip clip = buildClipFromFile(filePath, insertFrame, targetTrack);
         m_clips.push_back(clip);
         insertFrame += clip.durationFrames + 6;
@@ -2671,6 +2777,7 @@ void TimelineWidget::dropEvent(QDropEvent* event) {
     sortClips();
     m_dropFrame = -1;
     m_trackDropIndex = -1;
+    m_trackDropInGap = false;
     event->acceptProposedAction();
     
     if (clipsChanged) clipsChanged();
@@ -2749,7 +2856,7 @@ void TimelineWidget::mousePressEvent(QMouseEvent* event) {
 }
 
 void TimelineWidget::mouseMoveEvent(QMouseEvent* event) {
-        if (m_draggedTrackIndex >= 0 && (event->buttons() & Qt::LeftButton)) {
+    if (m_draggedTrackIndex >= 0 && (event->buttons() & Qt::LeftButton)) {
         const int proposed = qBound(0, trackIndexAtY(event->position().toPoint().y(), false), trackCount() - 1);
         if (proposed != m_trackDropIndex) {
             m_trackDropIndex = proposed;
@@ -2772,14 +2879,12 @@ void TimelineWidget::mouseMoveEvent(QMouseEvent* event) {
         if (m_dragMode == ClipDragMode::Move) {
             const int64_t newStartFrame = qMax<int64_t>(0, pointerFrame - m_dragOffsetFrames);
             clip.startFrame = newStartFrame;
-            const int proposedTrack = trackIndexAtY(event->position().toPoint().y(), true);
+            bool insertsTrack = false;
+            const int proposedTrack = trackDropTargetAtY(event->position().toPoint().y(), &insertsTrack);
             if (proposedTrack >= 0) {
-                if (proposedTrack >= trackCount()) {
-                    ensureTrackCount(proposedTrack + 1);
-                    updateMinimumTimelineHeight();
-                }
                 clip.trackIndex = proposedTrack;
                 m_trackDropIndex = proposedTrack;
+                m_trackDropInGap = insertsTrack;
             }
             m_currentFrame = newStartFrame;
         } else if (m_dragMode == ClipDragMode::TrimLeft) {
@@ -2860,15 +2965,27 @@ void TimelineWidget::mouseReleaseEvent(QMouseEvent* event) {
         }
         m_draggedTrackIndex = -1;
         m_trackDropIndex = -1;
+        m_trackDropInGap = false;
         update();
         return;
     }
     if (event->button() == Qt::LeftButton && m_draggedClipIndex >= 0) {
+        if (m_dragMode == ClipDragMode::Move && m_trackDropInGap && m_trackDropIndex >= 0) {
+            const QString movingClipId = m_clips[m_draggedClipIndex].id;
+            insertTrackAt(m_trackDropIndex);
+            for (TimelineClip& clip : m_clips) {
+                if (clip.id == movingClipId) {
+                    clip.trackIndex = m_trackDropIndex;
+                    break;
+                }
+            }
+        }
         normalizeTrackIndices();
         sortClips();
         m_draggedClipIndex = -1;
         m_dragMode = ClipDragMode::None;
         m_trackDropIndex = -1;
+        m_trackDropInGap = false;
         m_dragOffsetFrames = 0;
         m_dragOriginalStartFrame = 0;
         m_dragOriginalDurationFrames = 0;
@@ -3033,7 +3150,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
     for (int track = 0; track < trackCount(); ++track) {
         const QRect labelRect = trackLabelRect(track);
         const bool dragged = track == m_draggedTrackIndex;
-        const bool target = track == m_trackDropIndex && m_draggedTrackIndex >= 0;
+        const bool target = track == m_trackDropIndex && m_draggedTrackIndex >= 0 && !m_trackDropInGap;
         painter.setBrush(dragged ? QColor(QStringLiteral("#ff6f61"))
                                  : (target ? QColor(QStringLiteral("#32465f"))
                                            : QColor(QStringLiteral("#202a34"))));
@@ -3127,10 +3244,15 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
         painter.drawLine(x, tracks.top() + 2, x, tracks.bottom() - 2);
     }
 
-    if (m_trackDropIndex == trackCount() && (m_draggedClipIndex >= 0 || m_dropFrame >= 0)) {
-        const int bottom = trackTop(trackCount() - 1) + trackHeight(trackCount() - 1);
+    if (m_trackDropInGap && m_trackDropIndex >= 0 && (m_draggedClipIndex >= 0 || m_dropFrame >= 0)) {
+        int insertionY = trackTop(0) - (kTimelineTrackSpacing / 2);
+        if (m_trackDropIndex >= trackCount()) {
+            insertionY = trackTop(trackCount() - 1) + trackHeight(trackCount() - 1) + (kTimelineTrackSpacing / 2);
+        } else if (m_trackDropIndex > 0) {
+            insertionY = trackTop(m_trackDropIndex) - (kTimelineTrackSpacing / 2);
+        }
         painter.setPen(QPen(QColor(QStringLiteral("#f7b955")), 2, Qt::DashLine));
-        painter.drawLine(content.left() - 8, bottom + 6, tracks.right() - 10, bottom + 6);
+        painter.drawLine(content.left() - 8, insertionY, tracks.right() - 10, insertionY);
     }
     
     const int playheadX = xFromFrame(m_currentFrame);
@@ -3291,6 +3413,41 @@ protected:
         QMainWindow::closeEvent(event);
     }
 
+    bool eventFilter(QObject* watched, QEvent* event) override {
+        if (watched == (m_tree ? m_tree->viewport() : nullptr)) {
+            if (event->type() == QEvent::Leave) {
+                hideExplorerHoverPreview();
+            } else if (event->type() == QEvent::MouseMove && m_tree && m_fsModel) {
+                const auto* mouseEvent = static_cast<QMouseEvent*>(event);
+                const QModelIndex index = m_tree->indexAt(mouseEvent->pos());
+                if (!index.isValid()) {
+                    hideExplorerHoverPreview();
+                } else {
+                    const QFileInfo info = m_fsModel->fileInfo(index);
+                    if (!info.exists() || !info.isFile()) {
+                        hideExplorerHoverPreview();
+                    }
+                }
+            }
+        } else if (watched == (m_galleryList ? m_galleryList->viewport() : nullptr)) {
+            if (event->type() == QEvent::Leave) {
+                hideExplorerHoverPreview();
+            } else if (event->type() == QEvent::MouseMove && m_galleryList) {
+                const auto* mouseEvent = static_cast<QMouseEvent*>(event);
+                QListWidgetItem* item = m_galleryList->itemAt(mouseEvent->pos());
+                if (!item) {
+                    hideExplorerHoverPreview();
+                } else {
+                    const QFileInfo info(item->data(Qt::UserRole).toString());
+                    if (!info.exists() || !info.isFile()) {
+                        hideExplorerHoverPreview();
+                    }
+                }
+            }
+        }
+        return QMainWindow::eventFilter(watched, event);
+    }
+
 private slots:
     void advanceFrame() {
         if (m_audioEngine && m_audioEngine->hasPlayableAudio()) {
@@ -3330,9 +3487,15 @@ private:
     QJsonObject buildStateJson() const {
         QJsonObject root;
         root[QStringLiteral("explorerRoot")] = m_currentRootPath;
+        root[QStringLiteral("explorerGalleryPath")] = m_galleryFolderPath;
         root[QStringLiteral("currentFrame")] = static_cast<qint64>(m_timeline ? m_timeline->currentFrame() : 0);
         root[QStringLiteral("playing")] = m_playbackTimer.isActive();
         root[QStringLiteral("selectedClipId")] = m_timeline ? m_timeline->selectedClipId() : QString();
+        QJsonArray expandedFolders;
+        for (const QString& path : currentExpandedExplorerPaths()) {
+            expandedFolders.push_back(path);
+        }
+        root[QStringLiteral("explorerExpandedFolders")] = expandedFolders;
 
         QJsonArray timeline;
         if (m_timeline) {
@@ -3440,6 +3603,14 @@ private:
         m_loadingState = true;
 
         QString rootPath = root.value(QStringLiteral("explorerRoot")).toString(QDir::currentPath());
+        m_galleryFolderPath = root.value(QStringLiteral("explorerGalleryPath")).toString();
+        m_expandedExplorerPaths.clear();
+        for (const QJsonValue& value : root.value(QStringLiteral("explorerExpandedFolders")).toArray()) {
+            const QString path = value.toString();
+            if (!path.isEmpty()) {
+                m_expandedExplorerPaths.push_back(path);
+            }
+        }
         QVector<TimelineClip> loadedClips;
         const int64_t currentFrame = root.value(QStringLiteral("currentFrame")).toVariant().toLongLong();
         const QString selectedClipId = root.value(QStringLiteral("selectedClipId")).toString();
@@ -3527,6 +3698,11 @@ private:
         m_currentRootPath = QDir(resolvedPath).absolutePath();
         const QModelIndex rootIndex = m_fsModel->setRootPath(m_currentRootPath);
         m_tree->setRootIndex(rootIndex);
+        hideExplorerHoverPreview();
+        restoreExpandedExplorerPaths();
+        if (!m_galleryFolderPath.isEmpty()) {
+            setExplorerGalleryPath(m_galleryFolderPath, false);
+        }
         
         if (m_rootPathLabel) {
             m_rootPathLabel->setText(m_currentRootPath);
@@ -3536,6 +3712,225 @@ private:
             scheduleSaveState();
             pushHistorySnapshot();
         }
+    }
+
+    QStringList currentExpandedExplorerPaths() const {
+        QStringList expanded;
+        if (!m_tree || !m_fsModel) {
+            return expanded;
+        }
+        const QModelIndex rootIndex = m_tree->rootIndex();
+        std::function<void(const QModelIndex&)> collect = [&](const QModelIndex& parent) {
+            const int rowCount = m_fsModel->rowCount(parent);
+            for (int row = 0; row < rowCount; ++row) {
+                const QModelIndex child = m_fsModel->index(row, 0, parent);
+                if (!child.isValid()) {
+                    continue;
+                }
+                const QFileInfo info = m_fsModel->fileInfo(child);
+                if (!info.isDir()) {
+                    continue;
+                }
+                if (m_tree->isExpanded(child)) {
+                    expanded.push_back(info.absoluteFilePath());
+                    collect(child);
+                }
+            }
+        };
+        collect(rootIndex);
+        return expanded;
+    }
+
+    void restoreExpandedExplorerPaths() {
+        if (!m_tree || !m_fsModel) {
+            return;
+        }
+        for (const QString& path : m_expandedExplorerPaths) {
+            const QModelIndex index = m_fsModel->index(path);
+            if (index.isValid()) {
+                m_tree->expand(index);
+            }
+        }
+    }
+
+    void populateExplorerGallery(const QString& folderPath) {
+        if (!m_galleryList) {
+            return;
+        }
+        m_galleryList->clear();
+        QFileIconProvider iconProvider;
+        QDir dir(folderPath);
+        const QFileInfoList entries = dir.entryInfoList(QDir::NoDotAndDotDot | QDir::AllEntries,
+                                                        QDir::DirsFirst | QDir::Name | QDir::IgnoreCase);
+        for (const QFileInfo& info : entries) {
+            auto* item = new QListWidgetItem(iconProvider.icon(info), info.fileName(), m_galleryList);
+            item->setData(Qt::UserRole, info.absoluteFilePath());
+            item->setToolTip(QDir::toNativeSeparators(info.absoluteFilePath()));
+            if (info.isDir()) {
+                item->setText(QStringLiteral("[%1]").arg(info.fileName()));
+            }
+        }
+        if (m_galleryTitleLabel) {
+            m_galleryTitleLabel->setText(QDir::toNativeSeparators(folderPath));
+        }
+    }
+
+    void setExplorerGalleryPath(const QString& folderPath, bool saveAfterChange = true) {
+        if (!m_explorerStack || !m_galleryList) {
+            return;
+        }
+        if (folderPath.isEmpty() || !QFileInfo(folderPath).isDir()) {
+            m_galleryFolderPath.clear();
+            m_explorerStack->setCurrentIndex(0);
+            hideExplorerHoverPreview();
+            if (saveAfterChange) {
+                scheduleSaveState();
+            }
+            return;
+        }
+        m_galleryFolderPath = QDir(folderPath).absolutePath();
+        populateExplorerGallery(m_galleryFolderPath);
+        m_explorerStack->setCurrentIndex(1);
+        if (saveAfterChange) {
+            scheduleSaveState();
+            pushHistorySnapshot();
+        }
+    }
+
+    QPixmap previewPixmapForFile(const QString& filePath) const {
+        const QFileInfo info(filePath);
+        if (!info.exists() || !info.isFile()) {
+            return QPixmap();
+        }
+
+        const MediaProbeResult probe = probeMediaFile(filePath);
+        if (probe.mediaType == ClipMediaType::Image) {
+            QImage image(filePath);
+            return image.isNull() ? QPixmap() : QPixmap::fromImage(image);
+        }
+        if (probe.mediaType != ClipMediaType::Video) {
+            return QPixmap();
+        }
+
+        AVFormatContext* formatCtx = nullptr;
+        if (avformat_open_input(&formatCtx, QFile::encodeName(filePath).constData(), nullptr, nullptr) < 0) {
+            return QPixmap();
+        }
+        if (avformat_find_stream_info(formatCtx, nullptr) < 0) {
+            avformat_close_input(&formatCtx);
+            return QPixmap();
+        }
+
+        int videoStreamIndex = -1;
+        for (unsigned i = 0; i < formatCtx->nb_streams; ++i) {
+            if (formatCtx->streams[i] && formatCtx->streams[i]->codecpar &&
+                formatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                videoStreamIndex = static_cast<int>(i);
+                break;
+            }
+        }
+        if (videoStreamIndex < 0) {
+            avformat_close_input(&formatCtx);
+            return QPixmap();
+        }
+
+        AVStream* stream = formatCtx->streams[videoStreamIndex];
+        const AVCodec* decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+        if (!decoder) {
+            avformat_close_input(&formatCtx);
+            return QPixmap();
+        }
+
+        AVCodecContext* codecCtx = avcodec_alloc_context3(decoder);
+        if (!codecCtx) {
+            avformat_close_input(&formatCtx);
+            return QPixmap();
+        }
+        if (avcodec_parameters_to_context(codecCtx, stream->codecpar) < 0 ||
+            avcodec_open2(codecCtx, decoder, nullptr) < 0) {
+            avcodec_free_context(&codecCtx);
+            avformat_close_input(&formatCtx);
+            return QPixmap();
+        }
+
+        AVPacket* packet = av_packet_alloc();
+        AVFrame* frame = av_frame_alloc();
+        QPixmap pixmap;
+        auto decodeFrame = [&](AVFrame* decodedFrame) {
+            if (decodedFrame->width <= 0 || decodedFrame->height <= 0) {
+                return;
+            }
+            SwsContext* sws = sws_getContext(decodedFrame->width,
+                                             decodedFrame->height,
+                                             static_cast<AVPixelFormat>(decodedFrame->format),
+                                             decodedFrame->width,
+                                             decodedFrame->height,
+                                             AV_PIX_FMT_RGBA,
+                                             SWS_BILINEAR,
+                                             nullptr,
+                                             nullptr,
+                                             nullptr);
+            if (!sws) {
+                return;
+            }
+            QImage image(decodedFrame->width, decodedFrame->height, QImage::Format_RGBA8888);
+            uint8_t* destData[4] = { image.bits(), nullptr, nullptr, nullptr };
+            int destLinesize[4] = { static_cast<int>(image.bytesPerLine()), 0, 0, 0 };
+            sws_scale(sws,
+                      decodedFrame->data,
+                      decodedFrame->linesize,
+                      0,
+                      decodedFrame->height,
+                      destData,
+                      destLinesize);
+            sws_freeContext(sws);
+            pixmap = QPixmap::fromImage(image.copy());
+        };
+
+        while (av_read_frame(formatCtx, packet) >= 0 && pixmap.isNull()) {
+            if (packet->stream_index == videoStreamIndex && avcodec_send_packet(codecCtx, packet) >= 0) {
+                while (avcodec_receive_frame(codecCtx, frame) >= 0) {
+                    decodeFrame(frame);
+                    av_frame_unref(frame);
+                    if (!pixmap.isNull()) {
+                        break;
+                    }
+                }
+            }
+            av_packet_unref(packet);
+        }
+
+        av_frame_free(&frame);
+        av_packet_free(&packet);
+        avcodec_free_context(&codecCtx);
+        avformat_close_input(&formatCtx);
+        return pixmap;
+    }
+
+    void hideExplorerHoverPreview() {
+        if (m_explorerHoverPreview) {
+            m_explorerHoverPreview->hide();
+        }
+    }
+
+    void showExplorerHoverPreview(const QString& filePath, const QPoint& globalPos) {
+        const QPixmap source = previewPixmapForFile(filePath);
+        if (source.isNull()) {
+            hideExplorerHoverPreview();
+            return;
+        }
+        if (!m_explorerHoverPreview) {
+            m_explorerHoverPreview = new QLabel(nullptr, Qt::ToolTip);
+            m_explorerHoverPreview->setObjectName(QStringLiteral("explorerHoverPreview"));
+            m_explorerHoverPreview->setAlignment(Qt::AlignCenter);
+            m_explorerHoverPreview->setStyleSheet(
+                QStringLiteral("QLabel#explorerHoverPreview { background: #05080c; color: #edf2f7; border: 1px solid #24303c; border-radius: 10px; padding: 8px; }"));
+        }
+        const QPixmap scaled = source.scaled(QSize(280, 180), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        m_explorerHoverPreview->setPixmap(scaled);
+        m_explorerHoverPreview->resize(scaled.size() + QSize(16, 16));
+        m_explorerHoverPreview->move(globalPos + QPoint(18, 18));
+        m_explorerHoverPreview->show();
     }
     
     void chooseExplorerRoot() {
@@ -3688,6 +4083,8 @@ private:
                           "QLabel { color: #dce5ee; font-weight: 600; letter-spacing: 0.08em; }"
                           "QPushButton#folderPicker { background: transparent; border: none; color: #dce5ee; font-weight: 700; letter-spacing: 0.08em; padding: 0; text-align: left; }"
                           "QPushButton#folderPicker:hover { color: #ffffff; }"
+                          "QToolButton#explorerRefresh { background: transparent; border: 1px solid #24303c; border-radius: 8px; color: #dce5ee; padding: 4px 8px; }"
+                          "QToolButton#explorerRefresh:hover { background: #1a2330; color: #ffffff; }"
                           "QLabel#rootPath { color: #8ea0b2; font-size: 11px; letter-spacing: 0; }"
                           "QTreeView { background: transparent; border: none; color: #dbe2ea; }"
                           "QTreeView::item { padding: 4px 0; }"
@@ -3696,11 +4093,21 @@ private:
         auto* layout = new QVBoxLayout(pane);
         layout->setContentsMargins(14, 14, 14, 14);
         layout->setSpacing(10);
-        
+
+        auto* headerRow = new QHBoxLayout;
+        headerRow->setContentsMargins(0, 0, 0, 0);
+        headerRow->setSpacing(8);
         m_folderPickerButton = new QPushButton(QStringLiteral("FILES"));
         m_folderPickerButton->setObjectName(QStringLiteral("folderPicker"));
         m_folderPickerButton->setCursor(Qt::PointingHandCursor);
-        layout->addWidget(m_folderPickerButton);
+        headerRow->addWidget(m_folderPickerButton);
+        headerRow->addStretch(1);
+        m_refreshExplorerButton = new QToolButton(pane);
+        m_refreshExplorerButton->setObjectName(QStringLiteral("explorerRefresh"));
+        m_refreshExplorerButton->setText(QStringLiteral("Refresh"));
+        m_refreshExplorerButton->setCursor(Qt::PointingHandCursor);
+        headerRow->addWidget(m_refreshExplorerButton);
+        layout->addLayout(headerRow);
         
         m_rootPathLabel = new QLabel;
         m_rootPathLabel->setObjectName(QStringLiteral("rootPath"));
@@ -3721,12 +4128,46 @@ private:
         m_tree->setSelectionMode(QAbstractItemView::SingleSelection);
         m_tree->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         m_tree->setTextElideMode(Qt::ElideRight);
+        m_tree->setMouseTracking(true);
+        m_tree->viewport()->installEventFilter(this);
         m_tree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
         m_tree->hideColumn(1);
         m_tree->hideColumn(2);
         m_tree->hideColumn(3);
         m_tree->header()->setStretchLastSection(true);
-        layout->addWidget(m_tree, 1);
+
+        m_explorerStack = new QStackedWidget(pane);
+        m_explorerStack->addWidget(m_tree);
+
+        auto* galleryPage = new QWidget(m_explorerStack);
+        auto* galleryLayout = new QVBoxLayout(galleryPage);
+        galleryLayout->setContentsMargins(0, 0, 0, 0);
+        galleryLayout->setSpacing(8);
+        auto* galleryHeader = new QHBoxLayout;
+        galleryHeader->setContentsMargins(0, 0, 0, 0);
+        galleryHeader->setSpacing(8);
+        m_galleryBackButton = new QToolButton(galleryPage);
+        m_galleryBackButton->setText(QStringLiteral("Tree"));
+        m_galleryBackButton->setCursor(Qt::PointingHandCursor);
+        galleryHeader->addWidget(m_galleryBackButton);
+        m_galleryTitleLabel = new QLabel(QStringLiteral("Gallery"), galleryPage);
+        m_galleryTitleLabel->setObjectName(QStringLiteral("rootPath"));
+        m_galleryTitleLabel->setWordWrap(true);
+        galleryHeader->addWidget(m_galleryTitleLabel, 1);
+        galleryLayout->addLayout(galleryHeader);
+        m_galleryList = new QListWidget(galleryPage);
+        m_galleryList->setViewMode(QListView::IconMode);
+        m_galleryList->setResizeMode(QListView::Adjust);
+        m_galleryList->setMovement(QListView::Static);
+        m_galleryList->setSpacing(12);
+        m_galleryList->setIconSize(QSize(72, 72));
+        m_galleryList->setWordWrap(true);
+        m_galleryList->setUniformItemSizes(false);
+        m_galleryList->setMouseTracking(true);
+        m_galleryList->viewport()->installEventFilter(this);
+        galleryLayout->addWidget(m_galleryList, 1);
+        m_explorerStack->addWidget(galleryPage);
+        layout->addWidget(m_explorerStack, 1);
         
         connect(m_tree, &QTreeView::doubleClicked, this, [this](const QModelIndex& index) {
             if (!m_fsModel) return;
@@ -3735,7 +4176,105 @@ private:
                 addFileToTimeline(info.absoluteFilePath());
             }
         });
+        connect(m_tree, &QTreeView::entered, this, [this](const QModelIndex& index) {
+            if (!m_fsModel || !m_tree) {
+                return;
+            }
+            const QFileInfo info = m_fsModel->fileInfo(index);
+            if (!info.exists() || !info.isFile()) {
+                hideExplorerHoverPreview();
+                return;
+            }
+            const MediaProbeResult probe = probeMediaFile(info.absoluteFilePath());
+            if (probe.mediaType != ClipMediaType::Image && probe.mediaType != ClipMediaType::Video) {
+                hideExplorerHoverPreview();
+                return;
+            }
+            showExplorerHoverPreview(info.absoluteFilePath(),
+                                     m_tree->viewport()->mapToGlobal(m_tree->visualRect(index).bottomRight()));
+        });
+        connect(m_tree, &QAbstractItemView::viewportEntered, this, [this]() {
+            hideExplorerHoverPreview();
+        });
+        m_tree->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(m_tree, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+            if (!m_fsModel || !m_tree) {
+                return;
+            }
+            const QModelIndex index = m_tree->indexAt(pos);
+            if (!index.isValid()) {
+                return;
+            }
+            const QFileInfo info = m_fsModel->fileInfo(index);
+            if (!info.exists() || !info.isDir()) {
+                return;
+            }
+            QMenu menu(this);
+            QAction* galleryAction = menu.addAction(QStringLiteral("Open In Gallery"));
+            QAction* selected = menu.exec(m_tree->viewport()->mapToGlobal(pos));
+            if (selected == galleryAction) {
+                setExplorerGalleryPath(info.absoluteFilePath(), true);
+            }
+        });
+        connect(m_tree, &QTreeView::expanded, this, [this](const QModelIndex&) {
+            m_expandedExplorerPaths = currentExpandedExplorerPaths();
+            scheduleSaveState();
+        });
+        connect(m_tree, &QTreeView::collapsed, this, [this](const QModelIndex&) {
+            m_expandedExplorerPaths = currentExpandedExplorerPaths();
+            scheduleSaveState();
+        });
         connect(m_folderPickerButton, &QPushButton::clicked, this, [this]() { chooseExplorerRoot(); });
+        connect(m_refreshExplorerButton, &QToolButton::clicked, this, [this]() {
+            m_expandedExplorerPaths = currentExpandedExplorerPaths();
+            if (m_currentRootPath.isEmpty()) {
+                setExplorerRootPath(QDir::currentPath(), false);
+            } else {
+                setExplorerRootPath(m_currentRootPath, false);
+            }
+        });
+        connect(m_galleryBackButton, &QToolButton::clicked, this, [this]() {
+            setExplorerGalleryPath(QString(), true);
+        });
+        connect(m_galleryList, &QListWidget::itemEntered, this, [this](QListWidgetItem* item) {
+            if (!item || !m_galleryList) {
+                hideExplorerHoverPreview();
+                return;
+            }
+            const QString path = item->data(Qt::UserRole).toString();
+            const QFileInfo info(path);
+            if (!info.exists() || !info.isFile()) {
+                hideExplorerHoverPreview();
+                return;
+            }
+            const MediaProbeResult probe = probeMediaFile(path);
+            if (probe.mediaType != ClipMediaType::Image && probe.mediaType != ClipMediaType::Video) {
+                hideExplorerHoverPreview();
+                return;
+            }
+            showExplorerHoverPreview(path,
+                                     m_galleryList->viewport()->mapToGlobal(m_galleryList->visualItemRect(item).bottomRight()));
+        });
+        connect(m_galleryList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* item) {
+            if (!item) {
+                return;
+            }
+            const QString path = item->data(Qt::UserRole).toString();
+            const QFileInfo info(path);
+            if (info.isDir()) {
+                setExplorerGalleryPath(path, true);
+            } else if (info.exists() && info.isFile()) {
+                addFileToTimeline(path);
+            }
+        });
+        connect(m_galleryList, &QListWidget::itemSelectionChanged, this, [this]() {
+            if (m_galleryList && m_galleryList->selectedItems().isEmpty()) {
+                hideExplorerHoverPreview();
+            }
+        });
+        connect(m_galleryList, &QAbstractItemView::viewportEntered, this, [this]() {
+            hideExplorerHoverPreview();
+        });
         
         return pane;
     }
@@ -3969,6 +4508,50 @@ private:
                     keyframe.frame = keyframeFrame;
                     keyframe.scaleX = sanitizeScaleValue(scaleX / sanitizeScaleValue(clip.baseScaleX));
                     keyframe.scaleY = sanitizeScaleValue(scaleY / sanitizeScaleValue(clip.baseScaleY));
+                    bool replaced = false;
+                    for (TimelineClip::TransformKeyframe& existing : clip.transformKeyframes) {
+                        if (existing.frame == keyframeFrame) {
+                            existing = keyframe;
+                            replaced = true;
+                            break;
+                        }
+                    }
+                    if (!replaced) {
+                        clip.transformKeyframes.push_back(keyframe);
+                    }
+                }
+                normalizeClipTransformKeyframes(clip);
+            });
+            if (!updated) {
+                return;
+            }
+            m_preview->setTimelineClips(m_timeline->clips());
+            refreshInspector();
+            scheduleSaveState();
+            if (finalize) {
+                pushHistorySnapshot();
+            }
+        };
+        m_preview->moveRequested = [this](const QString& clipId, qreal translationX, qreal translationY, bool finalize) {
+            if (!m_timeline) {
+                return;
+            }
+            const int64_t currentFrame = m_timeline->currentFrame();
+            const bool updated = m_timeline->updateClipById(clipId, [this, currentFrame, translationX, translationY](TimelineClip& clip) {
+                if (!clipHasVisuals(clip)) {
+                    return;
+                }
+                const TimelineClip::TransformKeyframe offset = evaluateClipKeyframeOffsetAtFrame(clip, currentFrame);
+                if (m_keyframeModeCheckBox && !m_keyframeModeCheckBox->isChecked()) {
+                    clip.baseTranslationX = translationX - offset.translationX;
+                    clip.baseTranslationY = translationY - offset.translationY;
+                } else {
+                    const int64_t keyframeFrame =
+                        qBound<int64_t>(0, currentFrame - clip.startFrame, qMax<int64_t>(0, clip.durationFrames - 1));
+                    TimelineClip::TransformKeyframe keyframe = offset;
+                    keyframe.frame = keyframeFrame;
+                    keyframe.translationX = translationX - clip.baseTranslationX;
+                    keyframe.translationY = translationY - clip.baseTranslationY;
                     bool replaced = false;
                     for (TimelineClip::TransformKeyframe& existing : clip.transformKeyframes) {
                         if (existing.frame == keyframeFrame) {
@@ -4680,8 +5263,14 @@ private:
     
     QFileSystemModel* m_fsModel = nullptr;
     QTreeView* m_tree = nullptr;
+    QStackedWidget* m_explorerStack = nullptr;
+    QListWidget* m_galleryList = nullptr;
+    QLabel* m_explorerHoverPreview = nullptr;
     QPushButton* m_folderPickerButton = nullptr;
+    QToolButton* m_refreshExplorerButton = nullptr;
+    QToolButton* m_galleryBackButton = nullptr;
     QLabel* m_rootPathLabel = nullptr;
+    QLabel* m_galleryTitleLabel = nullptr;
     PreviewWindow* m_preview = nullptr;
     TimelineWidget* m_timeline = nullptr;
     QPushButton* m_playButton = nullptr;
@@ -4729,6 +5318,8 @@ private:
     bool m_pendingSaveAfterLoad = false;
     bool m_restoringHistory = false;
     QString m_currentRootPath;
+    QString m_galleryFolderPath;
+    QStringList m_expandedExplorerPaths;
     QByteArray m_lastSavedState;
     QJsonArray m_historyEntries;
     int m_historyIndex = -1;

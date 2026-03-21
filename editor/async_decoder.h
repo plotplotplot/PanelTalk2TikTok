@@ -7,6 +7,7 @@
 #include <QDateTime>
 #include <QDeadlineTimer>
 #include <QHash>
+#include <QImage>
 #include <QMutex>
 #include <QObject>
 #include <QThread>
@@ -96,6 +97,7 @@ private:
     bool initCodec();
     bool initHardwareAccel(const AVCodec* decoder);
     bool seekToKeyframe(int64_t targetFrame);
+    bool loadStillImage();
     FrameHandle convertToFrame(AVFrame* avFrame, int64_t frameNumber);
     QImage convertAVFrameToImage(AVFrame* frame);
     
@@ -115,6 +117,8 @@ private:
     bool m_streamHasAlphaTag = false;
     bool m_loggedSourceFormat = false;
     bool m_reportedAlphaMismatch = false;
+    bool m_isStillImage = false;
+    QImage m_stillImage;
     
     // Seek state
     int64_t m_lastDecodedFrame = -1;

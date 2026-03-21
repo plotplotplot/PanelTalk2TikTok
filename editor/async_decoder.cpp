@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 #include <QFileInfo>
 #include <QHash>
+#include <QImageReader>
 #include <QThread>
 #include <QThreadStorage>
 
@@ -35,6 +36,20 @@ qint64 decodeTraceMs() {
 
 QString shortPath(const QString& path) {
     return QFileInfo(path).fileName();
+}
+
+bool isStillImagePath(const QString& path) {
+    static const QSet<QString> suffixes = {
+        QStringLiteral("png"),
+        QStringLiteral("jpg"),
+        QStringLiteral("jpeg"),
+        QStringLiteral("bmp"),
+        QStringLiteral("gif"),
+        QStringLiteral("webp"),
+        QStringLiteral("tif"),
+        QStringLiteral("tiff")
+    };
+    return suffixes.contains(QFileInfo(path).suffix().toLower());
 }
 
 void decodeTrace(const QString& stage, const QString& detail = QString()) {
@@ -114,6 +129,14 @@ void DecoderContext::shutdown() {
 }
 
 bool DecoderContext::initialize() {
+    if (isStillImagePath(m_path)) {
+        if (!loadStillImage()) {
+            return false;
+        }
+        updateAccessTime();
+        return true;
+    }
+
     if (!openInput()) return false;
     if (!initCodec()) return false;
     
@@ -173,6 +196,33 @@ bool DecoderContext::openInput() {
         return false;
     }
     
+    return true;
+}
+
+bool DecoderContext::loadStillImage() {
+    QImageReader reader(m_path);
+    reader.setAutoTransform(true);
+    QImage image = reader.read();
+    if (image.isNull()) {
+        qWarning() << "Failed to load image:" << m_path << reader.errorString();
+        return false;
+    }
+
+    if (image.format() != QImage::Format_ARGB32_Premultiplied) {
+        image = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    }
+
+    m_isStillImage = true;
+    m_stillImage = image;
+    m_info.path = m_path;
+    m_info.durationFrames = 1;
+    m_info.fps = 30.0;
+    m_info.frameSize = image.size();
+    m_info.codecName = QStringLiteral("still-image");
+    m_info.hasAlpha = image.hasAlphaChannel();
+    m_info.isValid = true;
+    m_lastDecodedFrame = 0;
+    m_eof = false;
     return true;
 }
 
@@ -278,6 +328,11 @@ bool DecoderContext::initHardwareAccel(const AVCodec* decoder) {
 }
 
 FrameHandle DecoderContext::decodeFrame(int64_t frameNumber) {
+    if (m_isStillImage) {
+        updateAccessTime();
+        return FrameHandle::createCpuFrame(m_stillImage, 0, m_path);
+    }
+
     decodeTrace(QStringLiteral("DecoderContext::decodeFrame.begin"),
                 QStringLiteral("file=%1 target=%2 last=%3")
                     .arg(shortPath(m_path))
@@ -363,6 +418,11 @@ done:
 }
 
 FrameHandle DecoderContext::seekAndDecode(int64_t frameNumber) {
+    if (m_isStillImage) {
+        updateAccessTime();
+        return FrameHandle::createCpuFrame(m_stillImage, 0, m_path);
+    }
+
     const qint64 startedAt = decodeTraceMs();
     decodeTrace(QStringLiteral("DecoderContext::seekAndDecode.begin"),
                 QStringLiteral("file=%1 target=%2")

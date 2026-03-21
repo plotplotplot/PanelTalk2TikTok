@@ -148,23 +148,26 @@ private slots:
     void onMemoryPressure();
 
 private:
-    struct PendingVisibleRequest {
-        QVector<std::function<void(FrameHandle)>> callbacks;
-    };
-
-    QString requestKey(const QString& clipId, int64_t frameNumber) const;
-    void dropStaleRequestsForPlayhead(int64_t playheadFrame);
-    void schedulePredictiveLoads();
-    int calculatePriority(int64_t frameNumber) const;
-    ClipCache* getOrCreateClipCache(const QString& clipId);
-    void evictOldestFrames(size_t targetMemory);
-    
     struct ClipInfo {
         QString id;
         QString path;
         int64_t startFrame = 0;
         int64_t duration = 0;
+        bool isSingleFrame = false;
     };
+
+    struct PendingVisibleRequest {
+        QVector<std::function<void(FrameHandle)>> callbacks;
+    };
+
+    QString requestKey(const QString& clipId, int64_t frameNumber) const;
+    int64_t normalizeFrameNumber(const QString& clipId, int64_t frameNumber) const;
+    int64_t normalizeFrameNumber(const ClipInfo& info, int64_t frameNumber) const;
+    void dropStaleRequestsForPlayhead(int64_t playheadFrame);
+    void schedulePredictiveLoads();
+    int calculatePriority(int64_t frameNumber) const;
+    ClipCache* getOrCreateClipCache(const QString& clipId);
+    void evictOldestFrames(size_t targetMemory);
     
     AsyncDecoder* m_decoder = nullptr;
     MemoryBudget* m_budget = nullptr;
