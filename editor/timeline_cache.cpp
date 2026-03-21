@@ -478,8 +478,16 @@ void TimelineCache::clearCache() {
 }
 
 void TimelineCache::trimCache() {
+    const bool alreadyTrimming = m_trimInProgress.exchange(true);
+    if (alreadyTrimming) {
+        cacheTrace(QStringLiteral("TimelineCache::trimCache.skip"),
+                   QStringLiteral("reason=reentrant"));
+        return;
+    }
+
     // Evict oldest frames globally
     evictOldestFrames(m_budget ? m_budget->maxCpuMemory() / 2 : 256 * 1024 * 1024);
+    m_trimInProgress.store(false);
 }
 
 void TimelineCache::preloadRange(const QString& clipId, int64_t startFrame, int64_t endFrame) {
@@ -787,6 +795,7 @@ ClipCache* TimelineCache::getOrCreateClipCache(const QString& clipId) {
 }
 
 void TimelineCache::evictOldestFrames(size_t targetMemory) {
+    size_t releasedMemory = 0;
     QMutexLocker lock(&m_clipsMutex);
     
     struct FrameEntry {
@@ -823,11 +832,14 @@ void TimelineCache::evictOldestFrames(size_t targetMemory) {
         if (it != m_caches.end()) {
             it.value()->remove(entry.frameNumber);
             current -= entry.memory;
-            if (m_budget && entry.memory > 0) {
-                m_budget->deallocateCpu(entry.memory);
-            }
+            releasedMemory += entry.memory;
             emit frameEvicted(entry.clipId, entry.frameNumber);
         }
+    }
+
+    lock.unlock();
+    if (m_budget && releasedMemory > 0) {
+        m_budget->deallocateCpu(releasedMemory);
     }
 }
 

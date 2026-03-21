@@ -189,6 +189,7 @@ private:
     QHash<QString, PendingVisibleRequest> m_pendingVisibleRequests;
     QSet<QString> m_pendingPrefetchRequests;
     std::atomic<int> m_inflightPrefetches{0};
+    std::atomic<bool> m_trimInProgress{false};
     
     // Statistics
     std::atomic<int> m_requests{0};
