@@ -101,10 +101,13 @@ public:
         if (m_outputWorker.joinable()) {
             m_outputWorker.join();
         }
-        if (m_pcm) {
-            snd_pcm_drop(m_pcm);
-            snd_pcm_close(m_pcm);
-            m_pcm = nullptr;
+        {
+            std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
+            if (m_pcm) {
+                snd_pcm_drop(m_pcm);
+                snd_pcm_close(m_pcm);
+                m_pcm = nullptr;
+            }
         }
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_initialized = false;
@@ -159,9 +162,12 @@ public:
             std::lock_guard<std::mutex> queueLock(m_queueMutex);
             m_pcmQueue.clear();
         }
-        if (m_pcm) {
-            snd_pcm_drop(m_pcm);
-            snd_pcm_prepare(m_pcm);
+        {
+            std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
+            if (m_pcm) {
+                snd_pcm_drop(m_pcm);
+                snd_pcm_prepare(m_pcm);
+            }
         }
         m_queueCondition.notify_all();
     }
@@ -176,9 +182,12 @@ public:
             std::lock_guard<std::mutex> queueLock(m_queueMutex);
             m_pcmQueue.clear();
         }
-        if (m_pcm) {
-            snd_pcm_drop(m_pcm);
-            snd_pcm_prepare(m_pcm);
+        {
+            std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
+            if (m_pcm) {
+                snd_pcm_drop(m_pcm);
+                snd_pcm_prepare(m_pcm);
+            }
         }
         m_stateCondition.notify_all();
         m_queueCondition.notify_all();
@@ -194,8 +203,20 @@ public:
         return false;
     }
 
+    int64_t currentSample() const {
+        const int64_t submittedSample = m_audioClockSample.load(std::memory_order_acquire);
+        snd_pcm_sframes_t delayFrames = 0;
+        {
+            std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
+            if (!m_pcm || snd_pcm_delay(m_pcm, &delayFrames) < 0) {
+                return qMax<int64_t>(0, submittedSample);
+            }
+        }
+        return qMax<int64_t>(0, submittedSample - qMax<int64_t>(0, static_cast<int64_t>(delayFrames)));
+    }
+
     int64_t currentFrame() const {
-        return samplesToTimelineFrame(m_audioClockSample.load(std::memory_order_acquire));
+        return samplesToTimelineFrame(currentSample());
     }
 
 private:
@@ -217,7 +238,7 @@ private:
     }
 
     int64_t samplesToTimelineFrame(int64_t samples) const {
-        return qMax<int64_t>(0, qRound64((static_cast<double>(samples) * kTimelineFps) / m_sampleRate));
+        return qMax<int64_t>(0, static_cast<int64_t>(std::floor((static_cast<double>(samples) * kTimelineFps) / m_sampleRate)));
     }
 
     void scheduleDecodesLocked(const QVector<TimelineClip>& clips) {
@@ -553,16 +574,26 @@ private:
             const int16_t* writePtr = hadAudio ? pcmBuffer.constData() : silenceBuffer.constData();
             int framesRemaining = m_periodFrames;
             while (framesRemaining > 0 && m_running) {
-                const snd_pcm_sframes_t written = snd_pcm_writei(m_pcm, writePtr, framesRemaining);
+                snd_pcm_sframes_t written = 0;
+                {
+                    std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
+                    written = snd_pcm_writei(m_pcm, writePtr, framesRemaining);
+                }
                 if (written == -EPIPE) {
                     m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+                    std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
                     snd_pcm_prepare(m_pcm);
                     continue;
                 }
                 if (written < 0) {
-                    const int recovered = snd_pcm_recover(m_pcm, static_cast<int>(written), 1);
+                    int recovered = 0;
+                    {
+                        std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
+                        recovered = snd_pcm_recover(m_pcm, static_cast<int>(written), 1);
+                    }
                     if (recovered < 0) {
                         m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+                        std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
                         snd_pcm_prepare(m_pcm);
                     }
                     continue;
@@ -593,6 +624,7 @@ private:
     std::thread m_mixWorker;
     std::thread m_outputWorker;
     snd_pcm_t* m_pcm = nullptr;
+    mutable std::mutex m_pcmMutex;
     bool m_initialized = false;
     bool m_running = false;
     bool m_playing = false;

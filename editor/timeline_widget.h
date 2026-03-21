@@ -247,6 +247,10 @@ public:
     const RenderSyncMarker* renderSyncMarkerAtFrame(int64_t frame) const;
     bool setRenderSyncMarkerAtCurrentFrame(RenderSyncAction action);
     bool clearRenderSyncMarkerAtCurrentFrame();
+    qreal timelineZoom() const { return m_pixelsPerFrame; }
+    void setTimelineZoom(qreal pixelsPerFrame);
+    int verticalScrollOffset() const { return m_verticalScrollOffset; }
+    void setVerticalScrollOffset(int offset);
 
 protected:
     void dragEnterEvent(QDragEnterEvent* event) override;
@@ -308,6 +312,8 @@ private:
     QString defaultTrackName(int trackIndex) const;
     int trackTop(int trackIndex) const;
     int trackHeight(int trackIndex) const;
+    int totalTrackAreaHeight() const;
+    int maxVerticalScrollOffset() const;
     void updateMinimumTimelineHeight();
     QRect drawRect() const;
     QRect rulerRect() const;
@@ -335,6 +341,7 @@ private:
     int m_resizeOriginHeight = 0;
     qreal m_pixelsPerFrame = 4.0;
     int64_t m_frameOffset = 0;
+    int m_verticalScrollOffset = 0;
     int64_t m_snapIndicatorFrame = -1;
     QString m_selectedClipId;
     QVector<RenderSyncMarker> m_renderSyncMarkers;
@@ -615,7 +622,7 @@ inline QString TimelineWidget::defaultTrackName(int trackIndex) const {
 
 inline int TimelineWidget::trackTop(int trackIndex) const {
     const QRect tracks = trackRect();
-    int y = tracks.top() + kTimelineTrackInnerPadding;
+    int y = tracks.top() + kTimelineTrackInnerPadding - m_verticalScrollOffset;
     for (int i = 0; i < trackIndex && i < m_tracks.size(); ++i) {
         y += trackHeight(i) + kTimelineTrackSpacing;
     }
@@ -627,6 +634,50 @@ inline int TimelineWidget::trackHeight(int trackIndex) const {
         return qMax(kMinTrackHeight, m_tracks[trackIndex].height);
     }
     return kDefaultTrackHeight;
+}
+
+inline int TimelineWidget::totalTrackAreaHeight() const {
+    int trackAreaHeight = kTimelineTrackInnerPadding * 2;
+    for (int i = 0; i < trackCount(); ++i) {
+        trackAreaHeight += trackHeight(i);
+    }
+    trackAreaHeight += qMax(0, trackCount() - 1) * kTimelineTrackSpacing;
+    return trackAreaHeight;
+}
+
+inline int TimelineWidget::maxVerticalScrollOffset() const {
+    return qMax(0, totalTrackAreaHeight() - trackRect().height());
+}
+
+inline void TimelineWidget::setVerticalScrollOffset(int offset) {
+    const int bounded = qBound(0, offset, maxVerticalScrollOffset());
+    if (m_verticalScrollOffset == bounded) {
+        return;
+    }
+    m_verticalScrollOffset = bounded;
+    update();
+}
+
+inline void TimelineWidget::setTimelineZoom(qreal pixelsPerFrame) {
+    const QRect contentRect = timelineContentRect();
+    const int64_t fullTimelineFrames = qMax<int64_t>(1, totalFrames());
+    const qreal fitAllPixelsPerFrame =
+        contentRect.width() > 0
+            ? static_cast<qreal>(contentRect.width()) / static_cast<qreal>(fullTimelineFrames)
+            : 0.01;
+    const qreal minPixelsPerFrame = qMin<qreal>(0.25, fitAllPixelsPerFrame);
+    const qreal bounded = qBound(minPixelsPerFrame, pixelsPerFrame, 24.0);
+    if (qFuzzyCompare(m_pixelsPerFrame, bounded)) {
+        return;
+    }
+    m_pixelsPerFrame = bounded;
+    const int64_t visibleFrames = qMax<int64_t>(1, qRound(static_cast<qreal>(contentRect.width()) / m_pixelsPerFrame));
+    const int64_t maxOffset = qMax<int64_t>(0, totalFrames() - visibleFrames);
+    m_frameOffset = qBound<int64_t>(0, m_frameOffset, maxOffset);
+    if (m_pixelsPerFrame <= fitAllPixelsPerFrame + 0.0001) {
+        m_frameOffset = 0;
+    }
+    update();
 }
 
 inline int TimelineWidget::trackIndexAtY(int y, bool allowAppendTrack) const {
@@ -708,13 +759,8 @@ inline int TimelineWidget::trackDividerAt(const QPoint& pos) const {
 }
 
 inline void TimelineWidget::updateMinimumTimelineHeight() {
-    int trackAreaHeight = kTimelineTrackInnerPadding * 2;
-    for (int i = 0; i < trackCount(); ++i) {
-        trackAreaHeight += trackHeight(i);
-    }
-    trackAreaHeight += qMax(0, trackCount() - 1) * kTimelineTrackSpacing;
-    const int minimum = (kTimelineOuterMargin * 2) + kTimelineRulerHeight + kTimelineTrackGap + trackAreaHeight;
-    setMinimumHeight(qMax(150, minimum));
+    setMinimumHeight(150);
+    m_verticalScrollOffset = qBound(0, m_verticalScrollOffset, maxVerticalScrollOffset());
 }
 
 inline void TimelineWidget::insertTrackAt(int trackIndex) {
@@ -1373,7 +1419,28 @@ inline void TimelineWidget::wheelEvent(QWheelEvent* event) {
         return;
     }
     
-    if (event->modifiers() & Qt::ControlModifier) {
+    if (event->modifiers() & Qt::AltModifier) {
+        const qreal zoomFactor = steps > 0 ? 1.12 : (1.0 / 1.12);
+        bool changed = false;
+        for (TimelineTrack& track : m_tracks) {
+            const int oldHeight = track.height;
+            track.height = qBound(kMinTrackHeight,
+                                  qRound(track.height * std::pow(zoomFactor, std::abs(steps))),
+                                  240);
+            changed = changed || track.height != oldHeight;
+        }
+        if (changed) {
+            updateMinimumTimelineHeight();
+            if (clipsChanged) {
+                clipsChanged();
+            }
+            update();
+        }
+        event->accept();
+        return;
+    }
+
+    if (event->modifiers() & Qt::ShiftModifier) {
         const int visibleFrames = qMax(1, static_cast<int>(width() / m_pixelsPerFrame));
         const int panFrames = qMax(1, visibleFrames / 12);
         m_frameOffset = qMax<int64_t>(0, m_frameOffset - steps * panFrames);
@@ -1381,34 +1448,43 @@ inline void TimelineWidget::wheelEvent(QWheelEvent* event) {
         event->accept();
         return;
     }
-    
-    const qreal oldPixelsPerFrame = m_pixelsPerFrame;
-    const qreal cursorFrame = frameFromX(event->position().x());
-    const qreal zoomFactor = steps > 0 ? 1.15 : (1.0 / 1.15);
-    const QRect contentRect = timelineContentRect();
-    const int64_t fullTimelineFrames = qMax<int64_t>(1, totalFrames());
-    const qreal fitAllPixelsPerFrame =
-        contentRect.width() > 0
-            ? static_cast<qreal>(contentRect.width()) / static_cast<qreal>(fullTimelineFrames)
-            : 0.01;
-    const qreal minPixelsPerFrame = qMin<qreal>(0.25, fitAllPixelsPerFrame);
-    m_pixelsPerFrame = qBound(minPixelsPerFrame, m_pixelsPerFrame * std::pow(zoomFactor, std::abs(steps)), 24.0);
-    
-    const qreal localX = event->position().x() - 16.0;
-    if (m_pixelsPerFrame > 0.0) {
-        const qreal newOffset = cursorFrame - qMax<qreal>(0.0, localX) / m_pixelsPerFrame;
-        const int64_t visibleFrames = qMax<int64_t>(1, qRound(static_cast<qreal>(contentRect.width()) / m_pixelsPerFrame));
-        const int64_t maxOffset = qMax<int64_t>(0, totalFrames() - visibleFrames);
-        m_frameOffset = qBound<int64_t>(0, static_cast<int64_t>(qRound(newOffset)), maxOffset);
+
+    const bool overTrackLabels = trackRect().contains(event->position().toPoint()) &&
+                                 !timelineContentRect().contains(event->position().toPoint());
+
+    if ((event->modifiers() & Qt::ControlModifier) || !overTrackLabels) {
+        const qreal oldPixelsPerFrame = m_pixelsPerFrame;
+        const qreal cursorFrame = frameFromX(event->position().x());
+        const qreal zoomFactor = steps > 0 ? 1.15 : (1.0 / 1.15);
+        const QRect contentRect = timelineContentRect();
+        const int64_t fullTimelineFrames = qMax<int64_t>(1, totalFrames());
+        const qreal fitAllPixelsPerFrame =
+            contentRect.width() > 0
+                ? static_cast<qreal>(contentRect.width()) / static_cast<qreal>(fullTimelineFrames)
+                : 0.01;
+        const qreal minPixelsPerFrame = qMin<qreal>(0.25, fitAllPixelsPerFrame);
+        m_pixelsPerFrame = qBound(minPixelsPerFrame, m_pixelsPerFrame * std::pow(zoomFactor, std::abs(steps)), 24.0);
+
+        const qreal localX = event->position().x() - static_cast<qreal>(contentRect.left());
+        if (m_pixelsPerFrame > 0.0) {
+            const qreal newOffset = cursorFrame - qMax<qreal>(0.0, localX) / m_pixelsPerFrame;
+            const int64_t visibleFrames = qMax<int64_t>(1, qRound(static_cast<qreal>(contentRect.width()) / m_pixelsPerFrame));
+            const int64_t maxOffset = qMax<int64_t>(0, totalFrames() - visibleFrames);
+            m_frameOffset = qBound<int64_t>(0, static_cast<int64_t>(qRound(newOffset)), maxOffset);
+        }
+
+        if (m_pixelsPerFrame <= fitAllPixelsPerFrame + 0.0001) {
+            m_frameOffset = 0;
+        }
+
+        if (!qFuzzyCompare(oldPixelsPerFrame, m_pixelsPerFrame)) {
+            update();
+        }
+        event->accept();
+        return;
     }
 
-    if (m_pixelsPerFrame <= fitAllPixelsPerFrame + 0.0001) {
-        m_frameOffset = 0;
-    }
-    
-    if (!qFuzzyCompare(oldPixelsPerFrame, m_pixelsPerFrame)) {
-        update();
-    }
+    setVerticalScrollOffset(m_verticalScrollOffset - (steps * 36));
     event->accept();
 }
 

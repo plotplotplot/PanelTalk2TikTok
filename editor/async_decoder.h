@@ -26,6 +26,7 @@ struct AVFrame;
 struct AVPacket;
 struct AVBufferRef;
 struct AVCodecHWConfig;
+struct SwsContext;
 // AVPixelFormat is an enum - we store it as int in the header
 }
 
@@ -116,9 +117,15 @@ private:
     int m_swPixFmt = -1;  // AV_PIX_FMT_NONE stored as int
     bool m_streamHasAlphaTag = false;
     bool m_loggedSourceFormat = false;
+    bool m_loggedAlphaProbe = false;
     bool m_reportedAlphaMismatch = false;
     bool m_isStillImage = false;
     QImage m_stillImage;
+    SwsContext* m_swsCtx = nullptr;
+    AVFrame* m_convertFrame = nullptr;
+    int m_swsSourceFormat = -1;
+    QSize m_swsSourceSize;
+    QSize m_convertFrameSize;
     
     // Seek state
     int64_t m_lastDecodedFrame = -1;
@@ -229,7 +236,7 @@ public:
     void preloadFile(const QString& path);
     
     // Statistics
-    int pendingRequestCount() const { return m_queue.size(); }
+    int pendingRequestCount() const { return totalPendingRequests(); }
     int workerCount() const { return m_workers.size(); }
     
     // Memory budget access
@@ -243,9 +250,12 @@ signals:
 private:
     void setupTrimCallback();
     void trimCaches();
+    int totalPendingRequests() const;
+    int queueIndexForPath(const QString& path) const;
+    DecodeQueue* queueForPath(const QString& path) const;
     
-    DecodeQueue m_queue;
     MemoryBudget* m_budget = nullptr;
+    QVector<DecodeQueue*> m_queues;
     QVector<DecoderWorker*> m_workers;
     std::atomic<uint64_t> m_nextSequenceId{1};
     

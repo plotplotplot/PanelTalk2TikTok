@@ -24,6 +24,8 @@ extern "C" {
 namespace editor {
 
 namespace {
+constexpr int64_t kMaxSequentialDecodeGap = 90;
+
 qint64 decodeTraceMs() {
     static QElapsedTimer timer;
     static bool started = false;
@@ -96,6 +98,24 @@ static AVPixelFormat get_hw_format(AVCodecContext* ctx, const AVPixelFormat* pix
     return pix_fmts[0];
 }
 
+// get_alpha_compatible_format - Select a pixel format that supports alpha
+// when the stream is tagged with alpha_mode. This is needed for VP8/VP9
+// streams where the default decoder output (yuv420p) doesn't have alpha.
+static AVPixelFormat get_alpha_compatible_format(AVCodecContext* ctx, const AVPixelFormat* pix_fmts) {
+    Q_UNUSED(ctx)
+    
+    // First, try to find a format with alpha support
+    for (const AVPixelFormat* p = pix_fmts; *p != -1; p++) {
+        const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(*p);
+        if (desc && (desc->flags & AV_PIX_FMT_FLAG_ALPHA)) {
+            return *p;
+        }
+    }
+    
+    // Fall back to the first available format
+    return pix_fmts[0];
+}
+
 static int64_t ptsToFrameNumber(int64_t pts, const AVRational& timeBase, double fps) {
     if (pts == AV_NOPTS_VALUE || fps <= 0.0) {
         return -1;
@@ -124,8 +144,18 @@ void DecoderContext::shutdown() {
     if (m_hwDeviceCtx) {
         av_buffer_unref(&m_hwDeviceCtx);
     }
+    if (m_swsCtx) {
+        sws_freeContext(m_swsCtx);
+        m_swsCtx = nullptr;
+    }
+    if (m_convertFrame) {
+        av_frame_free(&m_convertFrame);
+    }
     m_hwDeviceCtx = nullptr;
     m_hwPixFmt = AV_PIX_FMT_NONE;
+    m_swsSourceFormat = AV_PIX_FMT_NONE;
+    m_swsSourceSize = QSize();
+    m_convertFrameSize = QSize();
 }
 
 bool DecoderContext::initialize() {
@@ -267,6 +297,13 @@ bool DecoderContext::initCodec() {
     // Hardware decode is disabled for now.
     // The current worker-thread startup path is not robust across driver stacks.
     
+    // For alpha-tagged streams, request a pixel format that supports alpha.
+    // This is necessary because some decoders (e.g., VP8/VP9) default to
+    // non-alpha formats like yuv420p even when the stream contains alpha.
+    if (m_streamHasAlphaTag) {
+        m_codecCtx->get_format = get_alpha_compatible_format;
+    }
+    
     ret = avcodec_open2(m_codecCtx, decoder, nullptr);
     if (ret < 0) {
         qWarning() << "Failed to open codec:" << avErrToString(ret);
@@ -345,8 +382,8 @@ FrameHandle DecoderContext::decodeFrame(int64_t frameNumber) {
     updateAccessTime();
     
     // For accurate seeking, we need to seek if we're too far ahead or behind
-    int64_t frameDelta = frameNumber - m_lastDecodedFrame;
-    if (frameDelta < 0 || frameDelta > 30) {
+    const int64_t frameDelta = frameNumber - m_lastDecodedFrame;
+    if (m_lastDecodedFrame < 0 || frameDelta < 0 || frameDelta > kMaxSequentialDecodeGap) {
         decodeTrace(QStringLiteral("DecoderContext::decodeFrame.seek"),
                     QStringLiteral("file=%1 target=%2 delta=%3")
                         .arg(shortPath(m_path))
@@ -491,12 +528,17 @@ done:
 bool DecoderContext::seekToKeyframe(int64_t targetFrame) {
     AVStream* stream = m_formatCtx->streams[m_videoStreamIndex];
     
-    // Convert frame number into the video stream's time base.
-    AVRational frameBase{1, static_cast<int>(qMax(1.0, m_info.fps))};
-    int64_t targetTs = av_rescale_q(targetFrame, frameBase, stream->time_base);
+    const double targetSeconds = targetFrame / qMax(1.0, m_info.fps);
+    const int64_t targetUsec = qMax<int64_t>(0, qRound64(targetSeconds * AV_TIME_BASE));
+    const int64_t targetTs = av_rescale_q(targetUsec, AVRational{1, AV_TIME_BASE}, stream->time_base);
     
-    // Seek to nearest keyframe before target
-    int ret = av_seek_frame(m_formatCtx, m_videoStreamIndex, targetTs, AVSEEK_FLAG_BACKWARD);
+    // Seek to the nearest decodable position at or before the target.
+    const int ret = avformat_seek_file(m_formatCtx,
+                                       m_videoStreamIndex,
+                                       std::numeric_limits<int64_t>::min(),
+                                       targetTs,
+                                       targetTs,
+                                       AVSEEK_FLAG_BACKWARD);
     if (ret < 0) {
         qWarning() << "Seek failed:" << avErrToString(ret);
         return false;
@@ -514,8 +556,6 @@ FrameHandle DecoderContext::convertToFrame(AVFrame* avFrame, int64_t frameNumber
         return FrameHandle();
     }
 
-    // QPainter's alpha compositing path is most stable with premultiplied Qt
-    // image formats. Normalize decoded video frames before caching them.
     if (image.format() != QImage::Format_ARGB32_Premultiplied) {
         image = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
     }
@@ -560,75 +600,120 @@ QImage DecoderContext::convertAVFrameToImage(AVFrame* frame) {
                         .arg(swFrame->linesize[3]));
     }
 
-    if (m_streamHasAlphaTag && !sourceHasAlpha) {
-        if (!m_reportedAlphaMismatch) {
-            m_reportedAlphaMismatch = true;
-            qWarning().noquote() << QStringLiteral(
-                "Alpha-tagged stream is decoding without alpha-capable pixel format; refusing frame conversion for %1 (fmt=%2)")
-                .arg(shortPath(m_path))
-                .arg(sourceDesc ? QString::fromUtf8(sourceDesc->name) : QStringLiteral("unknown"));
-        }
-        if (tempFrame) {
-            av_frame_free(&tempFrame);
-        }
-        return QImage();
+    // Note: We used to reject frames here when m_streamHasAlphaTag && !sourceHasAlpha,
+    // but this caused transparent WebM files to fail decoding. The get_alpha_compatible_format
+    // callback (set in initCodec) now requests alpha-capable formats from the decoder.
+    // If we still get a non-alpha format, we proceed anyway as the alpha data may still
+    // be present in the frame (e.g., VP8/VP9 with alpha in a separate plane).
+    if (m_streamHasAlphaTag && !sourceHasAlpha && !m_reportedAlphaMismatch) {
+        m_reportedAlphaMismatch = true;
+        qWarning().noquote() << QStringLiteral(
+            "Alpha-tagged stream is decoding without alpha-capable pixel format; attempting conversion anyway for %1 (fmt=%2)")
+            .arg(shortPath(m_path))
+            .arg(sourceDesc ? QString::fromUtf8(sourceDesc->name) : QStringLiteral("unknown"));
     }
 
-    SwsContext* swsCtx = sws_getContext(
-        swFrame->width, swFrame->height, sourceFormat,
-        swFrame->width, swFrame->height, AV_PIX_FMT_RGBA,
-        SWS_BILINEAR, nullptr, nullptr, nullptr
-    );
-    
-    if (!swsCtx) {
+    if (!m_swsCtx ||
+        m_swsSourceFormat != sourceFormat ||
+        m_swsSourceSize.width() != swFrame->width ||
+        m_swsSourceSize.height() != swFrame->height) {
+        m_swsCtx = sws_getCachedContext(m_swsCtx,
+                                        swFrame->width,
+                                        swFrame->height,
+                                        sourceFormat,
+                                        swFrame->width,
+                                        swFrame->height,
+                                        AV_PIX_FMT_RGBA,
+                                        SWS_BILINEAR,
+                                        nullptr,
+                                        nullptr,
+                                        nullptr);
+        m_swsSourceFormat = sourceFormat;
+        m_swsSourceSize = QSize(swFrame->width, swFrame->height);
+    }
+
+    if (!m_swsCtx) {
         if (tempFrame) av_frame_free(&tempFrame);
         return QImage();
     }
     
-    QImage image(swFrame->width, swFrame->height, QImage::Format_RGBA8888);
-    if (image.isNull()) {
-        sws_freeContext(swsCtx);
+    if (!m_convertFrame ||
+        m_convertFrameSize.width() != swFrame->width ||
+        m_convertFrameSize.height() != swFrame->height ||
+        m_convertFrame->format != AV_PIX_FMT_RGBA) {
+        if (m_convertFrame) {
+            av_frame_free(&m_convertFrame);
+        }
+        m_convertFrame = av_frame_alloc();
+        if (!m_convertFrame) {
+            if (tempFrame) av_frame_free(&tempFrame);
+            return QImage();
+        }
+        m_convertFrame->format = AV_PIX_FMT_RGBA;
+        m_convertFrame->width = swFrame->width;
+        m_convertFrame->height = swFrame->height;
+        if (av_frame_get_buffer(m_convertFrame, 32) < 0) {
+            av_frame_free(&m_convertFrame);
+            if (tempFrame) av_frame_free(&tempFrame);
+            return QImage();
+        }
+        m_convertFrameSize = QSize(swFrame->width, swFrame->height);
+    }
+
+    if (av_frame_make_writable(m_convertFrame) < 0) {
         if (tempFrame) av_frame_free(&tempFrame);
         return QImage();
     }
 
-    AVFrame* rgbaFrame = av_frame_alloc();
-    if (!rgbaFrame) {
-        sws_freeContext(swsCtx);
-        if (tempFrame) av_frame_free(&tempFrame);
-        return QImage();
-    }
-
-    rgbaFrame->format = AV_PIX_FMT_RGBA;
-    rgbaFrame->width = swFrame->width;
-    rgbaFrame->height = swFrame->height;
-    if (av_frame_get_buffer(rgbaFrame, 0) < 0) {
-        av_frame_free(&rgbaFrame);
-        sws_freeContext(swsCtx);
-        if (tempFrame) av_frame_free(&tempFrame);
-        return QImage();
-    }
-
-    if (sws_scale(swsCtx,
+    if (sws_scale(m_swsCtx,
                   swFrame->data,
                   swFrame->linesize,
                   0,
                   swFrame->height,
-                  rgbaFrame->data,
-                  rgbaFrame->linesize) <= 0) {
-        av_frame_free(&rgbaFrame);
-        sws_freeContext(swsCtx);
+                  m_convertFrame->data,
+                  m_convertFrame->linesize) <= 0) {
         if (tempFrame) av_frame_free(&tempFrame);
         return QImage();
     }
 
-    const int copyBytesPerRow = qMin(image.bytesPerLine(), rgbaFrame->linesize[0]);
-    for (int y = 0; y < swFrame->height; ++y) {
-        memcpy(image.scanLine(y), rgbaFrame->data[0] + (y * rgbaFrame->linesize[0]), copyBytesPerRow);
+    QImage image(swFrame->width, swFrame->height, QImage::Format_RGBA8888);
+    if (image.isNull()) {
+        if (tempFrame) av_frame_free(&tempFrame);
+        return QImage();
     }
 
-    av_frame_free(&rgbaFrame);
-    sws_freeContext(swsCtx);
+    const int copyBytesPerRow = qMin(static_cast<int>(image.bytesPerLine()), m_convertFrame->linesize[0]);
+    for (int y = 0; y < swFrame->height; ++y) {
+        memcpy(image.scanLine(y), m_convertFrame->data[0] + (y * m_convertFrame->linesize[0]), copyBytesPerRow);
+    }
+
+    if (m_streamHasAlphaTag && !m_loggedAlphaProbe && !image.isNull()) {
+        m_loggedAlphaProbe = true;
+        const auto samplePixel = [&image](int x, int y) {
+            const int sx = qBound(0, x, image.width() - 1);
+            const int sy = qBound(0, y, image.height() - 1);
+            const uchar* px = image.constScanLine(sy) + (sx * 4);
+            return QStringLiteral("(%1,%2)=[r=%3 g=%4 b=%5 a=%6]")
+                .arg(sx)
+                .arg(sy)
+                .arg(px[0])
+                .arg(px[1])
+                .arg(px[2])
+                .arg(px[3]);
+        };
+
+        qDebug().noquote() << QStringLiteral(
+            "[ALPHA] file=%1 size=%2x%3 samples: %4 %5 %6 %7 %8")
+            .arg(shortPath(m_path))
+            .arg(image.width())
+            .arg(image.height())
+            .arg(samplePixel(0, 0))
+            .arg(samplePixel(image.width() / 2, image.height() / 2))
+            .arg(samplePixel(image.width() - 1, 0))
+            .arg(samplePixel(0, image.height() - 1))
+            .arg(samplePixel(image.width() - 1, image.height() - 1));
+        }
+
     if (tempFrame) av_frame_free(&tempFrame);
     
     return image;
@@ -936,13 +1021,18 @@ AsyncDecoder::~AsyncDecoder() {
 }
 
 bool AsyncDecoder::initialize() {
-    // A single worker preserves decoder context locality for timeline playback.
-    // With multiple workers, sequential frame requests for one clip bounce across
-    // independent FFmpeg contexts and degrade into repeated seek-heavy decoding.
-    const int workerCount = 1;
+    if (!m_workers.isEmpty()) {
+        return true;
+    }
+
+    // Shard requests by file path so each file stays on one worker/context,
+    // while different files can decode in parallel.
+    const int workerCount = qBound(1, QThread::idealThreadCount(), 4);
     
     for (int i = 0; i < workerCount; ++i) {
-        auto* worker = new DecoderWorker(&m_queue, m_budget);
+        auto* queue = new DecodeQueue();
+        auto* worker = new DecoderWorker(queue, m_budget);
+        m_queues.append(queue);
         worker->start();
         m_workers.append(worker);
     }
@@ -952,13 +1042,20 @@ bool AsyncDecoder::initialize() {
 }
 
 void AsyncDecoder::shutdown() {
-    m_queue.shutdown();
+    for (DecodeQueue* queue : m_queues) {
+        if (queue) {
+            queue->shutdown();
+        }
+    }
     
     for (auto* worker : m_workers) {
         worker->stop();
         delete worker;
     }
     m_workers.clear();
+
+    qDeleteAll(m_queues);
+    m_queues.clear();
 }
 
 uint64_t AsyncDecoder::requestFrame(const QString& path, 
@@ -976,6 +1073,8 @@ uint64_t AsyncDecoder::requestFrame(const QString& path,
     req.deadline = QDeadlineTimer(timeoutMs);
     req.callback = callback;
     req.submittedAt = QDateTime::currentMSecsSinceEpoch();
+    DecodeQueue* queue = queueForPath(path);
+    const int pendingBefore = totalPendingRequests();
 
     decodeTrace(QStringLiteral("AsyncDecoder::requestFrame"),
                 QStringLiteral("seq=%1 file=%2 frame=%3 priority=%4 timeoutMs=%5 pending=%6")
@@ -984,9 +1083,9 @@ uint64_t AsyncDecoder::requestFrame(const QString& path,
                     .arg(frameNumber)
                     .arg(priority)
                     .arg(timeoutMs)
-                    .arg(m_queue.size()));
+                    .arg(pendingBefore));
     
-    if (!m_queue.enqueue(req)) {
+    if (!queue || !queue->enqueue(req)) {
         // Queue full, return immediately with null
         decodeTrace(QStringLiteral("AsyncDecoder::requestFrame.queue-full"),
                     QStringLiteral("seq=%1 file=%2 frame=%3")
@@ -998,20 +1097,32 @@ uint64_t AsyncDecoder::requestFrame(const QString& path,
         }
     }
     
-    emit queuePressureChanged(m_queue.size());
+    emit queuePressureChanged(totalPendingRequests());
     return seqId;
 }
 
 void AsyncDecoder::cancelForFile(const QString& path) {
-    m_queue.removeForFile(path);
+    for (DecodeQueue* queue : m_queues) {
+        if (queue) {
+            queue->removeForFile(path);
+        }
+    }
 }
 
 void AsyncDecoder::cancelForFileBefore(const QString& path, int64_t frameNumber) {
-    m_queue.removeForFileBefore(path, frameNumber);
+    for (DecodeQueue* queue : m_queues) {
+        if (queue) {
+            queue->removeForFileBefore(path, frameNumber);
+        }
+    }
 }
 
 void AsyncDecoder::cancelAll() {
-    m_queue.clear();
+    for (DecodeQueue* queue : m_queues) {
+        if (queue) {
+            queue->clear();
+        }
+    }
 }
 
 VideoStreamInfo AsyncDecoder::getVideoInfo(const QString& path) {
@@ -1051,6 +1162,31 @@ void AsyncDecoder::trimCaches() {
     QMutexLocker lock(&m_infoCacheMutex);
     // Keep only recent entries
     // (In production, implement proper LRU)
+}
+
+int AsyncDecoder::totalPendingRequests() const {
+    int total = 0;
+    for (DecodeQueue* queue : m_queues) {
+        if (queue) {
+            total += queue->size();
+        }
+    }
+    return total;
+}
+
+int AsyncDecoder::queueIndexForPath(const QString& path) const {
+    if (m_queues.isEmpty()) {
+        return -1;
+    }
+    return static_cast<int>(qHash(path) % static_cast<uint>(m_queues.size()));
+}
+
+DecodeQueue* AsyncDecoder::queueForPath(const QString& path) const {
+    const int index = queueIndexForPath(path);
+    if (index < 0 || index >= m_queues.size()) {
+        return nullptr;
+    }
+    return m_queues[index];
 }
 
 } // namespace editor

@@ -218,6 +218,57 @@ TimelineClip::TransformKeyframe evaluateClipTransformAtFrame(const TimelineClip&
     return effective;
 }
 
+TimelineClip::TransformKeyframe evaluateClipTransformAtPosition(const TimelineClip& clip, qreal timelineFramePosition) {
+    TimelineClip::TransformKeyframe state;
+    if (clip.transformKeyframes.isEmpty()) {
+        state.translationX = clip.baseTranslationX;
+        state.translationY = clip.baseTranslationY;
+        state.rotation = clip.baseRotation;
+        state.scaleX = sanitizeScaleValue(clip.baseScaleX);
+        state.scaleY = sanitizeScaleValue(clip.baseScaleY);
+        return state;
+    }
+
+    const qreal maxFrame = static_cast<qreal>(qMax<int64_t>(0, clip.durationFrames - 1));
+    const qreal localFrame = qBound<qreal>(0.0, timelineFramePosition - static_cast<qreal>(clip.startFrame), maxFrame);
+    if (localFrame <= static_cast<qreal>(clip.transformKeyframes.constFirst().frame)) {
+        state = clip.transformKeyframes.constFirst();
+    } else {
+        state = clip.transformKeyframes.constLast();
+        for (int i = 1; i < clip.transformKeyframes.size(); ++i) {
+            const TimelineClip::TransformKeyframe& previous = clip.transformKeyframes[i - 1];
+            const TimelineClip::TransformKeyframe& current = clip.transformKeyframes[i];
+            if (localFrame < static_cast<qreal>(current.frame)) {
+                if (!current.interpolated || current.frame <= previous.frame) {
+                    state = previous;
+                } else {
+                    const qreal t = (localFrame - static_cast<qreal>(previous.frame)) /
+                                    static_cast<qreal>(current.frame - previous.frame);
+                    state.frame = qRound64(localFrame);
+                    state.translationX = previous.translationX + ((current.translationX - previous.translationX) * t);
+                    state.translationY = previous.translationY + ((current.translationY - previous.translationY) * t);
+                    state.rotation = previous.rotation + ((current.rotation - previous.rotation) * t);
+                    state.scaleX = previous.scaleX + ((current.scaleX - previous.scaleX) * t);
+                    state.scaleY = previous.scaleY + ((current.scaleY - previous.scaleY) * t);
+                    state.interpolated = current.interpolated;
+                }
+                break;
+            }
+            if (qFuzzyCompare(localFrame + 1.0, static_cast<qreal>(current.frame) + 1.0)) {
+                state = current;
+                break;
+            }
+        }
+    }
+
+    state.translationX += clip.baseTranslationX;
+    state.translationY += clip.baseTranslationY;
+    state.rotation += clip.baseRotation;
+    state.scaleX = sanitizeScaleValue(clip.baseScaleX * state.scaleX);
+    state.scaleY = sanitizeScaleValue(clip.baseScaleY * state.scaleY);
+    return state;
+}
+
 MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames) {
     MediaProbeResult result;
     result.durationFrames = fallbackFrames;
