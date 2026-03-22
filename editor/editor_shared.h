@@ -55,14 +55,21 @@ struct TimelineTrack {
     int height = 44;
 };
 
+struct ExportRangeSegment {
+    int64_t startFrame = 0;
+    int64_t endFrame = 0;
+};
+
 enum class RenderSyncAction {
     DuplicateFrame,
     SkipFrame,
 };
 
 struct RenderSyncMarker {
+    QString clipId;
     int64_t frame = 0;
     RenderSyncAction action = RenderSyncAction::DuplicateFrame;
+    int count = 1;
 };
 
 struct MediaProbeResult {
@@ -101,6 +108,12 @@ void normalizeClipTransformKeyframes(TimelineClip& clip);
 TimelineClip::TransformKeyframe evaluateClipKeyframeOffsetAtFrame(const TimelineClip& clip, int64_t timelineFrame);
 TimelineClip::TransformKeyframe evaluateClipTransformAtFrame(const TimelineClip& clip, int64_t timelineFrame);
 TimelineClip::TransformKeyframe evaluateClipTransformAtPosition(const TimelineClip& clip, qreal timelineFramePosition);
+int64_t adjustedClipLocalFrameAtTimelineFrame(const TimelineClip& clip,
+                                              int64_t localTimelineFrame,
+                                              const QVector<RenderSyncMarker>& markers);
+int64_t sourceFrameForClipAtTimelinePosition(const TimelineClip& clip,
+                                             qreal timelineFramePosition,
+                                             const QVector<RenderSyncMarker>& markers);
 
 MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames = 120);
 QImage applyClipGrade(const QImage& source, const TimelineClip& clip);

@@ -168,6 +168,19 @@ void normalizeClipTransformKeyframes(TimelineClip& clip) {
             normalized.push_back(keyframe);
         }
     }
+    if (clipHasVisuals(clip)) {
+        if (normalized.isEmpty()) {
+            TimelineClip::TransformKeyframe keyframe;
+            keyframe.frame = 0;
+            normalized.push_back(keyframe);
+        } else if (normalized.constFirst().frame > 0) {
+            TimelineClip::TransformKeyframe firstKeyframe = normalized.constFirst();
+            firstKeyframe.frame = 0;
+            normalized.push_front(firstKeyframe);
+        } else {
+            normalized.first().frame = 0;
+        }
+    }
     clip.transformKeyframes = normalized;
 }
 
@@ -267,6 +280,49 @@ TimelineClip::TransformKeyframe evaluateClipTransformAtPosition(const TimelineCl
     state.scaleX = sanitizeScaleValue(clip.baseScaleX * state.scaleX);
     state.scaleY = sanitizeScaleValue(clip.baseScaleY * state.scaleY);
     return state;
+}
+
+int64_t adjustedClipLocalFrameAtTimelineFrame(const TimelineClip& clip,
+                                              int64_t localTimelineFrame,
+                                              const QVector<RenderSyncMarker>& markers) {
+    int64_t adjustedLocalFrame = qMax<int64_t>(0, localTimelineFrame);
+    int duplicateCarry = 0;
+    for (const RenderSyncMarker& marker : markers) {
+        if (marker.clipId != clip.id) {
+            continue;
+        }
+        const int64_t markerLocalFrame = marker.frame - clip.startFrame;
+        if (markerLocalFrame < 0 || markerLocalFrame >= localTimelineFrame) {
+            continue;
+        }
+        if (duplicateCarry > 0) {
+            adjustedLocalFrame -= 1;
+            duplicateCarry -= 1;
+            continue;
+        }
+        if (marker.action == RenderSyncAction::DuplicateFrame) {
+            adjustedLocalFrame -= 1;
+            duplicateCarry = qMax(0, marker.count - 1);
+        } else if (marker.action == RenderSyncAction::SkipFrame) {
+            adjustedLocalFrame += marker.count;
+        }
+    }
+    return adjustedLocalFrame;
+}
+
+int64_t sourceFrameForClipAtTimelinePosition(const TimelineClip& clip,
+                                             qreal timelineFramePosition,
+                                             const QVector<RenderSyncMarker>& markers) {
+    const qreal maxFrame = static_cast<qreal>(qMax<int64_t>(0, clip.durationFrames - 1));
+    const qreal localTimelineFramePosition =
+        qBound<qreal>(0.0, timelineFramePosition - static_cast<qreal>(clip.startFrame), maxFrame);
+    const int64_t steppedLocalTimelineFrame =
+        qMax<int64_t>(0, static_cast<int64_t>(std::floor(localTimelineFramePosition)));
+    const int64_t adjustedLocalFrame =
+        adjustedClipLocalFrameAtTimelineFrame(clip, steppedLocalTimelineFrame, markers);
+    return qMax<int64_t>(0,
+                         qMin<int64_t>(qMax<int64_t>(0, clip.sourceDurationFrames - 1),
+                                       clip.sourceInFrame + adjustedLocalFrame));
 }
 
 MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames) {

@@ -7,6 +7,7 @@
 #include "editor_shared.h"
 #include "audio_engine.h"
 #include "timeline_widget.h"
+#include "render.h"
 
 #include <QApplication>
 #include <QColor>
@@ -35,6 +36,7 @@
 #include <QLabel>
 #include <QInputDialog>
 #include <QListWidget>
+#include <QListWidgetItem>
 #include <QMainWindow>
 #include <QMenu>
 #include <QMessageBox>
@@ -49,9 +51,13 @@
 #include <QOpenGLTexture>
 #include <QOpenGLWidget>
 #include <QPainter>
+#include <QPlainTextEdit>
+#include <QProcess>
 #include <QProcessEnvironment>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QRandomGenerator>
+#include <QRegularExpression>
 #include <QResizeEvent>
 #include <QSaveFile>
 #include <QShortcut>
@@ -383,6 +389,12 @@ public:
         }
         m_registeredClips = registeredIds;
         
+        requestFramesForCurrentPosition();
+        scheduleRepaint();
+    }
+
+    void setRenderSyncMarkers(const QVector<RenderSyncMarker>& markers) {
+        m_renderSyncMarkers = markers;
         requestFramesForCurrentPosition();
         scheduleRepaint();
     }
@@ -920,12 +932,9 @@ private:
             entry.texture = nullptr;
         }
 
-        QImage uploadImage = frame.cpuImage().convertToFormat(QImage::Format_ARGB32_Premultiplied);
-        QByteArray packedPixels;
-        const int packedBytesPerRow = uploadImage.width() * 4;
-        packedPixels.resize(uploadImage.height() * packedBytesPerRow);
-        for (int y = 0; y < uploadImage.height(); ++y) {
-            memcpy(packedPixels.data() + (y * packedBytesPerRow), uploadImage.constScanLine(y), packedBytesPerRow);
+        QImage uploadImage = frame.cpuImage();
+        if (uploadImage.format() != QImage::Format_ARGB32_Premultiplied) {
+            uploadImage = uploadImage.convertToFormat(QImage::Format_ARGB32_Premultiplied);
         }
 
         auto* texture = new QOpenGLTexture(QOpenGLTexture::Target2D);
@@ -933,10 +942,10 @@ private:
         texture->setSize(uploadImage.width(), uploadImage.height());
         texture->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt8);
         QOpenGLPixelTransferOptions uploadOptions;
-        uploadOptions.setAlignment(1);
+        uploadOptions.setAlignment(4);
         texture->setData(QOpenGLTexture::BGRA,
                          QOpenGLTexture::UInt8,
-                         packedPixels.constData(),
+                         uploadImage.constBits(),
                          &uploadOptions);
         if (!texture->isCreated()) {
             delete texture;
@@ -983,7 +992,10 @@ private:
     }
 
     int64_t sourceFrameForSample(const TimelineClip& clip, int64_t samplePosition) const {
-        return qMax<int64_t>(0, static_cast<int64_t>(std::floor(samplesToFramePosition(sourceSampleForPlaybackSample(clip, samplePosition)))));
+        return sourceFrameForClipAtTimelinePosition(
+            clip,
+            samplesToFramePosition(samplePosition),
+            m_renderSyncMarkers);
     }
 
     QRectF renderFrameLayerGL(const QRect& targetRect, const TimelineClip& clip, const FrameHandle& frame) {
@@ -998,8 +1010,8 @@ private:
 
         const QRect fitted = fitRect(frame.size(), targetRect);
         const TimelineClip::TransformKeyframe transform = evaluateClipTransformAtPosition(clip, m_currentFramePosition);
-        const QPointF center(fitted.center().x() + (transform.translationX * m_previewZoom),
-                             fitted.center().y() + (transform.translationY * m_previewZoom));
+        const QPointF center(fitted.center().x() + transform.translationX,
+                             fitted.center().y() + transform.translationY);
 
         QMatrix4x4 projection;
         projection.ortho(0.0f, static_cast<float>(width()),
@@ -1383,8 +1395,8 @@ private:
             const QImage img = m_bypassGrading ? frame.cpuImage() : applyClipGrade(frame.cpuImage(), clip);
             const QRect fitted = fitRect(img.size(), targetRect);
         const TimelineClip::TransformKeyframe transform = evaluateClipTransformAtPosition(clip, m_currentFramePosition);
-            painter->translate(fitted.center().x() + (transform.translationX * m_previewZoom),
-                               fitted.center().y() + (transform.translationY * m_previewZoom));
+            painter->translate(fitted.center().x() + transform.translationX,
+                               fitted.center().y() + transform.translationY);
             painter->rotate(transform.rotation);
             painter->scale(transform.scaleX, transform.scaleY);
             const QRectF drawRect(-fitted.width() / 2.0,
@@ -1394,8 +1406,8 @@ private:
             painter->drawImage(drawRect, img);
 
             QTransform overlayTransform;
-            overlayTransform.translate(fitted.center().x() + (transform.translationX * m_previewZoom),
-                                       fitted.center().y() + (transform.translationY * m_previewZoom));
+            overlayTransform.translate(fitted.center().x() + transform.translationX,
+                                       fitted.center().y() + transform.translationY);
             overlayTransform.rotate(transform.rotation);
             overlayTransform.scale(transform.scaleX, transform.scaleY);
             const QRectF bounds = overlayTransform.mapRect(drawRect);
@@ -1587,6 +1599,7 @@ private:
     qreal m_currentFramePosition = 0.0;
     int m_clipCount = 0;
     QVector<TimelineClip> m_clips;
+    QVector<RenderSyncMarker> m_renderSyncMarkers;
     QSet<QString> m_registeredClips;
     QTimer m_repaintTimer;
     qint64 m_lastFrameRequestMs = 0;
@@ -1688,6 +1701,12 @@ public:
                 m_timeline->nudgeSelectedClip(1);
             }
         });
+        auto* playbackShortcut = new QShortcut(QKeySequence(Qt::Key_Space), this);
+        connect(playbackShortcut, &QShortcut::activated, this, [this]() {
+            if (m_timeline) {
+                togglePlayback();
+            }
+        });
         m_mainThreadHeartbeatTimer.setInterval(100);
         connect(&m_mainThreadHeartbeatTimer, &QTimer::timeout, this, [this]() {
             m_lastMainThreadHeartbeatMs.store(nowMs());
@@ -1752,13 +1771,33 @@ public:
         connectVideoKeyframeLive(m_videoTranslationXSpin);
         connectVideoKeyframeLive(m_videoTranslationYSpin);
         connectVideoKeyframeLive(m_videoRotationSpin);
-        connectVideoKeyframeLive(m_videoScaleXSpin);
-        connectVideoKeyframeLive(m_videoScaleYSpin);
+        connect(m_videoScaleXSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double) {
+            syncScaleSpinPair(m_videoScaleXSpin, m_videoScaleYSpin);
+            applySelectedVideoKeyframeFromInspector(false);
+        });
+        connect(m_videoScaleXSpin, &QDoubleSpinBox::editingFinished, this, [this]() {
+            applySelectedVideoKeyframeFromInspector(true);
+        });
+        connect(m_videoScaleYSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double) {
+            syncScaleSpinPair(m_videoScaleYSpin, m_videoScaleXSpin);
+            applySelectedVideoKeyframeFromInspector(false);
+        });
+        connect(m_videoScaleYSpin, &QDoubleSpinBox::editingFinished, this, [this]() {
+            applySelectedVideoKeyframeFromInspector(true);
+        });
         connect(m_videoInterpolationCombo, &QComboBox::currentIndexChanged, this, [this](int) {
+            applySelectedVideoKeyframeFromInspector(true);
+        });
+        connect(m_mirrorHorizontalCheckBox, &QCheckBox::toggled, this, [this](bool) {
+            applySelectedVideoKeyframeFromInspector(true);
+        });
+        connect(m_mirrorVerticalCheckBox, &QCheckBox::toggled, this, [this](bool) {
             applySelectedVideoKeyframeFromInspector(true);
         });
 
         QTimer::singleShot(0, this, [this]() {
+            loadProjectsFromFolders();
+            refreshProjectsList();
             loadState();
             refreshInspector();
         });
@@ -1847,12 +1886,278 @@ private slots:
     }
 
 private:
+    QString projectsDirPath() const {
+        return QDir(QDir::currentPath()).filePath(QStringLiteral("projects"));
+    }
+
+    QString currentProjectMarkerPath() const {
+        return QDir(projectsDirPath()).filePath(QStringLiteral(".current_project"));
+    }
+
+    QString currentProjectIdOrDefault() const {
+        return m_currentProjectId.isEmpty() ? QStringLiteral("default") : m_currentProjectId;
+    }
+
+    QString projectPath(const QString& projectId) const {
+        return QDir(projectsDirPath()).filePath(projectId.isEmpty() ? QStringLiteral("default") : projectId);
+    }
+
+    QString stateFilePathForProject(const QString& projectId) const {
+        return QDir(projectPath(projectId)).filePath(QStringLiteral("state.json"));
+    }
+
+    QString historyFilePathForProject(const QString& projectId) const {
+        return QDir(projectPath(projectId)).filePath(QStringLiteral("history.json"));
+    }
+
     QString stateFilePath() const {
-        return QDir(QDir::currentPath()).filePath(QStringLiteral("editor_state.json"));
+        return stateFilePathForProject(currentProjectIdOrDefault());
     }
 
     QString historyFilePath() const {
-        return QDir(QDir::currentPath()).filePath(QStringLiteral("editor_history.json"));
+        return historyFilePathForProject(currentProjectIdOrDefault());
+    }
+
+    QString sanitizedProjectId(const QString& name) const {
+        QString id = name.trimmed().toLower();
+        for (QChar& ch : id) {
+            if (!(ch.isLetterOrNumber() || ch == QLatin1Char('_') || ch == QLatin1Char('-'))) {
+                ch = QLatin1Char('-');
+            }
+        }
+        while (id.contains(QStringLiteral("--"))) {
+            id.replace(QStringLiteral("--"), QStringLiteral("-"));
+        }
+        id.remove(QRegularExpression(QStringLiteral("^-+|-+$")));
+        if (id.isEmpty()) {
+            id = QStringLiteral("project");
+        }
+        QString uniqueId = id;
+        int suffix = 2;
+        while (QFileInfo::exists(projectPath(uniqueId))) {
+            uniqueId = QStringLiteral("%1-%2").arg(id).arg(suffix++);
+        }
+        return uniqueId;
+    }
+
+    void ensureProjectsDirectory() const {
+        QDir().mkpath(projectsDirPath());
+    }
+
+    QStringList availableProjectIds() const {
+        ensureProjectsDirectory();
+        const QFileInfoList entries = QDir(projectsDirPath()).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot,
+                                                                            QDir::Name | QDir::IgnoreCase);
+        QStringList ids;
+        ids.reserve(entries.size());
+        for (const QFileInfo& entry : entries) {
+            ids.push_back(entry.fileName());
+        }
+        return ids;
+    }
+
+    void ensureDefaultProjectExists() const {
+        ensureProjectsDirectory();
+        QDir().mkpath(projectPath(QStringLiteral("default")));
+    }
+
+    void loadProjectsFromFolders() {
+        ensureDefaultProjectExists();
+        QFile markerFile(currentProjectMarkerPath());
+        if (markerFile.open(QIODevice::ReadOnly)) {
+            m_currentProjectId = QString::fromUtf8(markerFile.readAll()).trimmed();
+        }
+        const QStringList projectIds = availableProjectIds();
+        if (projectIds.isEmpty()) {
+            m_currentProjectId = QStringLiteral("default");
+            return;
+        }
+        if (m_currentProjectId.isEmpty() || !projectIds.contains(m_currentProjectId)) {
+            m_currentProjectId = projectIds.contains(QStringLiteral("default"))
+                ? QStringLiteral("default")
+                : projectIds.constFirst();
+        }
+        QSaveFile marker(currentProjectMarkerPath());
+        if (marker.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            const QByteArray payload = m_currentProjectId.toUtf8();
+            if (marker.write(payload) == payload.size()) {
+                marker.commit();
+            } else {
+                marker.cancelWriting();
+            }
+        }
+    }
+
+    void saveCurrentProjectMarker() {
+        ensureProjectsDirectory();
+        QSaveFile file(currentProjectMarkerPath());
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            return;
+        }
+        const QByteArray payload = currentProjectIdOrDefault().toUtf8();
+        if (file.write(payload) != payload.size()) {
+            file.cancelWriting();
+            return;
+        }
+        file.commit();
+    }
+
+    QString currentProjectName() const {
+        return currentProjectIdOrDefault();
+    }
+
+    void refreshProjectsList() {
+        if (!m_projectsList) {
+            return;
+        }
+        loadProjectsFromFolders();
+        m_updatingProjectsList = true;
+        m_projectsList->clear();
+        const QStringList projectIds = availableProjectIds();
+        for (const QString& projectId : projectIds) {
+            auto* item = new QListWidgetItem(projectId, m_projectsList);
+            item->setData(Qt::UserRole, projectId);
+            item->setToolTip(QDir::toNativeSeparators(projectPath(projectId)));
+            if (projectId == currentProjectIdOrDefault()) {
+                item->setSelected(true);
+            }
+        }
+        if (m_projectSectionLabel) {
+            m_projectSectionLabel->setText(QStringLiteral("PROJECTS  %1").arg(currentProjectName()));
+        }
+        m_updatingProjectsList = false;
+    }
+
+    void switchToProject(const QString& projectId) {
+        if (projectId.isEmpty() || projectId == currentProjectIdOrDefault()) {
+            refreshProjectsList();
+            return;
+        }
+        saveStateNow();
+        saveHistoryNow();
+        m_currentProjectId = projectId;
+        m_lastSavedState.clear();
+        m_historyEntries = QJsonArray();
+        m_historyIndex = -1;
+        saveCurrentProjectMarker();
+        loadState();
+        refreshProjectsList();
+        refreshInspector();
+    }
+
+    void createProject() {
+        bool accepted = false;
+        const QString name = QInputDialog::getText(this,
+                                                   QStringLiteral("New Project"),
+                                                   QStringLiteral("Project name"),
+                                                   QLineEdit::Normal,
+                                                   QStringLiteral("Untitled Project"),
+                                                   &accepted).trimmed();
+        if (!accepted || name.isEmpty()) {
+            return;
+        }
+        const QString projectId = sanitizedProjectId(name);
+        QDir().mkpath(projectPath(projectId));
+        switchToProject(projectId);
+    }
+
+    bool saveProjectPayload(const QString& projectId,
+                            const QByteArray& statePayload,
+                            const QByteArray& historyPayload) {
+        ensureProjectsDirectory();
+        QDir().mkpath(projectPath(projectId));
+
+        QSaveFile stateFile(stateFilePathForProject(projectId));
+        if (!stateFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            return false;
+        }
+        if (stateFile.write(statePayload) != statePayload.size()) {
+            stateFile.cancelWriting();
+            return false;
+        }
+        if (!stateFile.commit()) {
+            return false;
+        }
+
+        QSaveFile historyFile(historyFilePathForProject(projectId));
+        if (!historyFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            return false;
+        }
+        if (historyFile.write(historyPayload) != historyPayload.size()) {
+            historyFile.cancelWriting();
+            return false;
+        }
+        return historyFile.commit();
+    }
+
+    void saveProjectAs() {
+        if (!m_timeline) {
+            return;
+        }
+
+        bool accepted = false;
+        const QString name = QInputDialog::getText(this,
+                                                   QStringLiteral("Save Project As"),
+                                                   QStringLiteral("Project name"),
+                                                   QLineEdit::Normal,
+                                                   currentProjectName() == QStringLiteral("Default Project")
+                                                       ? QStringLiteral("Untitled Project")
+                                                       : currentProjectName(),
+                                                   &accepted).trimmed();
+        if (!accepted || name.isEmpty()) {
+            return;
+        }
+
+        saveStateNow();
+        saveHistoryNow();
+
+        const QString newProjectId = sanitizedProjectId(name);
+        const QByteArray statePayload = QJsonDocument(buildStateJson()).toJson(QJsonDocument::Indented);
+        QJsonObject historyRoot;
+        historyRoot[QStringLiteral("index")] = m_historyIndex;
+        historyRoot[QStringLiteral("entries")] = m_historyEntries;
+        const QByteArray historyPayload = QJsonDocument(historyRoot).toJson(QJsonDocument::Indented);
+
+        if (!saveProjectPayload(newProjectId, statePayload, historyPayload)) {
+            QMessageBox::warning(this,
+                                 QStringLiteral("Save Project As Failed"),
+                                 QStringLiteral("Could not write the new project files."));
+            return;
+        }
+
+        switchToProject(newProjectId);
+    }
+
+    void renameProject(const QString& projectId) {
+        if (projectId.isEmpty() || !QFileInfo::exists(projectPath(projectId))) {
+            return;
+        }
+        bool accepted = false;
+        const QString name = QInputDialog::getText(this,
+                                                   QStringLiteral("Rename Project"),
+                                                   QStringLiteral("Project name"),
+                                                   QLineEdit::Normal,
+                                                   projectId,
+                                                   &accepted).trimmed();
+        if (!accepted || name.isEmpty()) {
+            return;
+        }
+        const QString renamedProjectId = sanitizedProjectId(name);
+        if (renamedProjectId == projectId) {
+            return;
+        }
+        QDir projectsDir(projectsDirPath());
+        if (!projectsDir.rename(projectId, renamedProjectId)) {
+            QMessageBox::warning(this,
+                                 QStringLiteral("Rename Project Failed"),
+                                 QStringLiteral("Could not rename the project folder."));
+            return;
+        }
+        if (m_currentProjectId == projectId) {
+            m_currentProjectId = renamedProjectId;
+            saveCurrentProjectMarker();
+        }
+        refreshProjectsList();
     }
 
     QJsonObject buildStateJson() const {
@@ -1871,9 +2176,26 @@ private:
         root[QStringLiteral("outputHeight")] = m_outputHeightSpin ? m_outputHeightSpin->value() : 1920;
         root[QStringLiteral("outputFormat")] =
             m_outputFormatCombo ? m_outputFormatCombo->currentData().toString() : QStringLiteral("mp4");
+        root[QStringLiteral("exportOnlyTranscriptWords")] =
+            m_exportOnlyTranscriptWordsCheckBox ? m_exportOnlyTranscriptWordsCheckBox->isChecked() : false;
+        root[QStringLiteral("selectedInspectorTab")] =
+            m_inspectorTabs ? m_inspectorTabs->currentIndex() : 0;
         root[QStringLiteral("timelineZoom")] = m_timeline ? m_timeline->timelineZoom() : 4.0;
         root[QStringLiteral("timelineVerticalScroll")] =
             m_timeline ? m_timeline->verticalScrollOffset() : 0;
+        root[QStringLiteral("exportStartFrame")] = m_timeline ? static_cast<qint64>(m_timeline->exportStartFrame()) : 0;
+        root[QStringLiteral("exportEndFrame")] =
+            m_timeline ? static_cast<qint64>(m_timeline->exportEndFrame()) : 300;
+        QJsonArray exportRanges;
+        if (m_timeline) {
+            for (const ExportRangeSegment& range : m_timeline->exportRanges()) {
+                QJsonObject rangeObj;
+                rangeObj[QStringLiteral("startFrame")] = static_cast<qint64>(range.startFrame);
+                rangeObj[QStringLiteral("endFrame")] = static_cast<qint64>(range.endFrame);
+                exportRanges.push_back(rangeObj);
+            }
+        }
+        root[QStringLiteral("exportRanges")] = exportRanges;
 
         QJsonArray timeline;
         if (m_timeline) {
@@ -1886,8 +2208,10 @@ private:
         if (m_timeline) {
             for (const RenderSyncMarker& marker : m_timeline->renderSyncMarkers()) {
                 QJsonObject markerObj;
+                markerObj[QStringLiteral("clipId")] = marker.clipId;
                 markerObj[QStringLiteral("frame")] = static_cast<qint64>(marker.frame);
                 markerObj[QStringLiteral("action")] = renderSyncActionToString(marker.action);
+                markerObj[QStringLiteral("count")] = marker.count;
                 renderSyncMarkers.push_back(markerObj);
             }
         }
@@ -1923,6 +2247,8 @@ private:
         }
 
         m_stateSaveTimer.stop();
+        ensureProjectsDirectory();
+        QDir().mkpath(projectPath(currentProjectIdOrDefault()));
 
         const QByteArray serializedState =
             QJsonDocument(buildStateJson()).toJson(QJsonDocument::Indented);
@@ -1948,6 +2274,8 @@ private:
     }
 
     void saveHistoryNow() {
+        ensureProjectsDirectory();
+        QDir().mkpath(projectPath(currentProjectIdOrDefault()));
         QJsonObject root;
         root[QStringLiteral("index")] = m_historyIndex;
         root[QStringLiteral("entries")] = m_historyEntries;
@@ -1995,8 +2323,26 @@ private:
         const int outputWidth = qMax(16, root.value(QStringLiteral("outputWidth")).toInt(1080));
         const int outputHeight = qMax(16, root.value(QStringLiteral("outputHeight")).toInt(1920));
         const QString outputFormat = root.value(QStringLiteral("outputFormat")).toString(QStringLiteral("mp4"));
+        const bool exportOnlyTranscriptWords =
+            root.value(QStringLiteral("exportOnlyTranscriptWords")).toBool(false);
+        const int selectedInspectorTab = root.value(QStringLiteral("selectedInspectorTab")).toInt(0);
         const qreal timelineZoom = root.value(QStringLiteral("timelineZoom")).toDouble(4.0);
         const int timelineVerticalScroll = root.value(QStringLiteral("timelineVerticalScroll")).toInt(0);
+        const int64_t exportStartFrame = root.value(QStringLiteral("exportStartFrame")).toVariant().toLongLong();
+        const int64_t exportEndFrame = root.value(QStringLiteral("exportEndFrame")).toVariant().toLongLong();
+        QVector<ExportRangeSegment> loadedExportRanges;
+        const QJsonArray exportRanges = root.value(QStringLiteral("exportRanges")).toArray();
+        loadedExportRanges.reserve(exportRanges.size());
+        for (const QJsonValue& value : exportRanges) {
+            if (!value.isObject()) {
+                continue;
+            }
+            const QJsonObject obj = value.toObject();
+            ExportRangeSegment range;
+            range.startFrame = qMax<int64_t>(0, obj.value(QStringLiteral("startFrame")).toVariant().toLongLong());
+            range.endFrame = qMax<int64_t>(0, obj.value(QStringLiteral("endFrame")).toVariant().toLongLong());
+            loadedExportRanges.push_back(range);
+        }
         m_expandedExplorerPaths.clear();
         for (const QJsonValue& value : root.value(QStringLiteral("explorerExpandedFolders")).toArray()) {
             const QString path = value.toString();
@@ -2041,8 +2387,10 @@ private:
             }
             const QJsonObject obj = value.toObject();
             RenderSyncMarker marker;
+            marker.clipId = obj.value(QStringLiteral("clipId")).toString();
             marker.frame = qMax<int64_t>(0, obj.value(QStringLiteral("frame")).toVariant().toLongLong());
             marker.action = renderSyncActionFromString(obj.value(QStringLiteral("action")).toString());
+            marker.count = qMax(1, obj.value(QStringLiteral("count")).toInt(1));
             loadedRenderSyncMarkers.push_back(marker);
         }
 
@@ -2066,6 +2414,14 @@ private:
                 m_outputFormatCombo->setCurrentIndex(formatIndex);
             }
         }
+        if (m_exportOnlyTranscriptWordsCheckBox) {
+            QSignalBlocker block(m_exportOnlyTranscriptWordsCheckBox);
+            m_exportOnlyTranscriptWordsCheckBox->setChecked(exportOnlyTranscriptWords);
+        }
+        if (m_inspectorTabs && m_inspectorTabs->count() > 0) {
+            QSignalBlocker block(m_inspectorTabs);
+            m_inspectorTabs->setCurrentIndex(qBound(0, selectedInspectorTab, m_inspectorTabs->count() - 1));
+        }
         if (m_preview) {
             m_preview->setOutputSize(QSize(outputWidth, outputHeight));
         }
@@ -2074,11 +2430,17 @@ private:
         m_timeline->setClips(loadedClips);
         m_timeline->setTimelineZoom(timelineZoom);
         m_timeline->setVerticalScrollOffset(timelineVerticalScroll);
+        if (!loadedExportRanges.isEmpty()) {
+            m_timeline->setExportRanges(loadedExportRanges);
+        } else {
+            m_timeline->setExportRange(exportStartFrame, exportEndFrame > 0 ? exportEndFrame : m_timeline->totalFrames());
+        }
         m_timeline->setRenderSyncMarkers(loadedRenderSyncMarkers);
         m_timeline->setSelectedClipId(selectedClipId);
         syncSliderRange();
         m_preview->setClipCount(m_timeline->clips().size());
         m_preview->setTimelineClips(m_timeline->clips());
+        m_preview->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
         m_preview->setSelectedClipId(selectedClipId);
         if (m_audioEngine) {
             m_audioEngine->setTimelineClips(m_timeline->clips());
@@ -2096,6 +2458,7 @@ private:
         m_loadingState = false;
         QTimer::singleShot(0, this, [this, resolvedRootPath]() {
             setExplorerRootPath(resolvedRootPath, false);
+            refreshProjectsList();
             refreshInspector();
         });
     }
@@ -2341,7 +2704,7 @@ private:
         }
     }
 
-    void showExplorerHoverPreview(const QString& filePath, const QPoint& globalPos) {
+    void showExplorerHoverPreview(const QString& filePath) {
         const QPixmap source = previewPixmapForFile(filePath);
         if (source.isNull()) {
             hideExplorerHoverPreview();
@@ -2354,11 +2717,133 @@ private:
             m_explorerHoverPreview->setStyleSheet(
                 QStringLiteral("QLabel#explorerHoverPreview { background: #05080c; color: #edf2f7; border: 1px solid #24303c; border-radius: 10px; padding: 8px; }"));
         }
-        const QPixmap scaled = source.scaled(QSize(280, 180), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        QSize targetSize(280, 180);
+        if (m_preview) {
+            const QSize previewSize = m_preview->size() - QSize(32, 32);
+            if (previewSize.width() > 0 && previewSize.height() > 0) {
+                targetSize = previewSize;
+            }
+        }
+        const QPixmap scaled = source.scaled(targetSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
         m_explorerHoverPreview->setPixmap(scaled);
         m_explorerHoverPreview->resize(scaled.size() + QSize(16, 16));
-        m_explorerHoverPreview->move(globalPos + QPoint(18, 18));
+        QPoint previewAnchor(80, 80);
+        if (m_preview) {
+            const QRect previewRect = m_preview->rect();
+            previewAnchor = m_preview->mapToGlobal(
+                QPoint(qMax(24, (previewRect.width() - m_explorerHoverPreview->width()) / 2),
+                       qMax(24, previewRect.height() / 8)));
+        }
+        m_explorerHoverPreview->move(previewAnchor);
         m_explorerHoverPreview->show();
+        m_explorerHoverPreview->raise();
+    }
+
+    void openTranscriptionWindow(const QString& filePath, const QString& label) {
+        const QFileInfo inputInfo(filePath);
+        if (!inputInfo.exists() || !inputInfo.isFile()) {
+            QMessageBox::warning(this,
+                                 QStringLiteral("Transcribe Failed"),
+                                 QStringLiteral("The selected file does not exist:\n%1")
+                                     .arg(QDir::toNativeSeparators(filePath)));
+            return;
+        }
+
+        const QString scriptPath = QDir(QDir::currentPath()).absoluteFilePath(QStringLiteral("whisperx.sh"));
+        if (!QFileInfo::exists(scriptPath)) {
+            QMessageBox::warning(this,
+                                 QStringLiteral("Transcribe Failed"),
+                                 QStringLiteral("whisperx.sh was not found at:\n%1")
+                                     .arg(QDir::toNativeSeparators(scriptPath)));
+            return;
+        }
+
+        auto* dialog = new QDialog(this);
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->setWindowTitle(QStringLiteral("Transcribe  %1").arg(label));
+        dialog->resize(920, 560);
+
+        auto* layout = new QVBoxLayout(dialog);
+        layout->setContentsMargins(12, 12, 12, 12);
+        layout->setSpacing(8);
+
+        auto* title = new QLabel(QStringLiteral("whisperx.sh %1").arg(QDir::toNativeSeparators(filePath)), dialog);
+        title->setWordWrap(true);
+        layout->addWidget(title);
+
+        auto* output = new QPlainTextEdit(dialog);
+        output->setReadOnly(true);
+        output->setLineWrapMode(QPlainTextEdit::NoWrap);
+        output->setStyleSheet(QStringLiteral(
+            "QPlainTextEdit { background: #05080c; color: #d6e2ee; border: 1px solid #24303c; "
+            "border-radius: 8px; font-family: monospace; font-size: 12px; }"));
+        layout->addWidget(output, 1);
+
+        auto* inputRow = new QHBoxLayout;
+        inputRow->setContentsMargins(0, 0, 0, 0);
+        inputRow->setSpacing(8);
+        auto* inputLabel = new QLabel(QStringLiteral("stdin"), dialog);
+        auto* inputLine = new QLineEdit(dialog);
+        inputLine->setPlaceholderText(QStringLiteral("Type input for whisperx.sh prompts, then press Send"));
+        auto* sendButton = new QPushButton(QStringLiteral("Send"), dialog);
+        auto* closeButton = new QPushButton(QStringLiteral("Close"), dialog);
+        inputRow->addWidget(inputLabel);
+        inputRow->addWidget(inputLine, 1);
+        inputRow->addWidget(sendButton);
+        inputRow->addWidget(closeButton);
+        layout->addLayout(inputRow);
+
+        auto* process = new QProcess(dialog);
+        process->setProcessChannelMode(QProcess::MergedChannels);
+        process->setWorkingDirectory(QDir::currentPath());
+
+        const auto appendOutput = [output](const QString& text) {
+            if (text.isEmpty()) {
+                return;
+            }
+            output->moveCursor(QTextCursor::End);
+            output->insertPlainText(text);
+            output->moveCursor(QTextCursor::End);
+        };
+
+        connect(process, &QProcess::readyReadStandardOutput, dialog, [process, appendOutput]() {
+            appendOutput(QString::fromLocal8Bit(process->readAllStandardOutput()));
+        });
+        connect(process, &QProcess::started, dialog, [appendOutput, filePath]() {
+            appendOutput(QStringLiteral("$ ./whisperx.sh \"%1\"\n").arg(QDir::toNativeSeparators(filePath)));
+        });
+        connect(process, &QProcess::errorOccurred, dialog, [appendOutput](QProcess::ProcessError error) {
+            appendOutput(QStringLiteral("\n[process error] %1\n").arg(static_cast<int>(error)));
+        });
+        connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), dialog,
+                [appendOutput](int exitCode, QProcess::ExitStatus exitStatus) {
+                    appendOutput(QStringLiteral("\n[process finished] exitCode=%1 status=%2\n")
+                                     .arg(exitCode)
+                                     .arg(exitStatus == QProcess::NormalExit ? QStringLiteral("normal")
+                                                                             : QStringLiteral("crashed")));
+                });
+        connect(sendButton, &QPushButton::clicked, dialog, [process, inputLine, appendOutput]() {
+            const QString text = inputLine->text();
+            if (text.isEmpty()) {
+                return;
+            }
+            process->write(text.toUtf8());
+            process->write("\n");
+            appendOutput(QStringLiteral("> %1\n").arg(text));
+            inputLine->clear();
+        });
+        connect(inputLine, &QLineEdit::returnPressed, sendButton, &QPushButton::click);
+        connect(closeButton, &QPushButton::clicked, dialog, &QDialog::close);
+        connect(dialog, &QDialog::finished, dialog, [process](int) {
+            if (process->state() != QProcess::NotRunning) {
+                process->kill();
+                process->waitForFinished(1000);
+            }
+        });
+
+        process->start(QStringLiteral("/bin/bash"),
+                       {scriptPath, QFileInfo(filePath).absoluteFilePath()});
+        dialog->show();
     }
     
     void chooseExplorerRoot() {
@@ -2370,6 +2855,282 @@ private:
         if (!selected.isEmpty()) {
             setExplorerRootPath(selected, true);
         }
+    }
+
+    QString transcriptPathForClip(const TimelineClip& clip) const {
+        const QFileInfo info(clip.filePath);
+        return info.dir().filePath(info.completeBaseName() + QStringLiteral(".json"));
+    }
+
+    QString secondsToTranscriptTime(double seconds) const {
+        const qint64 millis = qMax<qint64>(0, qRound64(seconds * 1000.0));
+        const qint64 totalSeconds = millis / 1000;
+        const qint64 minutes = totalSeconds / 60;
+        const qint64 secs = totalSeconds % 60;
+        const qint64 ms = millis % 1000;
+        return QStringLiteral("%1:%2.%3")
+            .arg(minutes, 2, 10, QLatin1Char('0'))
+            .arg(secs, 2, 10, QLatin1Char('0'))
+            .arg(ms, 3, 10, QLatin1Char('0'));
+    }
+
+    bool parseTranscriptTime(const QString& text, double* secondsOut) const {
+        bool ok = false;
+        const double numericValue = text.toDouble(&ok);
+        if (ok) {
+            *secondsOut = qMax(0.0, numericValue);
+            return true;
+        }
+
+        const QString trimmed = text.trimmed();
+        const QStringList minuteParts = trimmed.split(QLatin1Char(':'));
+        if (minuteParts.size() != 2) {
+            return false;
+        }
+        const int minutes = minuteParts[0].toInt(&ok);
+        if (!ok) {
+            return false;
+        }
+        const double secValue = minuteParts[1].toDouble(&ok);
+        if (!ok) {
+            return false;
+        }
+        *secondsOut = qMax(0.0, minutes * 60.0 + secValue);
+        return true;
+    }
+
+    bool saveTranscriptJson(const QString& path, const QJsonDocument& doc) const {
+        QSaveFile file(path);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            return false;
+        }
+        const QByteArray payload = doc.toJson(QJsonDocument::Indented);
+        if (file.write(payload) != payload.size()) {
+            file.cancelWriting();
+            return false;
+        }
+        return file.commit();
+    }
+
+    int64_t adjustedLocalFrameForClip(const TimelineClip& clip,
+                                      int64_t localTimelineFrame,
+                                      const QVector<RenderSyncMarker>& markers) const {
+        int64_t adjustedLocalFrame = qMax<int64_t>(0, localTimelineFrame);
+        int duplicateCarry = 0;
+        for (const RenderSyncMarker& marker : markers) {
+            if (marker.clipId != clip.id) {
+                continue;
+            }
+            const int64_t markerLocalFrame = marker.frame - clip.startFrame;
+            if (markerLocalFrame < 0 || markerLocalFrame >= localTimelineFrame) {
+                continue;
+            }
+            if (duplicateCarry > 0) {
+                adjustedLocalFrame -= 1;
+                duplicateCarry -= 1;
+                continue;
+            }
+            if (marker.action == RenderSyncAction::DuplicateFrame) {
+                adjustedLocalFrame -= 1;
+                duplicateCarry = qMax(0, marker.count - 1);
+            } else if (marker.action == RenderSyncAction::SkipFrame) {
+                adjustedLocalFrame += marker.count;
+            }
+        }
+        return adjustedLocalFrame;
+    }
+
+    void appendMergedExportFrame(QVector<ExportRangeSegment>& ranges, int64_t frame) const {
+        if (ranges.isEmpty() || frame > ranges.constLast().endFrame + 1) {
+            ranges.push_back(ExportRangeSegment{frame, frame});
+            return;
+        }
+        ranges.last().endFrame = qMax(ranges.last().endFrame, frame);
+    }
+
+    QVector<ExportRangeSegment> transcriptWordExportRanges(const QVector<ExportRangeSegment>& baseRanges,
+                                                           const QVector<TimelineClip>& clips,
+                                                           const QVector<RenderSyncMarker>& markers) const {
+        QVector<ExportRangeSegment> resolvedBaseRanges = baseRanges;
+        if (resolvedBaseRanges.isEmpty()) {
+            int64_t endFrame = 0;
+            for (const TimelineClip& clip : clips) {
+                endFrame = qMax(endFrame, clip.startFrame + clip.durationFrames);
+            }
+            resolvedBaseRanges.push_back(ExportRangeSegment{0, endFrame});
+        }
+
+        QVector<ExportRangeSegment> transcriptRanges;
+        for (const TimelineClip& clip : clips) {
+            if (clip.durationFrames <= 0) {
+                continue;
+            }
+
+            QFile transcriptFile(transcriptPathForClip(clip));
+            if (!transcriptFile.open(QIODevice::ReadOnly)) {
+                continue;
+            }
+
+            QJsonParseError parseError;
+            const QJsonDocument transcriptDoc =
+                QJsonDocument::fromJson(transcriptFile.readAll(), &parseError);
+            if (parseError.error != QJsonParseError::NoError || !transcriptDoc.isObject()) {
+                continue;
+            }
+
+            QVector<ExportRangeSegment> sourceWordRanges;
+            const QJsonArray segments = transcriptDoc.object().value(QStringLiteral("segments")).toArray();
+            for (const QJsonValue& segmentValue : segments) {
+                const QJsonArray words = segmentValue.toObject().value(QStringLiteral("words")).toArray();
+                for (const QJsonValue& wordValue : words) {
+                    const QJsonObject wordObj = wordValue.toObject();
+                    if (wordObj.value(QStringLiteral("word")).toString().trimmed().isEmpty()) {
+                        continue;
+                    }
+
+                    const double startSeconds = wordObj.value(QStringLiteral("start")).toDouble(-1.0);
+                    const double endSeconds = wordObj.value(QStringLiteral("end")).toDouble(-1.0);
+                    if (startSeconds < 0.0 || endSeconds < startSeconds) {
+                        continue;
+                    }
+
+                    const int64_t startFrame =
+                        qMax<int64_t>(0, static_cast<int64_t>(std::floor(startSeconds * kTimelineFps)));
+                    const int64_t endFrame =
+                        qMax<int64_t>(startFrame, static_cast<int64_t>(std::ceil(endSeconds * kTimelineFps)) - 1);
+                    sourceWordRanges.push_back(ExportRangeSegment{startFrame, endFrame});
+                }
+            }
+
+            if (sourceWordRanges.isEmpty()) {
+                continue;
+            }
+
+            std::sort(sourceWordRanges.begin(), sourceWordRanges.end(),
+                      [](const ExportRangeSegment& a, const ExportRangeSegment& b) {
+                          if (a.startFrame == b.startFrame) {
+                              return a.endFrame < b.endFrame;
+                          }
+                          return a.startFrame < b.startFrame;
+                      });
+            QVector<ExportRangeSegment> mergedSourceWordRanges;
+            for (const ExportRangeSegment& wordRange : std::as_const(sourceWordRanges)) {
+                if (mergedSourceWordRanges.isEmpty() ||
+                    wordRange.startFrame > mergedSourceWordRanges.constLast().endFrame + 1) {
+                    mergedSourceWordRanges.push_back(wordRange);
+                } else {
+                    mergedSourceWordRanges.last().endFrame =
+                        qMax(mergedSourceWordRanges.last().endFrame, wordRange.endFrame);
+                }
+            }
+
+            for (const ExportRangeSegment& baseRange : resolvedBaseRanges) {
+                const int64_t clipStart = qMax<int64_t>(clip.startFrame, baseRange.startFrame);
+                const int64_t clipEnd =
+                    qMin<int64_t>(clip.startFrame + clip.durationFrames - 1, baseRange.endFrame);
+                if (clipEnd < clipStart) {
+                    continue;
+                }
+
+                for (int64_t timelineFrame = clipStart; timelineFrame <= clipEnd; ++timelineFrame) {
+                    const int64_t localTimelineFrame = timelineFrame - clip.startFrame;
+                    const int64_t sourceFrame =
+                        clip.sourceInFrame + adjustedLocalFrameForClip(clip, localTimelineFrame, markers);
+                    for (const ExportRangeSegment& wordRange : std::as_const(mergedSourceWordRanges)) {
+                        if (sourceFrame < wordRange.startFrame) {
+                            break;
+                        }
+                        if (sourceFrame <= wordRange.endFrame) {
+                            appendMergedExportFrame(transcriptRanges, timelineFrame);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        return transcriptRanges;
+    }
+
+    QString clipLabelForId(const QString& clipId) const {
+        if (!m_timeline) {
+            return clipId;
+        }
+        for (const TimelineClip& clip : m_timeline->clips()) {
+            if (clip.id == clipId) {
+                return clip.label;
+            }
+        }
+        return clipId;
+    }
+
+    QColor clipColorForId(const QString& clipId) const {
+        if (!m_timeline) {
+            return QColor(QStringLiteral("#24303c"));
+        }
+        for (const TimelineClip& clip : m_timeline->clips()) {
+            if (clip.id == clipId) {
+                return clip.color;
+            }
+        }
+        return QColor(QStringLiteral("#24303c"));
+    }
+
+    bool parseSyncActionText(const QString& text, RenderSyncAction* actionOut) const {
+        const QString normalized = text.trimmed().toLower();
+        if (normalized == QStringLiteral("duplicate") || normalized == QStringLiteral("dup")) {
+            *actionOut = RenderSyncAction::DuplicateFrame;
+            return true;
+        }
+        if (normalized == QStringLiteral("skip")) {
+            *actionOut = RenderSyncAction::SkipFrame;
+            return true;
+        }
+        return false;
+    }
+
+    void refreshSyncInspector() {
+        m_syncInspectorClipLabel->setText(QStringLiteral("Sync"));
+        m_updatingSyncInspector = true;
+        m_syncTable->clearContents();
+        m_syncTable->setRowCount(0);
+        if (!m_timeline || m_timeline->renderSyncMarkers().isEmpty()) {
+            m_syncInspectorDetailsLabel->setText(QStringLiteral("No render sync markers in the timeline."));
+            m_updatingSyncInspector = false;
+            return;
+        }
+
+        const QVector<RenderSyncMarker> markers = m_timeline->renderSyncMarkers();
+        m_syncInspectorDetailsLabel->setText(
+            QStringLiteral("%1 sync markers across the timeline. Edit Frame, Count, or Action directly.")
+                .arg(markers.size()));
+        m_syncTable->setRowCount(markers.size());
+        for (int i = 0; i < markers.size(); ++i) {
+            const RenderSyncMarker& marker = markers[i];
+            const QColor clipColor = clipColorForId(marker.clipId);
+            const QColor rowBackground = QColor(clipColor.red(), clipColor.green(), clipColor.blue(), 72);
+            const QColor rowForeground = QColor(QStringLiteral("#f4f7fb"));
+            const QString clipLabel = clipLabelForId(marker.clipId);
+            auto* clipItem = new QTableWidgetItem(QString());
+            clipItem->setData(Qt::UserRole, marker.clipId);
+            clipItem->setData(Qt::UserRole + 1, QVariant::fromValue(static_cast<qint64>(marker.frame)));
+            clipItem->setFlags(clipItem->flags() & ~Qt::ItemIsEditable);
+            clipItem->setToolTip(clipLabel);
+            auto* frameItem = new QTableWidgetItem(QString::number(marker.frame));
+            auto* countItem = new QTableWidgetItem(QString::number(marker.count));
+            auto* actionItem = new QTableWidgetItem(
+                marker.action == RenderSyncAction::DuplicateFrame ? QStringLiteral("Duplicate")
+                                                                  : QStringLiteral("Skip"));
+            for (QTableWidgetItem* item : {clipItem, frameItem, countItem, actionItem}) {
+                item->setBackground(rowBackground);
+                item->setForeground(rowForeground);
+            }
+            m_syncTable->setItem(i, 0, clipItem);
+            m_syncTable->setItem(i, 1, frameItem);
+            m_syncTable->setItem(i, 2, countItem);
+            m_syncTable->setItem(i, 3, actionItem);
+        }
+        m_updatingSyncInspector = false;
     }
     
     QJsonObject clipToJson(const TimelineClip& clip) const {
@@ -2475,6 +3236,10 @@ private:
     }
     
     void loadState() {
+        loadProjectsFromFolders();
+        m_historyEntries = QJsonArray();
+        m_historyIndex = -1;
+        m_lastSavedState.clear();
         QJsonObject root;
         QFile historyFile(historyFilePath());
         if (historyFile.open(QIODevice::ReadOnly)) {
@@ -2518,10 +3283,15 @@ private:
                           "QPushButton#folderPicker:hover { color: #ffffff; }"
                           "QToolButton#explorerRefresh { background: transparent; border: 1px solid #24303c; border-radius: 8px; color: #dce5ee; padding: 4px 8px; }"
                           "QToolButton#explorerRefresh:hover { background: #1a2330; color: #ffffff; }"
+                          "QToolButton#projectAction { background: transparent; border: 1px solid #24303c; border-radius: 8px; color: #dce5ee; padding: 4px 8px; }"
+                          "QToolButton#projectAction:hover { background: #1a2330; color: #ffffff; }"
                           "QLabel#rootPath { color: #8ea0b2; font-size: 11px; letter-spacing: 0; }"
                           "QTreeView { background: transparent; border: none; color: #dbe2ea; }"
                           "QTreeView::item { padding: 4px 0; }"
-                          "QTreeView::item:selected { background: #213042; color: #f7fbff; }"));
+                          "QTreeView::item:selected { background: #213042; color: #f7fbff; }"
+                          "QListWidget#projectsList { background: transparent; border: 1px solid #24303c; border-radius: 8px; color: #dbe2ea; }"
+                          "QListWidget#projectsList::item { padding: 6px 8px; }"
+                          "QListWidget#projectsList::item:selected { background: #213042; color: #f7fbff; }"));
         
         auto* layout = new QVBoxLayout(pane);
         layout->setContentsMargins(14, 14, 14, 14);
@@ -2601,6 +3371,31 @@ private:
         galleryLayout->addWidget(m_galleryList, 1);
         m_explorerStack->addWidget(galleryPage);
         layout->addWidget(m_explorerStack, 1);
+
+        auto* projectsHeader = new QHBoxLayout;
+        projectsHeader->setContentsMargins(0, 0, 0, 0);
+        projectsHeader->setSpacing(8);
+        m_projectSectionLabel = new QLabel(QStringLiteral("PROJECTS"), pane);
+        projectsHeader->addWidget(m_projectSectionLabel);
+        projectsHeader->addStretch(1);
+        m_saveProjectAsButton = new QToolButton(pane);
+        m_saveProjectAsButton->setObjectName(QStringLiteral("projectAction"));
+        m_saveProjectAsButton->setText(QStringLiteral("Save As"));
+        m_saveProjectAsButton->setCursor(Qt::PointingHandCursor);
+        projectsHeader->addWidget(m_saveProjectAsButton);
+        m_newProjectButton = new QToolButton(pane);
+        m_newProjectButton->setObjectName(QStringLiteral("projectAction"));
+        m_newProjectButton->setText(QStringLiteral("New Project"));
+        m_newProjectButton->setCursor(Qt::PointingHandCursor);
+        projectsHeader->addWidget(m_newProjectButton);
+        layout->addLayout(projectsHeader);
+
+        m_projectsList = new QListWidget(pane);
+        m_projectsList->setObjectName(QStringLiteral("projectsList"));
+        m_projectsList->setSelectionMode(QAbstractItemView::SingleSelection);
+        m_projectsList->setContextMenuPolicy(Qt::CustomContextMenu);
+        m_projectsList->setMaximumHeight(160);
+        layout->addWidget(m_projectsList, 0);
         
         connect(m_tree, &QTreeView::doubleClicked, this, [this](const QModelIndex& index) {
             if (!m_fsModel) return;
@@ -2623,11 +3418,50 @@ private:
                 hideExplorerHoverPreview();
                 return;
             }
-            showExplorerHoverPreview(info.absoluteFilePath(),
-                                     m_tree->viewport()->mapToGlobal(m_tree->visualRect(index).bottomRight()));
+            showExplorerHoverPreview(info.absoluteFilePath());
         });
         connect(m_tree, &QAbstractItemView::viewportEntered, this, [this]() {
             hideExplorerHoverPreview();
+        });
+        connect(m_newProjectButton, &QToolButton::clicked, this, [this]() {
+            createProject();
+        });
+        connect(m_saveProjectAsButton, &QToolButton::clicked, this, [this]() {
+            saveProjectAs();
+        });
+        connect(m_projectsList, &QListWidget::itemSelectionChanged, this, [this]() {
+            if (m_updatingProjectsList || !m_projectsList) {
+                return;
+            }
+            QListWidgetItem* item = m_projectsList->currentItem();
+            if (!item) {
+                return;
+            }
+            switchToProject(item->data(Qt::UserRole).toString());
+        });
+        connect(m_projectsList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* item) {
+            if (!item) {
+                return;
+            }
+            renameProject(item->data(Qt::UserRole).toString());
+        });
+        connect(m_projectsList, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+            if (!m_projectsList) {
+                return;
+            }
+            QListWidgetItem* item = m_projectsList->itemAt(pos);
+            if (!item) {
+                return;
+            }
+            QMenu menu(m_projectsList);
+            QAction* saveAsAction = menu.addAction(QStringLiteral("Save Project As..."));
+            QAction* renameAction = menu.addAction(QStringLiteral("Rename"));
+            QAction* chosen = menu.exec(m_projectsList->viewport()->mapToGlobal(pos));
+            if (chosen == saveAsAction) {
+                saveProjectAs();
+            } else if (chosen == renameAction) {
+                renameProject(item->data(Qt::UserRole).toString());
+            }
         });
         m_tree->setContextMenuPolicy(Qt::CustomContextMenu);
         connect(m_tree, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
@@ -2685,8 +3519,7 @@ private:
                 hideExplorerHoverPreview();
                 return;
             }
-            showExplorerHoverPreview(path,
-                                     m_galleryList->viewport()->mapToGlobal(m_galleryList->visualItemRect(item).bottomRight()));
+            showExplorerHoverPreview(path);
         });
         connect(m_galleryList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* item) {
             if (!item) {
@@ -2788,8 +3621,6 @@ private:
         
         m_playButton = new QPushButton(style()->standardIcon(QStyle::SP_MediaPlay), QStringLiteral("Play"));
         m_playButton->setObjectName(QStringLiteral("transport.play"));
-        auto* pauseButton = new QPushButton(style()->standardIcon(QStyle::SP_MediaPause), QStringLiteral("Pause"));
-        pauseButton->setObjectName(QStringLiteral("transport.pause"));
         auto* startButton = new QToolButton;
         auto* endButton = new QToolButton;
         startButton->setObjectName(QStringLiteral("transport.start"));
@@ -2821,7 +3652,6 @@ private:
         fflush(stderr);
         transportLayout->addWidget(startButton);
         transportLayout->addWidget(m_playButton);
-        transportLayout->addWidget(pauseButton);
         transportLayout->addWidget(endButton);
         transportLayout->addWidget(m_seekSlider, 1);
         transportLayout->addWidget(m_timecodeLabel);
@@ -2844,27 +3674,7 @@ private:
         verticalSplitter->setStretchFactor(1, 2);
         verticalSplitter->setSizes({540, 320});
         
-        connect(m_playButton, &QPushButton::clicked, this, [this]() {
-            if (m_audioEngine && m_audioEngine->hasPlayableAudio()) {
-                m_audioEngine->start(m_timeline->currentFrame());
-            }
-            advanceFrame();
-            m_playbackTimer.start();
-            m_fastPlaybackActive.store(true);
-            m_preview->setPlaybackState(true);
-            refreshInspector();
-            scheduleSaveState();
-        });
-        connect(pauseButton, &QPushButton::clicked, this, [this]() {
-            if (m_audioEngine) {
-                m_audioEngine->stop();
-            }
-            m_playbackTimer.stop();
-            m_fastPlaybackActive.store(false);
-            m_preview->setPlaybackState(false);
-            refreshInspector();
-            scheduleSaveState();
-        });
+        connect(m_playButton, &QPushButton::clicked, this, [this]() { togglePlayback(); });
         connect(startButton, &QToolButton::clicked, this, [this]() {
             setCurrentFrame(0);
         });
@@ -2899,6 +3709,7 @@ private:
             syncSliderRange();
             m_preview->setClipCount(m_timeline->clips().size());
             m_preview->setTimelineClips(m_timeline->clips());
+            m_preview->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
             m_preview->setSelectedClipId(m_timeline->selectedClipId());
             if (m_audioEngine) {
                 m_audioEngine->setTimelineClips(m_timeline->clips());
@@ -2912,6 +3723,12 @@ private:
             refreshInspector();
         };
         m_timeline->renderSyncMarkersChanged = [this]() {
+            m_preview->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
+            refreshInspector();
+            scheduleSaveState();
+            pushHistorySnapshot();
+        };
+        m_timeline->exportRangeChanged = [this]() {
             refreshInspector();
             scheduleSaveState();
             pushHistorySnapshot();
@@ -2919,6 +3736,9 @@ private:
         m_timeline->gradingRequested = [this]() {
             focusGradingTab();
             refreshInspector();
+        };
+        m_timeline->transcribeRequested = [this](const QString& filePath, const QString& label) {
+            openTranscriptionWindow(filePath, label);
         };
         m_preview->selectionRequested = [this](const QString& clipId) {
             if (!m_timeline) {
@@ -2936,29 +3756,22 @@ private:
                     return;
                 }
                 const TimelineClip::TransformKeyframe offset = evaluateClipKeyframeOffsetAtFrame(clip, currentFrame);
-                const qreal offsetScaleX = sanitizeScaleValue(offset.scaleX);
-                const qreal offsetScaleY = sanitizeScaleValue(offset.scaleY);
-                if (m_keyframeModeCheckBox && !m_keyframeModeCheckBox->isChecked()) {
-                    clip.baseScaleX = sanitizeScaleValue(scaleX / offsetScaleX);
-                    clip.baseScaleY = sanitizeScaleValue(scaleY / offsetScaleY);
-                } else {
-                    const int64_t keyframeFrame =
-                        qBound<int64_t>(0, currentFrame - clip.startFrame, qMax<int64_t>(0, clip.durationFrames - 1));
-                    TimelineClip::TransformKeyframe keyframe = offset;
-                    keyframe.frame = keyframeFrame;
-                    keyframe.scaleX = sanitizeScaleValue(scaleX / sanitizeScaleValue(clip.baseScaleX));
-                    keyframe.scaleY = sanitizeScaleValue(scaleY / sanitizeScaleValue(clip.baseScaleY));
-                    bool replaced = false;
-                    for (TimelineClip::TransformKeyframe& existing : clip.transformKeyframes) {
-                        if (existing.frame == keyframeFrame) {
-                            existing = keyframe;
-                            replaced = true;
-                            break;
-                        }
+                const int64_t keyframeFrame =
+                    qBound<int64_t>(0, currentFrame - clip.startFrame, qMax<int64_t>(0, clip.durationFrames - 1));
+                TimelineClip::TransformKeyframe keyframe = offset;
+                keyframe.frame = keyframeFrame;
+                keyframe.scaleX = sanitizeScaleValue(scaleX / sanitizeScaleValue(clip.baseScaleX));
+                keyframe.scaleY = sanitizeScaleValue(scaleY / sanitizeScaleValue(clip.baseScaleY));
+                bool replaced = false;
+                for (TimelineClip::TransformKeyframe& existing : clip.transformKeyframes) {
+                    if (existing.frame == keyframeFrame) {
+                        existing = keyframe;
+                        replaced = true;
+                        break;
                     }
-                    if (!replaced) {
-                        clip.transformKeyframes.push_back(keyframe);
-                    }
+                }
+                if (!replaced) {
+                    clip.transformKeyframes.push_back(keyframe);
                 }
                 normalizeClipTransformKeyframes(clip);
             });
@@ -2966,6 +3779,7 @@ private:
                 return;
             }
             m_preview->setTimelineClips(m_timeline->clips());
+            m_preview->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
             refreshInspector();
             scheduleSaveState();
             if (finalize) {
@@ -2982,27 +3796,22 @@ private:
                     return;
                 }
                 const TimelineClip::TransformKeyframe offset = evaluateClipKeyframeOffsetAtFrame(clip, currentFrame);
-                if (m_keyframeModeCheckBox && !m_keyframeModeCheckBox->isChecked()) {
-                    clip.baseTranslationX = translationX - offset.translationX;
-                    clip.baseTranslationY = translationY - offset.translationY;
-                } else {
-                    const int64_t keyframeFrame =
-                        qBound<int64_t>(0, currentFrame - clip.startFrame, qMax<int64_t>(0, clip.durationFrames - 1));
-                    TimelineClip::TransformKeyframe keyframe = offset;
-                    keyframe.frame = keyframeFrame;
-                    keyframe.translationX = translationX - clip.baseTranslationX;
-                    keyframe.translationY = translationY - clip.baseTranslationY;
-                    bool replaced = false;
-                    for (TimelineClip::TransformKeyframe& existing : clip.transformKeyframes) {
-                        if (existing.frame == keyframeFrame) {
-                            existing = keyframe;
-                            replaced = true;
-                            break;
-                        }
+                const int64_t keyframeFrame =
+                    qBound<int64_t>(0, currentFrame - clip.startFrame, qMax<int64_t>(0, clip.durationFrames - 1));
+                TimelineClip::TransformKeyframe keyframe = offset;
+                keyframe.frame = keyframeFrame;
+                keyframe.translationX = translationX - clip.baseTranslationX;
+                keyframe.translationY = translationY - clip.baseTranslationY;
+                bool replaced = false;
+                for (TimelineClip::TransformKeyframe& existing : clip.transformKeyframes) {
+                    if (existing.frame == keyframeFrame) {
+                        existing = keyframe;
+                        replaced = true;
+                        break;
                     }
-                    if (!replaced) {
-                        clip.transformKeyframes.push_back(keyframe);
-                    }
+                }
+                if (!replaced) {
+                    clip.transformKeyframes.push_back(keyframe);
                 }
                 normalizeClipTransformKeyframes(clip);
             });
@@ -3010,6 +3819,7 @@ private:
                 return;
             }
             m_preview->setTimelineClips(m_timeline->clips());
+            m_preview->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
             refreshInspector();
             scheduleSaveState();
             if (finalize) {
@@ -3029,6 +3839,10 @@ private:
             QStringLiteral("QFrame { background: #11161c; color: #e8edf2; }"
                            "QLabel#inspectorTitle { color: #dce5ee; font-weight: 700; letter-spacing: 0.08em; }"
                            "QLabel#inspectorMeta { color: #91a3b4; }"
+                           "QCheckBox { color: #e8edf2; spacing: 8px; }"
+                           "QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #4b6074; border-radius: 4px; background: #17202a; }"
+                           "QCheckBox::indicator:checked { background: #5da2ff; border-color: #5da2ff; }"
+                           "QCheckBox::indicator:disabled { background: #141a20; border-color: #26323e; }"
                            "QDoubleSpinBox, QSpinBox, QComboBox { background: #1b2430; border: 1px solid #2e3b4a; border-radius: 6px; padding: 6px; color: #edf2f7; }"
                            "QTabWidget::pane { border: 1px solid #222c36; border-radius: 8px; }"
                            "QTabBar::tab { background: #17202a; color: #f4f7fb; padding: 8px 12px; margin-right: 2px; }"
@@ -3089,7 +3903,7 @@ private:
         auto* videoLayout = new QVBoxLayout(videoTab);
         videoLayout->setContentsMargins(12, 12, 12, 12);
         videoLayout->setSpacing(10);
-        m_videoInspectorClipLabel = new QLabel(QStringLiteral("Video output"), videoTab);
+        m_videoInspectorClipLabel = new QLabel(QStringLiteral("Output"), videoTab);
         m_videoInspectorClipLabel->setObjectName(QStringLiteral("inspectorTitle"));
         m_videoInspectorDetailsLabel = new QLabel(QStringLiteral("Configure output dimensions and format for rendering."), videoTab);
         m_videoInspectorDetailsLabel->setObjectName(QStringLiteral("inspectorMeta"));
@@ -3116,53 +3930,23 @@ private:
         m_outputFormatCombo->addItem(QStringLiteral("MKV (FFV1)"), QStringLiteral("mkv"));
         m_outputFormatCombo->addItem(QStringLiteral("WebM (VP9)"), QStringLiteral("webm"));
         videoForm->addRow(QStringLiteral("Output Format"), m_outputFormatCombo);
+        m_exportOnlyTranscriptWordsCheckBox =
+            new QCheckBox(QStringLiteral("Only export frames with transcript words"), videoTab);
+        videoForm->addRow(QStringLiteral("Speech Filter"), m_exportOnlyTranscriptWordsCheckBox);
+        m_exportStartSpin = new QSpinBox(videoTab);
+        m_exportStartSpin->setRange(0, INT_MAX);
+        videoForm->addRow(QStringLiteral("Export Start"), m_exportStartSpin);
 
-        m_videoTranslationXSpin = new QDoubleSpinBox(videoTab);
-        m_videoTranslationXSpin->setRange(-4000.0, 4000.0);
-        m_videoTranslationXSpin->setDecimals(1);
-        m_videoTranslationXSpin->setSingleStep(10.0);
-        videoForm->addRow(QStringLiteral("Translate X"), m_videoTranslationXSpin);
-
-        m_videoTranslationYSpin = new QDoubleSpinBox(videoTab);
-        m_videoTranslationYSpin->setRange(-4000.0, 4000.0);
-        m_videoTranslationYSpin->setDecimals(1);
-        m_videoTranslationYSpin->setSingleStep(10.0);
-        videoForm->addRow(QStringLiteral("Translate Y"), m_videoTranslationYSpin);
-
-        m_videoRotationSpin = new QDoubleSpinBox(videoTab);
-        m_videoRotationSpin->setRange(-3600.0, 3600.0);
-        m_videoRotationSpin->setDecimals(1);
-        m_videoRotationSpin->setSingleStep(5.0);
-        videoForm->addRow(QStringLiteral("Rotation"), m_videoRotationSpin);
-
-        m_videoScaleXSpin = new QDoubleSpinBox(videoTab);
-        m_videoScaleXSpin->setRange(-20.0, 20.0);
-        m_videoScaleXSpin->setDecimals(3);
-        m_videoScaleXSpin->setSingleStep(0.05);
-        m_videoScaleXSpin->setValue(1.0);
-        videoForm->addRow(QStringLiteral("Scale X"), m_videoScaleXSpin);
-
-        m_videoScaleYSpin = new QDoubleSpinBox(videoTab);
-        m_videoScaleYSpin->setRange(-20.0, 20.0);
-        m_videoScaleYSpin->setDecimals(3);
-        m_videoScaleYSpin->setSingleStep(0.05);
-        m_videoScaleYSpin->setValue(1.0);
-        videoForm->addRow(QStringLiteral("Scale Y"), m_videoScaleYSpin);
-
-        m_videoInterpolationCombo = new QComboBox(videoTab);
-        m_videoInterpolationCombo->addItem(QStringLiteral("Interpolated"));
-        m_videoInterpolationCombo->addItem(QStringLiteral("Sudden"));
-        videoForm->addRow(QStringLiteral("To This Keyframe"), m_videoInterpolationCombo);
+        m_exportEndSpin = new QSpinBox(videoTab);
+        m_exportEndSpin->setRange(0, INT_MAX);
+        videoForm->addRow(QStringLiteral("Export End"), m_exportEndSpin);
         videoLayout->addLayout(videoForm);
-
-        m_addVideoKeyframeButton = new QPushButton(QStringLiteral("Add/Update Keyframe"), videoTab);
-        videoLayout->addWidget(m_addVideoKeyframeButton, 0, Qt::AlignLeft);
 
         m_renderButton = new QPushButton(QStringLiteral("Render"), videoTab);
         m_renderButton->setObjectName(QStringLiteral("video.render"));
         videoLayout->addWidget(m_renderButton, 0, Qt::AlignLeft);
         videoLayout->addStretch(1);
-        m_inspectorTabs->addTab(videoTab, QStringLiteral("Video"));
+        m_inspectorTabs->addTab(videoTab, QStringLiteral("Output"));
 
         auto* keyframesTab = new QWidget(m_inspectorTabs);
         auto* keyframesLayout = new QVBoxLayout(keyframesTab);
@@ -3175,9 +3959,57 @@ private:
         m_keyframesInspectorDetailsLabel->setWordWrap(true);
         keyframesLayout->addWidget(m_keyframesInspectorClipLabel);
         keyframesLayout->addWidget(m_keyframesInspectorDetailsLabel);
-        m_keyframeModeCheckBox = new QCheckBox(QStringLiteral("Keyframe Mode"), keyframesTab);
-        m_keyframeModeCheckBox->setChecked(true);
-        keyframesLayout->addWidget(m_keyframeModeCheckBox);
+        m_keyframeSpaceCheckBox = new QCheckBox(QStringLiteral("Show Clip-Relative Values"), keyframesTab);
+        m_keyframeSpaceCheckBox->setChecked(true);
+        keyframesLayout->addWidget(m_keyframeSpaceCheckBox);
+        auto* keyframeForm = new QFormLayout;
+        m_videoTranslationXSpin = new QDoubleSpinBox(keyframesTab);
+        m_videoTranslationXSpin->setRange(-4000.0, 4000.0);
+        m_videoTranslationXSpin->setDecimals(1);
+        m_videoTranslationXSpin->setSingleStep(10.0);
+        keyframeForm->addRow(QStringLiteral("Translate X"), m_videoTranslationXSpin);
+
+        m_videoTranslationYSpin = new QDoubleSpinBox(keyframesTab);
+        m_videoTranslationYSpin->setRange(-4000.0, 4000.0);
+        m_videoTranslationYSpin->setDecimals(1);
+        m_videoTranslationYSpin->setSingleStep(10.0);
+        keyframeForm->addRow(QStringLiteral("Translate Y"), m_videoTranslationYSpin);
+
+        m_videoRotationSpin = new QDoubleSpinBox(keyframesTab);
+        m_videoRotationSpin->setRange(-3600.0, 3600.0);
+        m_videoRotationSpin->setDecimals(1);
+        m_videoRotationSpin->setSingleStep(5.0);
+        keyframeForm->addRow(QStringLiteral("Rotation"), m_videoRotationSpin);
+
+        m_videoScaleXSpin = new QDoubleSpinBox(keyframesTab);
+        m_videoScaleXSpin->setRange(-20.0, 20.0);
+        m_videoScaleXSpin->setDecimals(3);
+        m_videoScaleXSpin->setSingleStep(0.05);
+        m_videoScaleXSpin->setValue(1.0);
+        keyframeForm->addRow(QStringLiteral("Scale X"), m_videoScaleXSpin);
+
+        m_videoScaleYSpin = new QDoubleSpinBox(keyframesTab);
+        m_videoScaleYSpin->setRange(-20.0, 20.0);
+        m_videoScaleYSpin->setDecimals(3);
+        m_videoScaleYSpin->setSingleStep(0.05);
+        m_videoScaleYSpin->setValue(1.0);
+        keyframeForm->addRow(QStringLiteral("Scale Y"), m_videoScaleYSpin);
+        m_mirrorHorizontalCheckBox = new QCheckBox(QStringLiteral("Mirror Horizontal"), keyframesTab);
+        keyframeForm->addRow(QStringLiteral(""), m_mirrorHorizontalCheckBox);
+
+        m_mirrorVerticalCheckBox = new QCheckBox(QStringLiteral("Mirror Vertical"), keyframesTab);
+        keyframeForm->addRow(QStringLiteral(""), m_mirrorVerticalCheckBox);
+
+        m_lockVideoScaleCheckBox = new QCheckBox(QStringLiteral("Lock X / Y Scale"), keyframesTab);
+        keyframeForm->addRow(QStringLiteral(""), m_lockVideoScaleCheckBox);
+
+        m_videoInterpolationCombo = new QComboBox(keyframesTab);
+        m_videoInterpolationCombo->addItem(QStringLiteral("Interpolated"));
+        m_videoInterpolationCombo->addItem(QStringLiteral("Sudden"));
+        keyframeForm->addRow(QStringLiteral("To This Keyframe"), m_videoInterpolationCombo);
+        keyframesLayout->addLayout(keyframeForm);
+        m_addVideoKeyframeButton = new QPushButton(QStringLiteral("Add/Update Keyframe"), keyframesTab);
+        keyframesLayout->addWidget(m_addVideoKeyframeButton, 0, Qt::AlignLeft);
         m_videoKeyframeTable = new QTableWidget(keyframesTab);
         m_videoKeyframeTable->setColumnCount(7);
         m_videoKeyframeTable->setHorizontalHeaderLabels(
@@ -3188,6 +4020,7 @@ private:
         m_videoKeyframeTable->setEditTriggers(QAbstractItemView::DoubleClicked |
                                               QAbstractItemView::EditKeyPressed |
                                               QAbstractItemView::SelectedClicked);
+        m_videoKeyframeTable->setContextMenuPolicy(Qt::CustomContextMenu);
         m_videoKeyframeTable->verticalHeader()->setVisible(false);
         m_videoKeyframeTable->horizontalHeader()->setStretchLastSection(true);
         m_videoKeyframeTable->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
@@ -3209,7 +4042,65 @@ private:
         audioLayout->addWidget(m_audioInspectorDetailsLabel);
         audioLayout->addStretch(1);
         m_inspectorTabs->addTab(audioTab, QStringLiteral("Audio"));
+
+        auto* transcriptTab = new QWidget(m_inspectorTabs);
+        auto* transcriptLayout = new QVBoxLayout(transcriptTab);
+        transcriptLayout->setContentsMargins(12, 12, 12, 12);
+        transcriptLayout->setSpacing(10);
+        m_transcriptInspectorClipLabel = new QLabel(QStringLiteral("No transcript selected"), transcriptTab);
+        m_transcriptInspectorClipLabel->setObjectName(QStringLiteral("inspectorTitle"));
+        m_transcriptInspectorDetailsLabel = new QLabel(QStringLiteral("Select a clip with a WhisperX JSON transcript."), transcriptTab);
+        m_transcriptInspectorDetailsLabel->setObjectName(QStringLiteral("inspectorMeta"));
+        m_transcriptInspectorDetailsLabel->setWordWrap(true);
+        transcriptLayout->addWidget(m_transcriptInspectorClipLabel);
+        transcriptLayout->addWidget(m_transcriptInspectorDetailsLabel);
+        m_transcriptTable = new QTableWidget(transcriptTab);
+        m_transcriptTable->setColumnCount(3);
+        m_transcriptTable->setHorizontalHeaderLabels(
+            {QStringLiteral("Start"), QStringLiteral("End"), QStringLiteral("Text")});
+        m_transcriptTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+        m_transcriptTable->setSelectionMode(QAbstractItemView::SingleSelection);
+        m_transcriptTable->setEditTriggers(QAbstractItemView::DoubleClicked |
+                                           QAbstractItemView::EditKeyPressed |
+                                           QAbstractItemView::SelectedClicked);
+        m_transcriptTable->verticalHeader()->setVisible(false);
+        m_transcriptTable->horizontalHeader()->setStretchLastSection(true);
+        m_transcriptTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+        m_transcriptTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        transcriptLayout->addWidget(m_transcriptTable, 1);
+        m_inspectorTabs->addTab(transcriptTab, QStringLiteral("Transcript"));
+
+        auto* syncTab = new QWidget(m_inspectorTabs);
+        auto* syncLayout = new QVBoxLayout(syncTab);
+        syncLayout->setContentsMargins(12, 12, 12, 12);
+        syncLayout->setSpacing(10);
+        m_syncInspectorClipLabel = new QLabel(QStringLiteral("Sync"), syncTab);
+        m_syncInspectorClipLabel->setObjectName(QStringLiteral("inspectorTitle"));
+        m_syncInspectorDetailsLabel = new QLabel(QStringLiteral("Timeline render sync markers."), syncTab);
+        m_syncInspectorDetailsLabel->setObjectName(QStringLiteral("inspectorMeta"));
+        m_syncInspectorDetailsLabel->setWordWrap(true);
+        syncLayout->addWidget(m_syncInspectorClipLabel);
+        syncLayout->addWidget(m_syncInspectorDetailsLabel);
+        m_syncTable = new QTableWidget(syncTab);
+        m_syncTable->setColumnCount(4);
+        m_syncTable->setHorizontalHeaderLabels(
+            {QStringLiteral("Clip"), QStringLiteral("Frame"), QStringLiteral("Count"), QStringLiteral("Action")});
+        m_syncTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+        m_syncTable->setSelectionMode(QAbstractItemView::SingleSelection);
+        m_syncTable->setEditTriggers(QAbstractItemView::DoubleClicked |
+                                     QAbstractItemView::EditKeyPressed |
+                                     QAbstractItemView::SelectedClicked);
+        m_syncTable->verticalHeader()->setVisible(false);
+        m_syncTable->horizontalHeader()->setStretchLastSection(true);
+        m_syncTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+        m_syncTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        m_syncTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+        syncLayout->addWidget(m_syncTable, 1);
+        m_inspectorTabs->addTab(syncTab, QStringLiteral("Sync"));
         layout->addWidget(m_inspectorTabs, 1);
+        connect(m_inspectorTabs, &QTabWidget::currentChanged, this, [this](int) {
+            scheduleSaveState();
+        });
 
         connect(m_outputWidthSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) {
             if (m_preview) {
@@ -3231,11 +4122,127 @@ private:
             scheduleSaveState();
             refreshInspector();
         });
+        connect(m_exportOnlyTranscriptWordsCheckBox, &QCheckBox::toggled, this, [this](bool) {
+            scheduleSaveState();
+            refreshInspector();
+        });
+        connect(m_exportStartSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+            if (!m_timeline || m_loadingState) {
+                return;
+            }
+            m_timeline->setExportRange(value, m_timeline->exportEndFrame());
+            refreshInspector();
+        });
+        connect(m_exportEndSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+            if (!m_timeline || m_loadingState) {
+                return;
+            }
+            m_timeline->setExportRange(m_timeline->exportStartFrame(), value);
+            refreshInspector();
+        });
         connect(m_bypassGradingCheckBox, &QCheckBox::toggled, this, [this](bool checked) {
             if (m_preview) {
                 m_preview->setBypassGrading(checked);
             }
             refreshInspector();
+        });
+        connect(m_transcriptTable, &QTableWidget::cellChanged, this, [this](int row, int column) {
+            if (m_updatingTranscriptInspector || !m_transcriptTable || row < 0 || column < 0 ||
+                m_loadedTranscriptPath.isEmpty() || m_loadedTranscriptDoc.isNull()) {
+                return;
+            }
+
+            QTableWidgetItem* item = m_transcriptTable->item(row, column);
+            if (!item) {
+                return;
+            }
+            QTableWidgetItem* anchorItem = m_transcriptTable->item(row, 0);
+            if (!anchorItem) {
+                return;
+            }
+            const int segmentIndex = anchorItem->data(Qt::UserRole).toInt();
+            const int wordIndex = anchorItem->data(Qt::UserRole + 1).toInt();
+
+            QJsonObject root = m_loadedTranscriptDoc.object();
+            QJsonArray segments = root.value(QStringLiteral("segments")).toArray();
+            if (segmentIndex < 0 || segmentIndex >= segments.size()) {
+                refreshInspector();
+                return;
+            }
+            QJsonObject segmentObj = segments[segmentIndex].toObject();
+            QJsonArray words = segmentObj.value(QStringLiteral("words")).toArray();
+            if (wordIndex < 0 || wordIndex >= words.size()) {
+                refreshInspector();
+                return;
+            }
+            QJsonObject wordObj = words[wordIndex].toObject();
+
+            if (column == 0 || column == 1) {
+                double seconds = 0.0;
+                if (!parseTranscriptTime(item->text(), &seconds)) {
+                    refreshInspector();
+                    return;
+                }
+                wordObj[column == 0 ? QStringLiteral("start") : QStringLiteral("end")] = seconds;
+            } else if (column == 2) {
+                wordObj[QStringLiteral("word")] = item->text();
+            }
+
+            words[wordIndex] = wordObj;
+            segmentObj[QStringLiteral("words")] = words;
+            segments[segmentIndex] = segmentObj;
+            root[QStringLiteral("segments")] = segments;
+            m_loadedTranscriptDoc = QJsonDocument(root);
+            if (!saveTranscriptJson(m_loadedTranscriptPath, m_loadedTranscriptDoc)) {
+                QMessageBox::warning(this,
+                                     QStringLiteral("Transcript Save Failed"),
+                                     QStringLiteral("Could not save transcript changes to:\n%1")
+                                         .arg(QDir::toNativeSeparators(m_loadedTranscriptPath)));
+            }
+            refreshInspector();
+        });
+        connect(m_syncTable, &QTableWidget::cellChanged, this, [this](int row, int column) {
+            if (m_updatingSyncInspector || !m_timeline || !m_syncTable || row < 0 || column < 0) {
+                return;
+            }
+            QTableWidgetItem* clipItem = m_syncTable->item(row, 0);
+            QTableWidgetItem* frameItem = m_syncTable->item(row, 1);
+            QTableWidgetItem* countItem = m_syncTable->item(row, 2);
+            QTableWidgetItem* actionItem = m_syncTable->item(row, 3);
+            if (!clipItem || !frameItem || !countItem || !actionItem) {
+                return;
+            }
+
+            const QString clipId = clipItem->data(Qt::UserRole).toString();
+            const int64_t originalFrame = clipItem->data(Qt::UserRole + 1).toLongLong();
+            bool frameOk = false;
+            bool countOk = false;
+            const int64_t editedFrame = frameItem->text().toLongLong(&frameOk);
+            const int editedCount = countItem->text().toInt(&countOk);
+            RenderSyncAction action = RenderSyncAction::DuplicateFrame;
+            const bool actionOk = parseSyncActionText(actionItem->text(), &action);
+            if (clipId.isEmpty() || !frameOk || !countOk || editedCount < 1 || !actionOk) {
+                refreshInspector();
+                return;
+            }
+
+            QVector<RenderSyncMarker> markers = m_timeline->renderSyncMarkers();
+            bool updated = false;
+            for (RenderSyncMarker& marker : markers) {
+                if (marker.clipId == clipId && marker.frame == originalFrame) {
+                    marker.frame = qMax<int64_t>(0, editedFrame);
+                    marker.count = qMax(1, editedCount);
+                    marker.action = action;
+                    updated = true;
+                    break;
+                }
+            }
+            if (!updated) {
+                refreshInspector();
+                return;
+            }
+
+            m_timeline->setRenderSyncMarkers(markers);
         });
         connect(m_videoKeyframeTable, &QTableWidget::itemSelectionChanged, this, [this]() {
             if (m_updatingVideoInspector) {
@@ -3262,6 +4269,11 @@ private:
             } else {
                 m_selectedVideoKeyframeFrame = -1;
             }
+            const TimelineClip* clip = m_timeline ? m_timeline->selectedClip() : nullptr;
+            if (clip && m_selectedVideoKeyframeFrame >= 0) {
+                setCurrentFrame(clip->startFrame + m_selectedVideoKeyframeFrame);
+                return;
+            }
             refreshInspector();
         });
         connect(m_videoKeyframeTable, &QTableWidget::currentItemChanged, this, [this](QTableWidgetItem* current, QTableWidgetItem*) {
@@ -3280,7 +4292,6 @@ private:
                 return;
             }
             m_selectedVideoKeyframeFrame = frame;
-            refreshInspector();
         });
         connect(m_videoKeyframeTable, &QTableWidget::cellChanged, this, [this](int row, int) {
             if (m_updatingVideoInspector || !m_timeline || row < 0) {
@@ -3302,7 +4313,6 @@ private:
                 return;
             }
             const bool updated = m_timeline->updateClipById(clipId, [this, row, originalFrame, editedFrame](TimelineClip& clip) {
-                const int index = selectedVideoKeyframeIndex(clip);
                 int rowIndex = -1;
                 for (int i = 0; i < clip.transformKeyframes.size(); ++i) {
                     if (clip.transformKeyframes[i].frame == originalFrame) {
@@ -3314,12 +4324,21 @@ private:
                     return;
                 }
                 TimelineClip::TransformKeyframe& keyframe = clip.transformKeyframes[rowIndex];
-                keyframe.frame = qMax<int64_t>(0, editedFrame);
-                keyframe.translationX = m_videoKeyframeTable->item(row, 1)->text().toDouble();
-                keyframe.translationY = m_videoKeyframeTable->item(row, 2)->text().toDouble();
-                keyframe.rotation = m_videoKeyframeTable->item(row, 3)->text().toDouble();
-                keyframe.scaleX = m_videoKeyframeTable->item(row, 4)->text().toDouble();
-                keyframe.scaleY = m_videoKeyframeTable->item(row, 5)->text().toDouble();
+                keyframe.frame = (originalFrame == 0)
+                    ? 0
+                    : qMax<int64_t>(0, keyframeFrameFromInspectorDisplay(clip, editedFrame));
+                TimelineClip::TransformKeyframe displayed = keyframe;
+                displayed.translationX = m_videoKeyframeTable->item(row, 1)->text().toDouble();
+                displayed.translationY = m_videoKeyframeTable->item(row, 2)->text().toDouble();
+                displayed.rotation = m_videoKeyframeTable->item(row, 3)->text().toDouble();
+                displayed.scaleX = m_videoKeyframeTable->item(row, 4)->text().toDouble();
+                displayed.scaleY = m_videoKeyframeTable->item(row, 5)->text().toDouble();
+                const TimelineClip::TransformKeyframe stored = keyframeFromInspectorDisplay(clip, displayed);
+                keyframe.translationX = stored.translationX;
+                keyframe.translationY = stored.translationY;
+                keyframe.rotation = stored.rotation;
+                keyframe.scaleX = stored.scaleX;
+                keyframe.scaleY = stored.scaleY;
                 const QString mode = m_videoKeyframeTable->item(row, 6)->text().trimmed().toLower();
                 keyframe.interpolated = mode != QStringLiteral("sudden");
                 normalizeClipTransformKeyframes(clip);
@@ -3328,7 +4347,11 @@ private:
                 refreshInspector();
                 return;
             }
-            m_selectedVideoKeyframeFrame = qMax<int64_t>(0, editedFrame);
+            const int64_t selectedFrame =
+                (originalFrame == 0)
+                    ? 0
+                    : qMax<int64_t>(0, keyframeFrameFromInspectorDisplay(*m_timeline->selectedClip(), editedFrame));
+            m_selectedVideoKeyframeFrame = selectedFrame;
             m_selectedVideoKeyframeFrames.remove(originalFrame);
             m_selectedVideoKeyframeFrames.insert(m_selectedVideoKeyframeFrame);
             m_preview->setTimelineClips(m_timeline->clips());
@@ -3336,7 +4359,38 @@ private:
             scheduleSaveState();
             pushHistorySnapshot();
         });
-        connect(m_keyframeModeCheckBox, &QCheckBox::toggled, this, [this](bool) {
+        connect(m_videoKeyframeTable, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+            if (!m_videoKeyframeTable || !m_timeline) {
+                return;
+            }
+            const QModelIndex index = m_videoKeyframeTable->indexAt(pos);
+            if (!index.isValid()) {
+                return;
+            }
+            if (!m_videoKeyframeTable->selectionModel()->isRowSelected(index.row(), QModelIndex())) {
+                m_videoKeyframeTable->selectRow(index.row());
+            }
+
+            QMenu menu(m_videoKeyframeTable);
+            QAction* duplicateAboveAction = menu.addAction(QStringLiteral("Duplicate Above (-1 frame)"));
+            QAction* duplicateBelowAction = menu.addAction(QStringLiteral("Duplicate Below (+1 frame)"));
+            menu.addSeparator();
+            QAction* deleteAction = menu.addAction(QStringLiteral("Delete"));
+            const TimelineClip* clip = m_timeline->selectedClip();
+            if (!clip || !hasRemovableVideoKeyframeSelection(*clip)) {
+                deleteAction->setEnabled(false);
+            }
+
+            QAction* chosen = menu.exec(m_videoKeyframeTable->viewport()->mapToGlobal(pos));
+            if (chosen == duplicateAboveAction) {
+                duplicateSelectedClipVideoKeyframes(-1);
+            } else if (chosen == duplicateBelowAction) {
+                duplicateSelectedClipVideoKeyframes(1);
+            } else if (chosen == deleteAction) {
+                removeSelectedClipVideoKeyframe();
+            }
+        });
+        connect(m_keyframeSpaceCheckBox, &QCheckBox::toggled, this, [this](bool) {
             refreshInspector();
         });
         connect(m_addVideoKeyframeButton, &QPushButton::clicked, this, [this]() {
@@ -3357,26 +4411,129 @@ private:
             if (selectedPath.isEmpty()) {
                 return;
             }
-            QString renderSyncSummary = QStringLiteral("none");
-            if (m_timeline && !m_timeline->renderSyncMarkers().isEmpty()) {
-                QStringList items;
-                for (const RenderSyncMarker& marker : m_timeline->renderSyncMarkers()) {
-                    items.append(QStringLiteral("%1 @ %2")
-                                     .arg(renderSyncActionLabel(marker.action))
-                                     .arg(frameToTimecode(marker.frame)));
+            RenderRequest request;
+            request.outputPath = selectedPath;
+            request.outputFormat = extension;
+            request.outputSize = QSize(m_outputWidthSpin ? m_outputWidthSpin->value() : 1080,
+                                       m_outputHeightSpin ? m_outputHeightSpin->value() : 1920);
+            request.clips = m_timeline ? m_timeline->clips() : QVector<TimelineClip>();
+            request.renderSyncMarkers = m_timeline ? m_timeline->renderSyncMarkers() : QVector<RenderSyncMarker>();
+            request.exportRanges = m_timeline ? m_timeline->exportRanges() : QVector<ExportRangeSegment>();
+            request.exportStartFrame = m_timeline ? m_timeline->exportStartFrame() : 0;
+            request.exportEndFrame = m_timeline ? m_timeline->exportEndFrame() : 0;
+            if (m_exportOnlyTranscriptWordsCheckBox && m_exportOnlyTranscriptWordsCheckBox->isChecked()) {
+                request.exportRanges =
+                    transcriptWordExportRanges(request.exportRanges, request.clips, request.renderSyncMarkers);
+                if (request.exportRanges.isEmpty()) {
+                    QMessageBox::information(
+                        this,
+                        QStringLiteral("Nothing To Render"),
+                        QStringLiteral("No transcript words were found inside the current export range."));
+                    return;
                 }
-                renderSyncSummary = items.join(QStringLiteral(", "));
+                request.exportStartFrame = request.exportRanges.constFirst().startFrame;
+                request.exportEndFrame = request.exportRanges.constLast().endFrame;
             }
-            QMessageBox::information(
-                this,
-                QStringLiteral("Render Queued"),
-                QStringLiteral("Render settings\n\nOutput: %1\nResolution: %2x%3\nFormat: %4\nTimeline clips: %5\nRender sync marks: %6")
-                    .arg(QDir::toNativeSeparators(selectedPath))
-                    .arg(m_outputWidthSpin ? m_outputWidthSpin->value() : 1080)
-                    .arg(m_outputHeightSpin ? m_outputHeightSpin->value() : 1920)
-                    .arg(m_outputFormatCombo ? m_outputFormatCombo->currentText() : QStringLiteral("MP4 (H.264)"))
-                    .arg(m_timeline ? m_timeline->clips().size() : 0)
-                    .arg(renderSyncSummary));
+
+            auto* progressDialog = new QDialog(this);
+            progressDialog->setWindowTitle(QStringLiteral("Rendering"));
+            progressDialog->setModal(true);
+            progressDialog->setMinimumWidth(520);
+            progressDialog->setAttribute(Qt::WA_DeleteOnClose, false);
+            auto* progressLayout = new QVBoxLayout(progressDialog);
+            progressLayout->setContentsMargins(18, 18, 18, 18);
+            progressLayout->setSpacing(10);
+
+            auto* titleLabel = new QLabel(QStringLiteral("Rendering Video"), progressDialog);
+            titleLabel->setStyleSheet(QStringLiteral("font-weight: 700; font-size: 16px;"));
+            auto* pathLabel = new QLabel(QDir::toNativeSeparators(selectedPath), progressDialog);
+            pathLabel->setWordWrap(true);
+            auto* pipelineLabel = new QLabel(QStringLiteral("Pipeline: Detecting..."), progressDialog);
+            pipelineLabel->setStyleSheet(QStringLiteral("font-weight: 600; color: #fff4c2;"));
+            auto* statusLabel = new QLabel(QStringLiteral("Preparing render..."), progressDialog);
+            statusLabel->setWordWrap(true);
+            auto* detailLabel = new QLabel(QStringLiteral("Scanning export ranges..."), progressDialog);
+            detailLabel->setWordWrap(true);
+            auto* progressBar = new QProgressBar(progressDialog);
+            progressBar->setRange(0, 1000);
+            progressBar->setValue(0);
+            auto* cancelButton = new QPushButton(QStringLiteral("Cancel"), progressDialog);
+            progressLayout->addWidget(titleLabel);
+            progressLayout->addWidget(pathLabel);
+            progressLayout->addWidget(pipelineLabel);
+            progressLayout->addWidget(statusLabel);
+            progressLayout->addWidget(detailLabel);
+            progressLayout->addWidget(progressBar);
+            progressLayout->addWidget(cancelButton, 0, Qt::AlignRight);
+
+            bool cancelRequested = false;
+            connect(cancelButton, &QPushButton::clicked, progressDialog, [&cancelRequested, cancelButton, statusLabel]() {
+                cancelRequested = true;
+                cancelButton->setEnabled(false);
+                statusLabel->setText(QStringLiteral("Cancelling render..."));
+            });
+
+            progressDialog->show();
+            progressDialog->raise();
+            progressDialog->activateWindow();
+            QApplication::processEvents();
+
+            QApplication::setOverrideCursor(Qt::WaitCursor);
+            const RenderResult renderResult = renderTimelineToFile(
+                request,
+                [this, &cancelRequested, progressDialog, progressBar, pipelineLabel, statusLabel, detailLabel](const RenderProgress& progress) {
+                    if (cancelRequested) {
+                        return false;
+                    }
+                    pipelineLabel->setText(progress.usingGpu
+                                               ? QStringLiteral("Pipeline: GPU Offscreen OpenGL")
+                                               : QStringLiteral("Pipeline: CPU Fallback"));
+                    const int percent = progress.totalFrames > 0
+                        ? qBound(0, qRound((static_cast<double>(progress.framesCompleted) / static_cast<double>(progress.totalFrames)) * 1000.0), 1000)
+                        : 0;
+                    progressBar->setValue(percent);
+                    statusLabel->setText(
+                        QStringLiteral("Frame %1 of %2  (%3%)")
+                            .arg(progress.framesCompleted + 1)
+                            .arg(qMax<int64_t>(1, progress.totalFrames))
+                            .arg(QString::number(percent / 10.0, 'f', 1)));
+                    detailLabel->setText(
+                        QStringLiteral("Segment %1 of %2  |  Timeline frame %3  |  Segment %4 -> %5")
+                            .arg(progress.segmentIndex)
+                            .arg(qMax(1, progress.segmentCount))
+                            .arg(progress.timelineFrame)
+                            .arg(progress.segmentStartFrame)
+                            .arg(progress.segmentEndFrame));
+                    if (progressDialog) {
+                        progressDialog->update();
+                    }
+                    QApplication::processEvents();
+                    return !cancelRequested;
+                });
+            QApplication::restoreOverrideCursor();
+            progressDialog->close();
+            progressDialog->deleteLater();
+
+            if (!renderResult.success) {
+                if (renderResult.cancelled) {
+                    QMessageBox::information(this,
+                                             QStringLiteral("Render Cancelled"),
+                                             renderResult.message);
+                    return;
+                }
+                QMessageBox::warning(this,
+                                     QStringLiteral("Render Failed"),
+                                     renderResult.message);
+                return;
+            }
+
+            QMessageBox::information(this,
+                                     QStringLiteral("Render Complete"),
+                                     renderResult.message +
+                                         QStringLiteral("\nPipeline: %1\n\nAudio included when timeline clips provide it.")
+                                             .arg(renderResult.usedGpu
+                                                      ? QStringLiteral("GPU Offscreen OpenGL")
+                                                      : QStringLiteral("CPU Fallback")));
         });
         return pane;
     }
@@ -3399,6 +4556,61 @@ private:
         }
     }
 
+    bool showClipRelativeKeyframes() const {
+        return !m_keyframeSpaceCheckBox || m_keyframeSpaceCheckBox->isChecked();
+    }
+
+    int64_t keyframeFrameForInspectorDisplay(const TimelineClip& clip, int64_t storedFrame) const {
+        return showClipRelativeKeyframes() ? storedFrame : (clip.startFrame + storedFrame);
+    }
+
+    int64_t keyframeFrameFromInspectorDisplay(const TimelineClip& clip, int64_t displayedFrame) const {
+        return showClipRelativeKeyframes() ? displayedFrame : (displayedFrame - clip.startFrame);
+    }
+
+    qreal inspectorScaleWithMirror(qreal magnitude, bool mirrored) const {
+        const qreal sanitized = sanitizeScaleValue(std::abs(magnitude));
+        return mirrored ? -sanitized : sanitized;
+    }
+
+    void syncScaleSpinPair(QDoubleSpinBox* changedSpin, QDoubleSpinBox* otherSpin) {
+        if (m_syncingScaleControls || !m_lockVideoScaleCheckBox || !m_lockVideoScaleCheckBox->isChecked() ||
+            !changedSpin || !otherSpin) {
+            return;
+        }
+        m_syncingScaleControls = true;
+        otherSpin->setValue(std::abs(changedSpin->value()));
+        m_syncingScaleControls = false;
+    }
+
+    TimelineClip::TransformKeyframe keyframeForInspectorDisplay(const TimelineClip& clip,
+                                                                const TimelineClip::TransformKeyframe& keyframe) const {
+        if (showClipRelativeKeyframes()) {
+            return keyframe;
+        }
+        TimelineClip::TransformKeyframe displayed = keyframe;
+        displayed.translationX = clip.baseTranslationX + keyframe.translationX;
+        displayed.translationY = clip.baseTranslationY + keyframe.translationY;
+        displayed.rotation = clip.baseRotation + keyframe.rotation;
+        displayed.scaleX = sanitizeScaleValue(clip.baseScaleX) * sanitizeScaleValue(keyframe.scaleX);
+        displayed.scaleY = sanitizeScaleValue(clip.baseScaleY) * sanitizeScaleValue(keyframe.scaleY);
+        return displayed;
+    }
+
+    TimelineClip::TransformKeyframe keyframeFromInspectorDisplay(const TimelineClip& clip,
+                                                                 const TimelineClip::TransformKeyframe& displayed) const {
+        if (showClipRelativeKeyframes()) {
+            return displayed;
+        }
+        TimelineClip::TransformKeyframe stored = displayed;
+        stored.translationX = displayed.translationX - clip.baseTranslationX;
+        stored.translationY = displayed.translationY - clip.baseTranslationY;
+        stored.rotation = displayed.rotation - clip.baseRotation;
+        stored.scaleX = sanitizeScaleValue(displayed.scaleX / sanitizeScaleValue(clip.baseScaleX));
+        stored.scaleY = sanitizeScaleValue(displayed.scaleY / sanitizeScaleValue(clip.baseScaleY));
+        return stored;
+    }
+
     int selectedVideoKeyframeIndex(const TimelineClip& clip) const {
         for (int i = 0; i < clip.transformKeyframes.size(); ++i) {
             if (clip.transformKeyframes[i].frame == m_selectedVideoKeyframeFrame) {
@@ -3416,6 +4628,15 @@ private:
             }
         }
         return frames;
+    }
+
+    bool hasRemovableVideoKeyframeSelection(const TimelineClip& clip) const {
+        for (const int64_t frame : selectedVideoKeyframeFrames(clip)) {
+            if (frame > 0) {
+                return true;
+            }
+        }
+        return false;
     }
 
     int nearestVideoKeyframeIndex(const TimelineClip& clip) const {
@@ -3452,11 +4673,20 @@ private:
                 return;
             }
             TimelineClip::TransformKeyframe& keyframe = clip.transformKeyframes[index];
-            keyframe.translationX = m_videoTranslationXSpin->value();
-            keyframe.translationY = m_videoTranslationYSpin->value();
-            keyframe.rotation = m_videoRotationSpin->value();
-            keyframe.scaleX = m_videoScaleXSpin->value();
-            keyframe.scaleY = m_videoScaleYSpin->value();
+            TimelineClip::TransformKeyframe displayed = keyframe;
+            displayed.translationX = m_videoTranslationXSpin->value();
+            displayed.translationY = m_videoTranslationYSpin->value();
+            displayed.rotation = m_videoRotationSpin->value();
+            displayed.scaleX = inspectorScaleWithMirror(m_videoScaleXSpin->value(),
+                                                        m_mirrorHorizontalCheckBox && m_mirrorHorizontalCheckBox->isChecked());
+            displayed.scaleY = inspectorScaleWithMirror(m_videoScaleYSpin->value(),
+                                                        m_mirrorVerticalCheckBox && m_mirrorVerticalCheckBox->isChecked());
+            const TimelineClip::TransformKeyframe stored = keyframeFromInspectorDisplay(clip, displayed);
+            keyframe.translationX = stored.translationX;
+            keyframe.translationY = stored.translationY;
+            keyframe.rotation = stored.rotation;
+            keyframe.scaleX = stored.scaleX;
+            keyframe.scaleY = stored.scaleY;
             keyframe.interpolated = m_videoInterpolationCombo->currentIndex() == 0;
             normalizeClipTransformKeyframes(clip);
         });
@@ -3493,8 +4723,12 @@ private:
             keyframe.translationX = m_videoTranslationXSpin->value();
             keyframe.translationY = m_videoTranslationYSpin->value();
             keyframe.rotation = m_videoRotationSpin->value();
-            keyframe.scaleX = m_videoScaleXSpin->value();
-            keyframe.scaleY = m_videoScaleYSpin->value();
+            keyframe.scaleX = inspectorScaleWithMirror(m_videoScaleXSpin->value(),
+                                                       m_mirrorHorizontalCheckBox && m_mirrorHorizontalCheckBox->isChecked());
+            keyframe.scaleY = inspectorScaleWithMirror(m_videoScaleYSpin->value(),
+                                                       m_mirrorVerticalCheckBox && m_mirrorVerticalCheckBox->isChecked());
+            keyframe = keyframeFromInspectorDisplay(editableClip, keyframe);
+            keyframe.frame = keyframeFrame;
             keyframe.interpolated = m_videoInterpolationCombo->currentIndex() == 0;
 
             bool replaced = false;
@@ -3521,6 +4755,68 @@ private:
         pushHistorySnapshot();
     }
 
+    void duplicateSelectedClipVideoKeyframes(int frameDelta) {
+        if (!m_timeline || frameDelta == 0) {
+            return;
+        }
+        const TimelineClip* selectedClip = m_timeline->selectedClip();
+        if (!selectedClip || !clipHasVisuals(*selectedClip)) {
+            return;
+        }
+
+        const QList<int64_t> selectedFrames = selectedVideoKeyframeFrames(*selectedClip);
+        if (selectedFrames.isEmpty()) {
+            return;
+        }
+
+        QSet<int64_t> sourceFrames;
+        for (int64_t frame : selectedFrames) {
+            sourceFrames.insert(frame);
+        }
+        const int64_t maxFrame = qMax<int64_t>(0, selectedClip->durationFrames - 1);
+        QSet<int64_t> newFrames;
+        const bool updated = m_timeline->updateClipById(selectedClip->id, [frameDelta, maxFrame, sourceFrames, &newFrames](TimelineClip& clip) {
+            bool changed = false;
+            const QVector<TimelineClip::TransformKeyframe> originalKeyframes = clip.transformKeyframes;
+            for (const TimelineClip::TransformKeyframe& keyframe : originalKeyframes) {
+                if (!sourceFrames.contains(keyframe.frame)) {
+                    continue;
+                }
+                const int64_t newFrame = qBound<int64_t>(0, keyframe.frame + frameDelta, maxFrame);
+                TimelineClip::TransformKeyframe duplicate = keyframe;
+                duplicate.frame = newFrame;
+                bool replaced = false;
+                for (TimelineClip::TransformKeyframe& existing : clip.transformKeyframes) {
+                    if (existing.frame == newFrame) {
+                        existing = duplicate;
+                        replaced = true;
+                        changed = true;
+                        break;
+                    }
+                }
+                if (!replaced) {
+                    clip.transformKeyframes.push_back(duplicate);
+                    changed = true;
+                }
+                newFrames.insert(newFrame);
+            }
+            if (changed) {
+                normalizeClipTransformKeyframes(clip);
+            }
+        });
+
+        if (!updated || newFrames.isEmpty()) {
+            return;
+        }
+
+        m_selectedVideoKeyframeFrames = newFrames;
+        m_selectedVideoKeyframeFrame = *std::min_element(newFrames.begin(), newFrames.end());
+        m_preview->setTimelineClips(m_timeline->clips());
+        refreshInspector();
+        scheduleSaveState();
+        pushHistorySnapshot();
+    }
+
     void removeSelectedClipVideoKeyframe() {
         if (!m_timeline || m_selectedVideoKeyframeFrames.isEmpty()) {
             return;
@@ -3534,8 +4830,13 @@ private:
         if (!selectedClip) {
             return;
         }
-        const QList<int64_t> selectedFrames = selectedVideoKeyframeFrames(*selectedClip);
+        QList<int64_t> selectedFrames = selectedVideoKeyframeFrames(*selectedClip);
+        selectedFrames.erase(std::remove_if(selectedFrames.begin(),
+                                            selectedFrames.end(),
+                                            [](int64_t frame) { return frame <= 0; }),
+                             selectedFrames.end());
         if (selectedFrames.isEmpty()) {
+            refreshInspector();
             return;
         }
 
@@ -3554,8 +4855,8 @@ private:
             return;
         }
 
-        m_selectedVideoKeyframeFrame = -1;
-        m_selectedVideoKeyframeFrames.clear();
+        m_selectedVideoKeyframeFrame = 0;
+        m_selectedVideoKeyframeFrames = {0};
         m_preview->setTimelineClips(m_timeline->clips());
         refreshInspector();
         scheduleSaveState();
@@ -3592,6 +4893,31 @@ private:
     
     void setCurrentFrame(int64_t frame, bool syncAudio = true) {
         setCurrentPlaybackSample(frameToSamples(frame), syncAudio);
+    }
+
+    void setPlaybackActive(bool playing) {
+        if (playing) {
+            if (m_audioEngine && m_audioEngine->hasPlayableAudio()) {
+                m_audioEngine->start(m_timeline->currentFrame());
+            }
+            advanceFrame();
+            m_playbackTimer.start();
+            m_fastPlaybackActive.store(true);
+            m_preview->setPlaybackState(true);
+        } else {
+            if (m_audioEngine) {
+                m_audioEngine->stop();
+            }
+            m_playbackTimer.stop();
+            m_fastPlaybackActive.store(false);
+            m_preview->setPlaybackState(false);
+        }
+        refreshInspector();
+        scheduleSaveState();
+    }
+
+    void togglePlayback() {
+        setPlaybackActive(!m_playbackTimer.isActive());
     }
 
     void setCurrentPlaybackSample(int64_t samplePosition, bool syncAudio = true) {
@@ -3652,7 +4978,9 @@ private:
                                    .arg(frameToTimecode(m_timeline ? m_timeline->currentFrame() : 0))
                                    .arg(activeAudio.isEmpty() ? QStringLiteral("idle") : activeAudio)
                                    .arg(m_preview && m_preview->bypassGrading() ? QStringLiteral("bypassed") : QStringLiteral("on")));
-        m_playButton->setText(playing ? QStringLiteral("Playing") : QStringLiteral("Play"));
+        m_playButton->setText(playing ? QStringLiteral("Pause") : QStringLiteral("Play"));
+        m_playButton->setIcon(style()->standardIcon(playing ? QStyle::SP_MediaPause
+                                                            : QStyle::SP_MediaPlay));
         m_audioMuteButton->setText(m_preview && m_preview->audioMuted()
                                        ? QStringLiteral("Unmute")
                                        : QStringLiteral("Mute"));
@@ -3662,6 +4990,15 @@ private:
         if (m_bypassGradingCheckBox) {
             QSignalBlocker block(m_bypassGradingCheckBox);
             m_bypassGradingCheckBox->setChecked(m_preview && m_preview->bypassGrading());
+        }
+        if (m_timeline && m_exportStartSpin && m_exportEndSpin) {
+            const int totalFrames = static_cast<int>(qMin<int64_t>(m_timeline->totalFrames(), INT_MAX));
+            QSignalBlocker block1(m_exportStartSpin);
+            QSignalBlocker block2(m_exportEndSpin);
+            m_exportStartSpin->setRange(0, totalFrames);
+            m_exportEndSpin->setRange(0, totalFrames);
+            m_exportStartSpin->setValue(static_cast<int>(qMin<int64_t>(m_timeline->exportStartFrame(), totalFrames)));
+            m_exportEndSpin->setValue(static_cast<int>(qMin<int64_t>(m_timeline->exportEndFrame(), totalFrames)));
         }
 
         const TimelineClip* clip = m_timeline ? m_timeline->selectedClip() : nullptr;
@@ -3676,28 +5013,48 @@ private:
         m_videoScaleXSpin->setEnabled(enabled);
         m_videoScaleYSpin->setEnabled(enabled);
         m_videoInterpolationCombo->setEnabled(enabled);
+        m_mirrorHorizontalCheckBox->setEnabled(enabled);
+        m_mirrorVerticalCheckBox->setEnabled(enabled);
+        m_lockVideoScaleCheckBox->setEnabled(enabled);
         m_addVideoKeyframeButton->setEnabled(enabled);
         m_videoKeyframeTable->setEnabled(enabled);
+        m_keyframeSpaceCheckBox->setEnabled(enabled);
+        m_transcriptTable->setEnabled(clip != nullptr);
+        m_syncTable->setEnabled(m_timeline != nullptr);
+        refreshSyncInspector();
 
         if (!clip) {
             m_gradingClipLabel->setText(QStringLiteral("No clip selected"));
             m_gradingPathLabel->setText(QStringLiteral("Select a clip in the timeline to grade it live."));
-            m_videoInspectorClipLabel->setText(QStringLiteral("Video output"));
+            m_videoInspectorClipLabel->setText(QStringLiteral("Output"));
             m_videoInspectorDetailsLabel->setText(
-                QStringLiteral("Render %1 clips at %2x%3 as %4.")
+                QStringLiteral("Render %1 clips at %2x%3 as %4.\nExport range: %5 -> %6\nSpeech filter: %7")
                     .arg(m_timeline ? m_timeline->clips().size() : 0)
                     .arg(m_outputWidthSpin ? m_outputWidthSpin->value() : 1080)
                     .arg(m_outputHeightSpin ? m_outputHeightSpin->value() : 1920)
-                    .arg(m_outputFormatCombo ? m_outputFormatCombo->currentText() : QStringLiteral("MP4 (H.264)")));
+                    .arg(m_outputFormatCombo ? m_outputFormatCombo->currentText() : QStringLiteral("MP4 (H.264)"))
+                    .arg(frameToTimecode(m_timeline ? m_timeline->exportStartFrame() : 0))
+                    .arg(frameToTimecode(m_timeline ? m_timeline->exportEndFrame() : 0))
+                    .arg(m_exportOnlyTranscriptWordsCheckBox && m_exportOnlyTranscriptWordsCheckBox->isChecked()
+                             ? QStringLiteral("Only frames with transcript words")
+                             : QStringLiteral("Off")));
             m_keyframesInspectorClipLabel->setText(QStringLiteral("No visual clip selected"));
             m_keyframesInspectorDetailsLabel->setText(QStringLiteral("Select a visual clip to inspect its keyframes."));
-            m_keyframeModeCheckBox->setEnabled(false);
+            m_keyframeSpaceCheckBox->setEnabled(false);
             m_audioInspectorClipLabel->setText(QStringLiteral("No audio clip selected"));
             m_audioInspectorDetailsLabel->setText(QStringLiteral("Select an audio clip to inspect playback details."));
+            m_transcriptInspectorClipLabel->setText(QStringLiteral("No transcript selected"));
+            m_transcriptInspectorDetailsLabel->setText(QStringLiteral("Select a clip with a WhisperX JSON transcript."));
             m_updatingVideoInspector = true;
             m_videoKeyframeTable->clearContents();
             m_videoKeyframeTable->setRowCount(0);
             m_removeVideoKeyframeButton->setEnabled(false);
+            m_updatingTranscriptInspector = true;
+            m_transcriptTable->clearContents();
+            m_transcriptTable->setRowCount(0);
+            m_updatingTranscriptInspector = false;
+            m_loadedTranscriptDoc = QJsonDocument();
+            m_loadedTranscriptPath.clear();
             {
                 QSignalBlocker videoBlock1(m_videoTranslationXSpin);
                 QSignalBlocker videoBlock2(m_videoTranslationYSpin);
@@ -3705,12 +5062,16 @@ private:
                 QSignalBlocker videoBlock4(m_videoScaleXSpin);
                 QSignalBlocker videoBlock5(m_videoScaleYSpin);
                 QSignalBlocker videoBlock6(m_videoInterpolationCombo);
+                QSignalBlocker videoBlock7(m_mirrorHorizontalCheckBox);
+                QSignalBlocker videoBlock8(m_mirrorVerticalCheckBox);
                 m_videoTranslationXSpin->setValue(0.0);
                 m_videoTranslationYSpin->setValue(0.0);
                 m_videoRotationSpin->setValue(0.0);
                 m_videoScaleXSpin->setValue(1.0);
                 m_videoScaleYSpin->setValue(1.0);
                 m_videoInterpolationCombo->setCurrentIndex(0);
+                m_mirrorHorizontalCheckBox->setChecked(false);
+                m_mirrorVerticalCheckBox->setChecked(false);
             }
             m_updatingVideoInspector = false;
             m_selectedVideoKeyframeFrame = -1;
@@ -3733,19 +5094,24 @@ private:
                                                .arg(m_outputWidthSpin ? m_outputWidthSpin->value() : 1080)
                                                .arg(m_outputHeightSpin ? m_outputHeightSpin->value() : 1920));
         m_videoInspectorDetailsLabel->setText(
-            QStringLiteral("Selected clip: %1\nOutput format: %2\nTimeline length: %3")
+            QStringLiteral("Selected clip: %1\nOutput format: %2\nExport range: %3 -> %4\nSpeech filter: %5\nTimeline length: %6")
                 .arg(clip->label)
                 .arg(m_outputFormatCombo ? m_outputFormatCombo->currentText() : QStringLiteral("MP4 (H.264)"))
+                .arg(frameToTimecode(m_timeline ? m_timeline->exportStartFrame() : 0))
+                .arg(frameToTimecode(m_timeline ? m_timeline->exportEndFrame() : 0))
+                .arg(m_exportOnlyTranscriptWordsCheckBox && m_exportOnlyTranscriptWordsCheckBox->isChecked()
+                         ? QStringLiteral("Only frames with transcript words")
+                         : QStringLiteral("Off"))
                 .arg(frameToTimecode(m_timeline ? m_timeline->totalFrames() : 0)));
         m_keyframesInspectorClipLabel->setText(QStringLiteral("Keyframes  %1").arg(clip->label));
-        m_keyframeModeCheckBox->setEnabled(enabled);
+        m_keyframeSpaceCheckBox->setEnabled(enabled);
         m_updatingVideoInspector = true;
         m_videoKeyframeTable->clearContents();
         m_videoKeyframeTable->setRowCount(0);
         if (clip->transformKeyframes.isEmpty()) {
             m_keyframesInspectorDetailsLabel->setText(
-                QStringLiteral("Mode: %1\nNo keyframes yet at this clip.\nBase scale: %2 x %3")
-                    .arg(m_keyframeModeCheckBox->isChecked() ? QStringLiteral("Keyframing") : QStringLiteral("Base Sizing"))
+                QStringLiteral("Values: %1\nNo keyframes available for this clip.\nBase scale: %2 x %3")
+                    .arg(showClipRelativeKeyframes() ? QStringLiteral("Clip-relative") : QStringLiteral("Project-relative"))
                     .arg(clip->baseScaleX, 0, 'f', 3)
                     .arg(clip->baseScaleY, 0, 'f', 3));
             m_selectedVideoKeyframeFrame = -1;
@@ -3769,44 +5135,87 @@ private:
                 m_timeline
                     ? qBound<int64_t>(0, m_timeline->currentFrame() - clip->startFrame, qMax<int64_t>(0, clip->durationFrames - 1))
                     : 0;
+            const int64_t displayedCurrentFrame = keyframeFrameForInspectorDisplay(*clip, localFrame);
+            const int64_t displayedNearestFrame =
+                nearestIndex >= 0 ? keyframeFrameForInspectorDisplay(*clip, clip->transformKeyframes[nearestIndex].frame) : -1;
+            QSet<int64_t> boundaryFrames;
+            int lowerBoundaryIndex = -1;
+            int upperBoundaryIndex = -1;
+            for (int i = 0; i < clip->transformKeyframes.size(); ++i) {
+                const int64_t frame = clip->transformKeyframes[i].frame;
+                if (frame <= localFrame) {
+                    lowerBoundaryIndex = i;
+                }
+                if (frame >= localFrame) {
+                    upperBoundaryIndex = i;
+                    break;
+                }
+            }
+            if (lowerBoundaryIndex < 0 && !clip->transformKeyframes.isEmpty()) {
+                lowerBoundaryIndex = 0;
+            }
+            if (upperBoundaryIndex < 0 && !clip->transformKeyframes.isEmpty()) {
+                upperBoundaryIndex = clip->transformKeyframes.size() - 1;
+            }
+            if (lowerBoundaryIndex >= 0) {
+                boundaryFrames.insert(clip->transformKeyframes[lowerBoundaryIndex].frame);
+            }
+            if (upperBoundaryIndex >= 0) {
+                boundaryFrames.insert(clip->transformKeyframes[upperBoundaryIndex].frame);
+            }
             m_keyframesInspectorDetailsLabel->setText(
-                QStringLiteral("Mode: %1\nCurrent clip frame: %2\nNearest keyframe: %3\nBase scale: %4 x %5")
-                    .arg(m_keyframeModeCheckBox->isChecked() ? QStringLiteral("Keyframing") : QStringLiteral("Base Sizing"))
-                    .arg(frameToTimecode(localFrame))
-                    .arg(nearestIndex >= 0 ? frameToTimecode(clip->transformKeyframes[nearestIndex].frame)
+                QStringLiteral("Values: %1\nCurrent clip frame: %2\nNearest keyframe: %3\nBase scale: %4 x %5")
+                    .arg(showClipRelativeKeyframes() ? QStringLiteral("Clip-relative") : QStringLiteral("Project-relative"))
+                    .arg(frameToTimecode(displayedCurrentFrame))
+                    .arg(nearestIndex >= 0 ? frameToTimecode(displayedNearestFrame)
                                            : QStringLiteral("none"))
                     .arg(clip->baseScaleX, 0, 'f', 3)
                     .arg(clip->baseScaleY, 0, 'f', 3));
             m_videoKeyframeTable->setRowCount(clip->transformKeyframes.size());
             for (int i = 0; i < clip->transformKeyframes.size(); ++i) {
-                const TimelineClip::TransformKeyframe& keyframe = clip->transformKeyframes[i];
+                const TimelineClip::TransformKeyframe displayedKeyframe =
+                    keyframeForInspectorDisplay(*clip, clip->transformKeyframes[i]);
+                const int64_t displayedFrame =
+                    keyframeFrameForInspectorDisplay(*clip, clip->transformKeyframes[i].frame);
                 const bool nearest = i == nearestIndex;
                 const QStringList values = {
-                    QString::number(keyframe.frame),
-                    QString::number(keyframe.translationX, 'f', 1),
-                    QString::number(keyframe.translationY, 'f', 1),
-                    QString::number(keyframe.rotation, 'f', 1),
-                    QString::number(keyframe.scaleX, 'f', 3),
-                    QString::number(keyframe.scaleY, 'f', 3),
-                    keyframe.interpolated ? QStringLiteral("Interpolated") : QStringLiteral("Sudden")
+                    QString::number(displayedFrame),
+                    QString::number(displayedKeyframe.translationX, 'f', 1),
+                    QString::number(displayedKeyframe.translationY, 'f', 1),
+                    QString::number(displayedKeyframe.rotation, 'f', 1),
+                    QString::number(displayedKeyframe.scaleX, 'f', 3),
+                    QString::number(displayedKeyframe.scaleY, 'f', 3),
+                    displayedKeyframe.interpolated ? QStringLiteral("Interpolated") : QStringLiteral("Sudden")
                 };
                 for (int column = 0; column < values.size(); ++column) {
                     auto* item = new QTableWidgetItem(values[column]);
-                    item->setData(Qt::UserRole, QVariant::fromValue(static_cast<qint64>(keyframe.frame)));
+                    item->setData(Qt::UserRole, QVariant::fromValue(static_cast<qint64>(clip->transformKeyframes[i].frame)));
+                    if (column == 0 && clip->transformKeyframes[i].frame == 0) {
+                        item->setFlags(item->flags() & ~Qt::ItemIsEditable);
+                        item->setToolTip(QStringLiteral("The first keyframe is fixed at frame 0."));
+                    }
                     if (column == 6) {
                         item->setToolTip(QStringLiteral("Use Interpolated or Sudden"));
                     }
-                    if (nearest) {
+                    if (boundaryFrames.contains(clip->transformKeyframes[i].frame)) {
+                        item->setBackground(QColor(QStringLiteral("#d97a1f")));
+                        item->setForeground(QColor(QStringLiteral("#ffffff")));
+                    } else if (nearest) {
                         item->setBackground(QColor(QStringLiteral("#2a3948")));
                         item->setForeground(QColor(QStringLiteral("#ffffff")));
                     }
                     m_videoKeyframeTable->setItem(i, column, item);
                 }
-                if (nearest) {
+                if (boundaryFrames.contains(clip->transformKeyframes[i].frame) || nearest) {
                     for (int column = 0; column < m_videoKeyframeTable->columnCount(); ++column) {
                         if (QTableWidgetItem* item = m_videoKeyframeTable->item(i, column)) {
-                            item->setBackground(QColor(QStringLiteral("#2a3948")));
-                            item->setForeground(QColor(QStringLiteral("#ffffff")));
+                            if (boundaryFrames.contains(clip->transformKeyframes[i].frame)) {
+                                item->setBackground(QColor(QStringLiteral("#d97a1f")));
+                                item->setForeground(QColor(QStringLiteral("#ffffff")));
+                            } else {
+                                item->setBackground(QColor(QStringLiteral("#2a3948")));
+                                item->setForeground(QColor(QStringLiteral("#ffffff")));
+                            }
                         }
                     }
                 }
@@ -3826,7 +5235,7 @@ private:
             m_videoKeyframeTable->setCurrentCell(selectedRow, 0);
         }
         const int keyframeIndex = selectedVideoKeyframeIndex(*clip);
-        m_removeVideoKeyframeButton->setEnabled(enabled && !m_selectedVideoKeyframeFrames.isEmpty());
+        m_removeVideoKeyframeButton->setEnabled(enabled && hasRemovableVideoKeyframeSelection(*clip));
         {
             QSignalBlocker videoBlock1(m_videoTranslationXSpin);
             QSignalBlocker videoBlock2(m_videoTranslationYSpin);
@@ -3834,14 +5243,19 @@ private:
             QSignalBlocker videoBlock4(m_videoScaleXSpin);
             QSignalBlocker videoBlock5(m_videoScaleYSpin);
             QSignalBlocker videoBlock6(m_videoInterpolationCombo);
+            QSignalBlocker videoBlock7(m_mirrorHorizontalCheckBox);
+            QSignalBlocker videoBlock8(m_mirrorVerticalCheckBox);
             if (keyframeIndex >= 0) {
-                const TimelineClip::TransformKeyframe& keyframe = clip->transformKeyframes[keyframeIndex];
-                m_videoTranslationXSpin->setValue(keyframe.translationX);
-                m_videoTranslationYSpin->setValue(keyframe.translationY);
-                m_videoRotationSpin->setValue(keyframe.rotation);
-                m_videoScaleXSpin->setValue(keyframe.scaleX);
-                m_videoScaleYSpin->setValue(keyframe.scaleY);
-                m_videoInterpolationCombo->setCurrentIndex(keyframe.interpolated ? 0 : 1);
+                const TimelineClip::TransformKeyframe displayedKeyframe =
+                    keyframeForInspectorDisplay(*clip, clip->transformKeyframes[keyframeIndex]);
+                m_videoTranslationXSpin->setValue(displayedKeyframe.translationX);
+                m_videoTranslationYSpin->setValue(displayedKeyframe.translationY);
+                m_videoRotationSpin->setValue(displayedKeyframe.rotation);
+                m_videoScaleXSpin->setValue(std::abs(displayedKeyframe.scaleX));
+                m_videoScaleYSpin->setValue(std::abs(displayedKeyframe.scaleY));
+                m_mirrorHorizontalCheckBox->setChecked(displayedKeyframe.scaleX < 0.0);
+                m_mirrorVerticalCheckBox->setChecked(displayedKeyframe.scaleY < 0.0);
+                m_videoInterpolationCombo->setCurrentIndex(displayedKeyframe.interpolated ? 0 : 1);
             } else {
                 m_videoTranslationXSpin->setValue(0.0);
                 m_videoTranslationYSpin->setValue(0.0);
@@ -3849,9 +5263,74 @@ private:
                 m_videoScaleXSpin->setValue(1.0);
                 m_videoScaleYSpin->setValue(1.0);
                 m_videoInterpolationCombo->setCurrentIndex(0);
+                m_mirrorHorizontalCheckBox->setChecked(false);
+                m_mirrorVerticalCheckBox->setChecked(false);
             }
         }
         m_updatingVideoInspector = false;
+
+        const QString transcriptPath = transcriptPathForClip(*clip);
+        const QFileInfo transcriptInfo(transcriptPath);
+        m_transcriptInspectorClipLabel->setText(QStringLiteral("Transcript  %1").arg(clip->label));
+        m_updatingTranscriptInspector = true;
+        m_transcriptTable->clearContents();
+        m_transcriptTable->setRowCount(0);
+        m_loadedTranscriptDoc = QJsonDocument();
+        m_loadedTranscriptPath.clear();
+        if (!transcriptInfo.exists() || !transcriptInfo.isFile()) {
+            m_transcriptInspectorDetailsLabel->setText(
+                QStringLiteral("No transcript JSON found.\nExpected: %1")
+                    .arg(QDir::toNativeSeparators(transcriptPath)));
+        } else {
+            QFile transcriptFile(transcriptPath);
+            if (!transcriptFile.open(QIODevice::ReadOnly)) {
+                m_transcriptInspectorDetailsLabel->setText(
+                    QStringLiteral("Could not open transcript JSON:\n%1")
+                        .arg(QDir::toNativeSeparators(transcriptPath)));
+            } else {
+                QJsonParseError parseError;
+                const QJsonDocument transcriptDoc =
+                    QJsonDocument::fromJson(transcriptFile.readAll(), &parseError);
+                if (parseError.error != QJsonParseError::NoError || !transcriptDoc.isObject()) {
+                    m_transcriptInspectorDetailsLabel->setText(
+                        QStringLiteral("Invalid transcript JSON:\n%1")
+                            .arg(parseError.errorString()));
+                } else {
+                    m_loadedTranscriptDoc = transcriptDoc;
+                    m_loadedTranscriptPath = transcriptPath;
+                    const QJsonArray segments = transcriptDoc.object().value(QStringLiteral("segments")).toArray();
+                    int row = 0;
+                    for (int segmentIndex = 0; segmentIndex < segments.size(); ++segmentIndex) {
+                        const QJsonObject segmentObj = segments[segmentIndex].toObject();
+                        const QJsonArray words = segmentObj.value(QStringLiteral("words")).toArray();
+                        for (int wordIndex = 0; wordIndex < words.size(); ++wordIndex) {
+                            const QJsonObject wordObj = words[wordIndex].toObject();
+                            m_transcriptTable->insertRow(row);
+                            auto* startItem = new QTableWidgetItem(
+                                secondsToTranscriptTime(wordObj.value(QStringLiteral("start")).toDouble()));
+                            auto* endItem = new QTableWidgetItem(
+                                secondsToTranscriptTime(wordObj.value(QStringLiteral("end")).toDouble()));
+                            auto* textItem = new QTableWidgetItem(wordObj.value(QStringLiteral("word")).toString());
+                            startItem->setData(Qt::UserRole, segmentIndex);
+                            startItem->setData(Qt::UserRole + 1, wordIndex);
+                            endItem->setData(Qt::UserRole, segmentIndex);
+                            endItem->setData(Qt::UserRole + 1, wordIndex);
+                            textItem->setData(Qt::UserRole, segmentIndex);
+                            textItem->setData(Qt::UserRole + 1, wordIndex);
+                            m_transcriptTable->setItem(row, 0, startItem);
+                            m_transcriptTable->setItem(row, 1, endItem);
+                            m_transcriptTable->setItem(row, 2, textItem);
+                            ++row;
+                        }
+                    }
+                    m_transcriptInspectorDetailsLabel->setText(
+                        QStringLiteral("%1 words from %2")
+                            .arg(m_transcriptTable->rowCount())
+                            .arg(QDir::toNativeSeparators(transcriptPath)));
+                }
+            }
+        }
+        m_updatingTranscriptInspector = false;
         if (clipHasVisuals(*clip)) {
             m_gradingPathLabel->setText(QDir::toNativeSeparators(clip->filePath));
         } else {
@@ -3909,8 +5388,12 @@ private:
     QPushButton* m_folderPickerButton = nullptr;
     QToolButton* m_refreshExplorerButton = nullptr;
     QToolButton* m_galleryBackButton = nullptr;
+    QToolButton* m_newProjectButton = nullptr;
+    QToolButton* m_saveProjectAsButton = nullptr;
     QLabel* m_rootPathLabel = nullptr;
     QLabel* m_galleryTitleLabel = nullptr;
+    QLabel* m_projectSectionLabel = nullptr;
+    QListWidget* m_projectsList = nullptr;
     PreviewWindow* m_preview = nullptr;
     TimelineWidget* m_timeline = nullptr;
     QPushButton* m_playButton = nullptr;
@@ -3930,6 +5413,10 @@ private:
     QLabel* m_keyframesInspectorDetailsLabel = nullptr;
     QLabel* m_audioInspectorClipLabel = nullptr;
     QLabel* m_audioInspectorDetailsLabel = nullptr;
+    QLabel* m_transcriptInspectorClipLabel = nullptr;
+    QLabel* m_transcriptInspectorDetailsLabel = nullptr;
+    QLabel* m_syncInspectorClipLabel = nullptr;
+    QLabel* m_syncInspectorDetailsLabel = nullptr;
     QDoubleSpinBox* m_brightnessSpin = nullptr;
     QDoubleSpinBox* m_contrastSpin = nullptr;
     QDoubleSpinBox* m_saturationSpin = nullptr;
@@ -3937,15 +5424,23 @@ private:
     QCheckBox* m_bypassGradingCheckBox = nullptr;
     QSpinBox* m_outputWidthSpin = nullptr;
     QSpinBox* m_outputHeightSpin = nullptr;
+    QSpinBox* m_exportStartSpin = nullptr;
+    QSpinBox* m_exportEndSpin = nullptr;
     QComboBox* m_outputFormatCombo = nullptr;
+    QCheckBox* m_exportOnlyTranscriptWordsCheckBox = nullptr;
     QDoubleSpinBox* m_videoTranslationXSpin = nullptr;
     QDoubleSpinBox* m_videoTranslationYSpin = nullptr;
     QDoubleSpinBox* m_videoRotationSpin = nullptr;
     QDoubleSpinBox* m_videoScaleXSpin = nullptr;
     QDoubleSpinBox* m_videoScaleYSpin = nullptr;
     QComboBox* m_videoInterpolationCombo = nullptr;
-    QCheckBox* m_keyframeModeCheckBox = nullptr;
+    QCheckBox* m_mirrorHorizontalCheckBox = nullptr;
+    QCheckBox* m_mirrorVerticalCheckBox = nullptr;
+    QCheckBox* m_lockVideoScaleCheckBox = nullptr;
+    QCheckBox* m_keyframeSpaceCheckBox = nullptr;
     QTableWidget* m_videoKeyframeTable = nullptr;
+    QTableWidget* m_transcriptTable = nullptr;
+    QTableWidget* m_syncTable = nullptr;
     QPushButton* m_addVideoKeyframeButton = nullptr;
     QPushButton* m_removeVideoKeyframeButton = nullptr;
     QPushButton* m_renderButton = nullptr;
@@ -3956,17 +5451,24 @@ private:
     QTimer m_stateSaveTimer;
     bool m_ignoreSeekSignal = false;
     bool m_loadingState = false;
+    bool m_updatingProjectsList = false;
     bool m_pendingSaveAfterLoad = false;
     bool m_restoringHistory = false;
     QString m_currentRootPath;
     QString m_galleryFolderPath;
+    QString m_currentProjectId;
     QStringList m_expandedExplorerPaths;
     QByteArray m_lastSavedState;
     QJsonArray m_historyEntries;
     int m_historyIndex = -1;
     bool m_updatingVideoInspector = false;
+    bool m_updatingTranscriptInspector = false;
+    bool m_updatingSyncInspector = false;
+    bool m_syncingScaleControls = false;
     int64_t m_selectedVideoKeyframeFrame = -1;
     QSet<int64_t> m_selectedVideoKeyframeFrames;
+    QString m_loadedTranscriptPath;
+    QJsonDocument m_loadedTranscriptDoc;
     std::atomic<qint64> m_fastCurrentFrame{0};
     std::atomic<bool> m_fastPlaybackActive{false};
     std::atomic<qint64> m_lastMainThreadHeartbeatMs{0};

@@ -49,6 +49,7 @@ public:
     
     void setCurrentFrame(int64_t frame) {
         m_currentFrame = qMax<int64_t>(0, frame);
+        normalizeExportRange();
         update();
     }
     
@@ -78,6 +79,7 @@ public:
         if (!selectedClip()) {
             m_selectedClipId.clear();
         }
+        normalizeExportRange();
         updateMinimumTimelineHeight();
         update();
     }
@@ -91,6 +93,7 @@ public:
             m_tracks[i].height = qMax(kMinTrackHeight, m_tracks[i].height);
         }
         ensureTrackCount(trackCount());
+        normalizeExportRange();
         updateMinimumTimelineHeight();
         update();
     }
@@ -241,12 +244,13 @@ public:
     std::function<void()> selectionChanged;
     std::function<void()> gradingRequested;
     std::function<void()> renderSyncMarkersChanged;
+    std::function<void(const QString&, const QString&)> transcribeRequested;
     bool nudgeSelectedClip(int direction);
     QVector<RenderSyncMarker> renderSyncMarkers() const { return m_renderSyncMarkers; }
     void setRenderSyncMarkers(const QVector<RenderSyncMarker>& markers);
-    const RenderSyncMarker* renderSyncMarkerAtFrame(int64_t frame) const;
-    bool setRenderSyncMarkerAtCurrentFrame(RenderSyncAction action);
-    bool clearRenderSyncMarkerAtCurrentFrame();
+    const RenderSyncMarker* renderSyncMarkerAtFrame(const QString& clipId, int64_t frame) const;
+    bool setRenderSyncMarkerAtCurrentFrame(const QString& clipId, RenderSyncAction action, int count = 1);
+    bool clearRenderSyncMarkerAtCurrentFrame(const QString& clipId);
     qreal timelineZoom() const { return m_pixelsPerFrame; }
     void setTimelineZoom(qreal pixelsPerFrame);
     int verticalScrollOffset() const { return m_verticalScrollOffset; }
@@ -271,6 +275,12 @@ private:
         Move,
         TrimLeft,
         TrimRight,
+    };
+
+    enum class ExportRangeDragMode {
+        None,
+        Start,
+        End,
     };
 
     static constexpr int kDefaultTrackHeight = 44;
@@ -316,15 +326,27 @@ private:
     int maxVerticalScrollOffset() const;
     void updateMinimumTimelineHeight();
     QRect drawRect() const;
+    QRect topBarRect() const;
     QRect rulerRect() const;
     QRect trackRect() const;
     QRect timelineContentRect() const;
+    QRect exportRangeRect() const;
+    QRect exportHandleRect(int segmentIndex, bool startHandle) const;
+    QRect exportSegmentRect(const ExportRangeSegment& segment) const;
     QRect trackLabelRect(int trackIndex) const;
     QRect clipRectFor(const TimelineClip& clip) const;
+    QRect renderSyncMarkerRect(const TimelineClip& clip, const RenderSyncMarker& marker) const;
+    void normalizeExportRange();
+    void normalizeExportRanges();
+    int exportSegmentIndexAtFrame(int64_t frame) const;
+    int exportHandleAtPos(const QPoint& pos, bool* startHandleOut) const;
+    const RenderSyncMarker* renderSyncMarkerAtPos(const QPoint& pos, int* clipIndexOut = nullptr) const;
+    void openRenderSyncMarkerMenu(const QPoint& globalPos, const QString& clipId);
     
     QVector<TimelineClip> m_clips;
     QVector<TimelineTrack> m_tracks;
     int64_t m_currentFrame = 0;
+    QVector<ExportRangeSegment> m_exportRanges = {ExportRangeSegment{0, 300}};
     int64_t m_dropFrame = -1;
     int m_draggedClipIndex = -1;
     ClipDragMode m_dragMode = ClipDragMode::None;
@@ -345,10 +367,29 @@ private:
     int64_t m_snapIndicatorFrame = -1;
     QString m_selectedClipId;
     QVector<RenderSyncMarker> m_renderSyncMarkers;
+    ExportRangeDragMode m_exportRangeDragMode = ExportRangeDragMode::None;
+    int m_exportRangeDragSegmentIndex = -1;
+
+public:
+    std::function<void()> exportRangeChanged;
+    int64_t exportStartFrame() const { return m_exportRanges.isEmpty() ? 0 : m_exportRanges.constFirst().startFrame; }
+    int64_t exportEndFrame() const { return m_exportRanges.isEmpty() ? 0 : m_exportRanges.constLast().endFrame; }
+    const QVector<ExportRangeSegment>& exportRanges() const { return m_exportRanges; }
+    void setExportRange(int64_t startFrame, int64_t endFrame) {
+        m_exportRanges = {ExportRangeSegment{startFrame, endFrame}};
+        normalizeExportRanges();
+        update();
+    }
+    void setExportRanges(const QVector<ExportRangeSegment>& ranges) {
+        m_exportRanges = ranges;
+        normalizeExportRanges();
+        update();
+    }
 };
 
 namespace {
 constexpr int kTimelineOuterMargin = 16;
+constexpr int kTimelineTopBarHeight = 52;
 constexpr int kTimelineRulerHeight = 28;
 constexpr int kTimelineTrackGap = 12;
 constexpr int kTimelineClipHeight = 32;
@@ -377,6 +418,9 @@ inline void TimelineWidget::sortClips() {
 inline void TimelineWidget::sortRenderSyncMarkers() {
     std::sort(m_renderSyncMarkers.begin(), m_renderSyncMarkers.end(),
               [](const RenderSyncMarker& a, const RenderSyncMarker& b) {
+                  if (a.clipId != b.clipId) {
+                      return a.clipId < b.clipId;
+                  }
                   if (a.frame == b.frame) {
                       return static_cast<int>(a.action) < static_cast<int>(b.action);
                   }
@@ -390,22 +434,27 @@ inline void TimelineWidget::setRenderSyncMarkers(const QVector<RenderSyncMarker>
     update();
 }
 
-inline const RenderSyncMarker* TimelineWidget::renderSyncMarkerAtFrame(int64_t frame) const {
+inline const RenderSyncMarker* TimelineWidget::renderSyncMarkerAtFrame(const QString& clipId, int64_t frame) const {
     for (const RenderSyncMarker& marker : m_renderSyncMarkers) {
-        if (marker.frame == frame) {
+        if (marker.clipId == clipId && marker.frame == frame) {
             return &marker;
         }
     }
     return nullptr;
 }
 
-inline bool TimelineWidget::setRenderSyncMarkerAtCurrentFrame(RenderSyncAction action) {
+inline bool TimelineWidget::setRenderSyncMarkerAtCurrentFrame(const QString& clipId, RenderSyncAction action, int count) {
+    if (clipId.isEmpty()) {
+        return false;
+    }
+    count = qMax(1, count);
     for (RenderSyncMarker& marker : m_renderSyncMarkers) {
-        if (marker.frame == m_currentFrame) {
-            if (marker.action == action) {
+        if (marker.clipId == clipId && marker.frame == m_currentFrame) {
+            if (marker.action == action && marker.count == count) {
                 return false;
             }
             marker.action = action;
+            marker.count = count;
             sortRenderSyncMarkers();
             if (renderSyncMarkersChanged) {
                 renderSyncMarkersChanged();
@@ -416,8 +465,10 @@ inline bool TimelineWidget::setRenderSyncMarkerAtCurrentFrame(RenderSyncAction a
     }
 
     RenderSyncMarker marker;
+    marker.clipId = clipId;
     marker.frame = m_currentFrame;
     marker.action = action;
+    marker.count = count;
     m_renderSyncMarkers.push_back(marker);
     sortRenderSyncMarkers();
     if (renderSyncMarkersChanged) {
@@ -427,9 +478,12 @@ inline bool TimelineWidget::setRenderSyncMarkerAtCurrentFrame(RenderSyncAction a
     return true;
 }
 
-inline bool TimelineWidget::clearRenderSyncMarkerAtCurrentFrame() {
+inline bool TimelineWidget::clearRenderSyncMarkerAtCurrentFrame(const QString& clipId) {
+    if (clipId.isEmpty()) {
+        return false;
+    }
     for (int i = 0; i < m_renderSyncMarkers.size(); ++i) {
-        if (m_renderSyncMarkers[i].frame == m_currentFrame) {
+        if (m_renderSyncMarkers[i].clipId == clipId && m_renderSyncMarkers[i].frame == m_currentFrame) {
             m_renderSyncMarkers.removeAt(i);
             if (renderSyncMarkersChanged) {
                 renderSyncMarkersChanged();
@@ -439,6 +493,68 @@ inline bool TimelineWidget::clearRenderSyncMarkerAtCurrentFrame() {
         }
     }
     return false;
+}
+
+inline void TimelineWidget::normalizeExportRange() {
+    normalizeExportRanges();
+}
+
+inline void TimelineWidget::normalizeExportRanges() {
+    const int64_t total = totalFrames();
+    if (m_exportRanges.isEmpty()) {
+        m_exportRanges = {ExportRangeSegment{0, total}};
+    }
+    for (ExportRangeSegment& segment : m_exportRanges) {
+        segment.startFrame = qBound<int64_t>(0, segment.startFrame, total);
+        segment.endFrame = qBound<int64_t>(0, segment.endFrame, total);
+        if (segment.endFrame < segment.startFrame) {
+            std::swap(segment.startFrame, segment.endFrame);
+        }
+    }
+    std::sort(m_exportRanges.begin(), m_exportRanges.end(), [](const ExportRangeSegment& a, const ExportRangeSegment& b) {
+        if (a.startFrame == b.startFrame) {
+            return a.endFrame < b.endFrame;
+        }
+        return a.startFrame < b.startFrame;
+    });
+    QVector<ExportRangeSegment> normalized;
+    normalized.reserve(m_exportRanges.size());
+    for (const ExportRangeSegment& segment : std::as_const(m_exportRanges)) {
+        if (!normalized.isEmpty() &&
+            normalized.constLast().startFrame == segment.startFrame &&
+            normalized.constLast().endFrame == segment.endFrame) {
+            continue;
+        }
+        normalized.push_back(segment);
+    }
+    m_exportRanges = normalized;
+}
+
+inline int TimelineWidget::exportSegmentIndexAtFrame(int64_t frame) const {
+    for (int i = 0; i < m_exportRanges.size(); ++i) {
+        if (frame >= m_exportRanges[i].startFrame && frame <= m_exportRanges[i].endFrame) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+inline int TimelineWidget::exportHandleAtPos(const QPoint& pos, bool* startHandleOut) const {
+    for (int i = 0; i < m_exportRanges.size(); ++i) {
+        if (exportHandleRect(i, true).contains(pos)) {
+            if (startHandleOut) {
+                *startHandleOut = true;
+            }
+            return i;
+        }
+        if (exportHandleRect(i, false).contains(pos)) {
+            if (startHandleOut) {
+                *startHandleOut = false;
+            }
+            return i;
+        }
+    }
+    return -1;
 }
 
 inline int64_t TimelineWidget::snapThresholdFrames() const {
@@ -788,16 +904,22 @@ inline QRect TimelineWidget::drawRect() const {
                            -kTimelineOuterMargin, -kTimelineOuterMargin);
 }
 
+inline QRect TimelineWidget::topBarRect() const {
+    const QRect draw = drawRect();
+    return QRect(draw.left(), draw.top(), draw.width(), kTimelineTopBarHeight);
+}
+
 inline QRect TimelineWidget::rulerRect() const {
     const QRect draw = drawRect();
-    return QRect(draw.left(), draw.top(), draw.width(), kTimelineRulerHeight);
+    const QRect topBar = topBarRect();
+    return QRect(draw.left(), topBar.bottom() + 8, draw.width(), kTimelineRulerHeight);
 }
 
 inline QRect TimelineWidget::trackRect() const {
     const QRect draw = drawRect();
     const QRect ruler = rulerRect();
     return QRect(draw.left(), ruler.bottom() + kTimelineTrackGap, draw.width(),
-                 draw.height() - (kTimelineRulerHeight + kTimelineTrackGap));
+                 draw.height() - ((ruler.bottom() - draw.top() + 1) + kTimelineTrackGap));
 }
 
 inline QRect TimelineWidget::timelineContentRect() const {
@@ -806,6 +928,32 @@ inline QRect TimelineWidget::timelineContentRect() const {
                  tracks.top(),
                  qMax(0, tracks.width() - kTimelineLabelWidth - kTimelineLabelGap),
                  tracks.height());
+}
+
+inline QRect TimelineWidget::exportRangeRect() const {
+    const QRect topBar = topBarRect();
+    const QRect content = timelineContentRect();
+    return QRect(content.left(), topBar.top() + 26, content.width(), 20);
+}
+
+inline QRect TimelineWidget::exportSegmentRect(const ExportRangeSegment& segment) const {
+    const QRect bar = exportRangeRect();
+    const int left = xFromFrame(segment.startFrame);
+    const int right = xFromFrame(segment.endFrame);
+    return QRect(qMin(left, right),
+                 bar.top(),
+                 qMax(6, qAbs(right - left)),
+                 bar.height());
+}
+
+inline QRect TimelineWidget::exportHandleRect(int segmentIndex, bool startHandle) const {
+    if (segmentIndex < 0 || segmentIndex >= m_exportRanges.size()) {
+        return QRect();
+    }
+    const QRect bar = exportRangeRect();
+    const int64_t frame = startHandle ? m_exportRanges[segmentIndex].startFrame : m_exportRanges[segmentIndex].endFrame;
+    const int x = xFromFrame(frame);
+    return QRect(x - 5, bar.top() - 1, 10, bar.height() + 2);
 }
 
 inline QRect TimelineWidget::trackLabelRect(int trackIndex) const {
@@ -824,6 +972,94 @@ inline QRect TimelineWidget::clipRectFor(const TimelineClip& clip) const {
         qMax(kTimelineClipHeight, trackHeight(clip.trackIndex) - (kTimelineClipVerticalPadding * 2));
     const int clipY = trackTop(clip.trackIndex) + qMax(0, (trackHeight(clip.trackIndex) - visualHeight) / 2);
     return QRect(clipX, clipY, clipW, visualHeight);
+}
+
+inline QRect TimelineWidget::renderSyncMarkerRect(const TimelineClip& clip, const RenderSyncMarker& marker) const {
+    const QRect clipRect = clipRectFor(clip);
+    const int left = xFromFrame(marker.frame);
+    const int right = xFromFrame(marker.frame + 1);
+    const int width = qMax(6, right - left);
+    return QRect(left,
+                 clipRect.top() + 2,
+                 qMin(width, qMax(6, clipRect.right() - left)),
+                 clipRect.height() - 4);
+}
+
+inline const RenderSyncMarker* TimelineWidget::renderSyncMarkerAtPos(const QPoint& pos, int* clipIndexOut) const {
+    for (int i = m_clips.size() - 1; i >= 0; --i) {
+        const TimelineClip& clip = m_clips[i];
+        for (const RenderSyncMarker& marker : m_renderSyncMarkers) {
+            if (marker.clipId != clip.id) {
+                continue;
+            }
+            if (renderSyncMarkerRect(clip, marker).contains(pos)) {
+                if (clipIndexOut) {
+                    *clipIndexOut = i;
+                }
+                return &marker;
+            }
+        }
+    }
+    if (clipIndexOut) {
+        *clipIndexOut = -1;
+    }
+    return nullptr;
+}
+
+inline void TimelineWidget::openRenderSyncMarkerMenu(const QPoint& globalPos, const QString& clipId) {
+    const RenderSyncMarker* currentSyncMarker = renderSyncMarkerAtFrame(clipId, m_currentFrame);
+    QMenu menu(this);
+    QAction* duplicateRenderFrameAction =
+        menu.addAction(QStringLiteral("Render Sync: Duplicate Frames For Clip..."));
+    QAction* skipRenderFrameAction =
+        menu.addAction(QStringLiteral("Render Sync: Skip Frames For Clip..."));
+    QAction* clearRenderSyncAction = menu.addAction(QStringLiteral("Clear Clip Render Sync At Playhead"));
+    clearRenderSyncAction->setEnabled(currentSyncMarker != nullptr);
+
+    QAction* selected = menu.exec(globalPos);
+    if (!selected) {
+        return;
+    }
+
+    if (selected == duplicateRenderFrameAction) {
+        const int defaultCount =
+            currentSyncMarker && currentSyncMarker->action == RenderSyncAction::DuplicateFrame ? currentSyncMarker->count : 1;
+        bool ok = false;
+        const int count = QInputDialog::getInt(this,
+                                               QStringLiteral("Duplicate Frames"),
+                                               QStringLiteral("How many extra frames should be duplicated for this clip?"),
+                                               defaultCount,
+                                               1,
+                                               120,
+                                               1,
+                                               &ok);
+        if (ok) {
+            setRenderSyncMarkerAtCurrentFrame(clipId, RenderSyncAction::DuplicateFrame, count);
+        }
+        return;
+    }
+
+    if (selected == skipRenderFrameAction) {
+        const int defaultCount =
+            currentSyncMarker && currentSyncMarker->action == RenderSyncAction::SkipFrame ? currentSyncMarker->count : 1;
+        bool ok = false;
+        const int count = QInputDialog::getInt(this,
+                                               QStringLiteral("Skip Frames"),
+                                               QStringLiteral("How many frames should be skipped for this clip?"),
+                                               defaultCount,
+                                               1,
+                                               120,
+                                               1,
+                                               &ok);
+        if (ok) {
+            setRenderSyncMarkerAtCurrentFrame(clipId, RenderSyncAction::SkipFrame, count);
+        }
+        return;
+    }
+
+    if (selected == clearRenderSyncAction) {
+        clearRenderSyncMarkerAtCurrentFrame(clipId);
+    }
 }
 
 inline int TimelineWidget::trackIndexAt(const QPoint& pos) const {
@@ -952,6 +1188,7 @@ inline TimelineClip TimelineWidget::buildClipFromFile(const QString& filePath,
     if (clip.mediaType == ClipMediaType::Audio) {
         clip.color = QColor(QStringLiteral("#2f7f93"));
     }
+    normalizeClipTransformKeyframes(clip);
     return clip;
 }
 
@@ -1070,6 +1307,36 @@ inline void TimelineWidget::mouseDoubleClickEvent(QMouseEvent* event) {
 
 inline void TimelineWidget::mousePressEvent(QMouseEvent* event) {
     if (event->button() == Qt::LeftButton) {
+        int markerClipIndex = -1;
+        if (const RenderSyncMarker* marker = renderSyncMarkerAtPos(event->position().toPoint(), &markerClipIndex)) {
+            if (markerClipIndex >= 0) {
+                setSelectedClipId(m_clips[markerClipIndex].id);
+                m_currentFrame = marker->frame;
+                if (seekRequested) seekRequested(marker->frame);
+                openRenderSyncMarkerMenu(event->globalPosition().toPoint(), marker->clipId);
+                update();
+                event->accept();
+                return;
+            }
+        }
+        bool startHandle = false;
+        const int exportHandleSegment = exportHandleAtPos(event->position().toPoint(), &startHandle);
+        if (exportHandleSegment >= 0) {
+            m_exportRangeDragSegmentIndex = exportHandleSegment;
+            m_exportRangeDragMode = startHandle ? ExportRangeDragMode::Start : ExportRangeDragMode::End;
+            event->accept();
+            return;
+        }
+        if (exportRangeRect().contains(event->position().toPoint())) {
+            const int64_t frame = frameFromX(event->position().x());
+            if (exportSegmentIndexAtFrame(frame) >= 0) {
+                m_currentFrame = frame;
+                if (seekRequested) seekRequested(frame);
+                update();
+                event->accept();
+                return;
+            }
+        }
         const int dividerHit = trackDividerAt(event->position().toPoint());
         if (dividerHit >= 0) {
             m_resizingTrackIndex = dividerHit;
@@ -1111,6 +1378,27 @@ inline void TimelineWidget::mousePressEvent(QMouseEvent* event) {
 }
 
 inline void TimelineWidget::mouseMoveEvent(QMouseEvent* event) {
+    if (m_exportRangeDragMode != ExportRangeDragMode::None && (event->buttons() & Qt::LeftButton)) {
+        if (m_exportRangeDragSegmentIndex < 0 || m_exportRangeDragSegmentIndex >= m_exportRanges.size()) {
+            m_exportRangeDragMode = ExportRangeDragMode::None;
+            m_exportRangeDragSegmentIndex = -1;
+            return;
+        }
+        const int64_t frame = qBound<int64_t>(0, frameFromX(event->position().x()), totalFrames());
+        if (m_exportRangeDragMode == ExportRangeDragMode::Start) {
+            m_exportRanges[m_exportRangeDragSegmentIndex].startFrame =
+                qMin(frame, m_exportRanges[m_exportRangeDragSegmentIndex].endFrame);
+        } else {
+            m_exportRanges[m_exportRangeDragSegmentIndex].endFrame =
+                qMax(frame, m_exportRanges[m_exportRangeDragSegmentIndex].startFrame);
+        }
+        normalizeExportRanges();
+        if (exportRangeChanged) {
+            exportRangeChanged();
+        }
+        update();
+        return;
+    }
     if (m_draggedTrackIndex >= 0 && (event->buttons() & Qt::LeftButton)) {
         const int proposed = qBound(0, trackIndexAtY(event->position().toPoint().y(), false), trackCount() - 1);
         if (proposed != m_trackDropIndex) {
@@ -1223,6 +1511,12 @@ inline void TimelineWidget::mouseMoveEvent(QMouseEvent* event) {
 }
 
 inline void TimelineWidget::mouseReleaseEvent(QMouseEvent* event) {
+    if (event->button() == Qt::LeftButton && m_exportRangeDragMode != ExportRangeDragMode::None) {
+        m_exportRangeDragMode = ExportRangeDragMode::None;
+        m_exportRangeDragSegmentIndex = -1;
+        update();
+        return;
+    }
     if (event->button() == Qt::LeftButton && m_resizingTrackIndex >= 0) {
         m_resizingTrackIndex = -1;
         m_resizeOriginY = 0;
@@ -1296,13 +1590,39 @@ inline void TimelineWidget::mouseReleaseEvent(QMouseEvent* event) {
 
 inline void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
     const int clipIndex = clipIndexAt(event->pos());
+    int markerClipIndex = -1;
+    const RenderSyncMarker* clickedMarker = renderSyncMarkerAtPos(event->pos(), &markerClipIndex);
+    if (clickedMarker && markerClipIndex >= 0) {
+        setSelectedClipId(m_clips[markerClipIndex].id);
+        m_currentFrame = clickedMarker->frame;
+        if (seekRequested) {
+            seekRequested(clickedMarker->frame);
+        }
+        openRenderSyncMarkerMenu(event->globalPos(), clickedMarker->clipId);
+        return;
+    }
+    const QString targetClipId =
+        clipIndex >= 0 ? m_clips[clipIndex].id : m_selectedClipId;
     QMenu menu(this);
+    QAction* setExportStartAction = menu.addAction(QStringLiteral("Set Export Start At Playhead"));
+    QAction* setExportEndAction = menu.addAction(QStringLiteral("Set Export End At Playhead"));
+    QAction* splitExportRangeAction = menu.addAction(QStringLiteral("Split Export Range At Playhead"));
+    QAction* resetExportRangeAction = menu.addAction(QStringLiteral("Reset Export Range"));
+    menu.addSeparator();
     QAction* duplicateRenderFrameAction =
-        menu.addAction(QStringLiteral("Render Sync: Duplicate Frame At Playhead"));
+        menu.addAction(QStringLiteral("Render Sync: Duplicate Frames For Clip..."));
     QAction* skipRenderFrameAction =
-        menu.addAction(QStringLiteral("Render Sync: Skip Frame At Playhead"));
-    QAction* clearRenderSyncAction = menu.addAction(QStringLiteral("Clear Render Sync At Playhead"));
-    const RenderSyncMarker* currentSyncMarker = renderSyncMarkerAtFrame(m_currentFrame);
+        menu.addAction(QStringLiteral("Render Sync: Skip Frames For Clip..."));
+    QAction* clearRenderSyncAction = menu.addAction(QStringLiteral("Clear Clip Render Sync At Playhead"));
+    const RenderSyncMarker* currentSyncMarker = renderSyncMarkerAtFrame(targetClipId, m_currentFrame);
+    const bool hasTargetClip = !targetClipId.isEmpty();
+    const int splitSegmentIndex = exportSegmentIndexAtFrame(m_currentFrame);
+    splitExportRangeAction->setEnabled(
+        splitSegmentIndex >= 0 &&
+        m_currentFrame > m_exportRanges[splitSegmentIndex].startFrame &&
+        m_currentFrame <= m_exportRanges[splitSegmentIndex].endFrame);
+    duplicateRenderFrameAction->setEnabled(hasTargetClip);
+    skipRenderFrameAction->setEnabled(hasTargetClip);
     clearRenderSyncAction->setEnabled(currentSyncMarker != nullptr);
 
     QAction* nudgeLeftAction = nullptr;
@@ -1311,6 +1631,7 @@ inline void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
     QAction* gradingAction = nullptr;
     QAction* resetGradingAction = nullptr;
     QAction* propertiesAction = nullptr;
+    QAction* transcribeAction = nullptr;
 
     if (clipIndex >= 0) {
         menu.addSeparator();
@@ -1324,24 +1645,88 @@ inline void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
         deleteAction = menu.addAction(QStringLiteral("Delete"));
         gradingAction = menu.addAction(QStringLiteral("Grading..."));
         resetGradingAction = menu.addAction(QStringLiteral("Reset Grading"));
+        transcribeAction = menu.addAction(QStringLiteral("Transcribe"));
         propertiesAction = menu.addAction(QStringLiteral("Properties"));
     }
     
     QAction* selected = menu.exec(event->globalPos());
     if (!selected) return;
 
+    if (selected == setExportStartAction) {
+        if (m_exportRanges.isEmpty()) {
+            m_exportRanges = {ExportRangeSegment{0, totalFrames()}};
+        }
+        m_exportRanges.first().startFrame = qMin(m_currentFrame, m_exportRanges.first().endFrame);
+        normalizeExportRanges();
+        if (exportRangeChanged) {
+            exportRangeChanged();
+        }
+        update();
+        return;
+    }
+
+    if (selected == setExportEndAction) {
+        if (m_exportRanges.isEmpty()) {
+            m_exportRanges = {ExportRangeSegment{0, totalFrames()}};
+        }
+        m_exportRanges.last().endFrame = qMax(m_currentFrame, m_exportRanges.last().startFrame);
+        normalizeExportRanges();
+        if (exportRangeChanged) {
+            exportRangeChanged();
+        }
+        update();
+        return;
+    }
+
+    if (selected == splitExportRangeAction) {
+        if (splitSegmentIndex < 0 || splitSegmentIndex >= m_exportRanges.size()) {
+            return;
+        }
+        const ExportRangeSegment segment = m_exportRanges[splitSegmentIndex];
+        if (m_currentFrame <= segment.startFrame || m_currentFrame > segment.endFrame) {
+            return;
+        }
+        ExportRangeSegment left = segment;
+        ExportRangeSegment right = segment;
+        left.endFrame = m_currentFrame - 1;
+        right.startFrame = m_currentFrame;
+        m_exportRanges.removeAt(splitSegmentIndex);
+        m_exportRanges.insert(splitSegmentIndex, right);
+        m_exportRanges.insert(splitSegmentIndex, left);
+        normalizeExportRanges();
+        if (exportRangeChanged) {
+            exportRangeChanged();
+        }
+        update();
+        return;
+    }
+
+    if (selected == resetExportRangeAction) {
+        m_exportRanges = {ExportRangeSegment{0, totalFrames()}};
+        normalizeExportRanges();
+        if (exportRangeChanged) {
+            exportRangeChanged();
+        }
+        update();
+        return;
+    }
+
     if (selected == duplicateRenderFrameAction) {
-        setRenderSyncMarkerAtCurrentFrame(RenderSyncAction::DuplicateFrame);
+        if (hasTargetClip) {
+            openRenderSyncMarkerMenu(event->globalPos(), targetClipId);
+        }
         return;
     }
 
     if (selected == skipRenderFrameAction) {
-        setRenderSyncMarkerAtCurrentFrame(RenderSyncAction::SkipFrame);
+        if (hasTargetClip) {
+            openRenderSyncMarkerMenu(event->globalPos(), targetClipId);
+        }
         return;
     }
 
     if (selected == clearRenderSyncAction) {
-        clearRenderSyncMarkerAtCurrentFrame();
+        clearRenderSyncMarkerAtCurrentFrame(targetClipId);
         return;
     }
     
@@ -1384,6 +1769,14 @@ inline void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
         clip.opacity = 1.0;
         if (clipsChanged) clipsChanged();
         update();
+        return;
+    }
+
+    if (selected == transcribeAction) {
+        if (transcribeRequested) {
+            const TimelineClip& clip = m_clips[clipIndex];
+            transcribeRequested(clip.filePath, clip.label);
+        }
         return;
     }
     
@@ -1494,9 +1887,50 @@ inline void TimelineWidget::paintEvent(QPaintEvent*) {
     painter.fillRect(rect(), QColor(QStringLiteral("#0f1216")));
     
     const QRect draw = drawRect();
+    const QRect topBar = topBarRect();
     const QRect ruler = rulerRect();
     const QRect tracks = trackRect();
     const QRect content = timelineContentRect();
+    const QRect exportBar = exportRangeRect();
+
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(QStringLiteral("#171c22")));
+    painter.drawRoundedRect(topBar, 10, 10);
+
+    const QRect frameInfoRect(draw.left() + 10, topBar.top() + 4, kTimelineLabelWidth + 44, 18);
+    painter.setBrush(QColor(QStringLiteral("#202a34")));
+    painter.drawRoundedRect(exportBar, 7, 7);
+
+    painter.setBrush(QColor(QStringLiteral("#4ea1ff")));
+    for (const ExportRangeSegment& segment : m_exportRanges) {
+        painter.drawRoundedRect(exportSegmentRect(segment), 7, 7);
+    }
+    painter.setBrush(QColor(QStringLiteral("#fff4c2")));
+    for (int i = 0; i < m_exportRanges.size(); ++i) {
+        painter.drawRoundedRect(exportHandleRect(i, true), 3, 3);
+        painter.drawRoundedRect(exportHandleRect(i, false), 3, 3);
+    }
+    painter.setPen(QColor(QStringLiteral("#0f1216")));
+    QString exportLabel;
+    for (int i = 0; i < m_exportRanges.size(); ++i) {
+        if (i > 0) {
+            exportLabel += QStringLiteral(" | ");
+        }
+        exportLabel += QStringLiteral("%1 -> %2")
+                           .arg(timecodeForFrame(m_exportRanges[i].startFrame))
+                           .arg(timecodeForFrame(m_exportRanges[i].endFrame));
+    }
+    painter.drawText(exportBar.adjusted(10, 0, -10, 0),
+                     Qt::AlignCenter,
+                     QStringLiteral("Export %1").arg(exportLabel));
+
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(QStringLiteral("#202a34")));
+    painter.drawRoundedRect(frameInfoRect, 7, 7);
+    painter.setPen(QColor(QStringLiteral("#eef4fa")));
+    painter.drawText(frameInfoRect.adjusted(8, 0, -8, 0),
+                     Qt::AlignLeft | Qt::AlignVCenter,
+                     QStringLiteral("Frame %1").arg(m_currentFrame));
     
     painter.setPen(Qt::NoPen);
     painter.setBrush(QColor(QStringLiteral("#171c22")));
@@ -1609,20 +2043,9 @@ inline void TimelineWidget::paintEvent(QPaintEvent*) {
                         Qt::AlignLeft | Qt::AlignVCenter,
                         painter.fontMetrics().elidedText(clipTitle, Qt::ElideRight, 
                                                          clipRect.width() - 20));
+
     }
 
-    for (const RenderSyncMarker& marker : m_renderSyncMarkers) {
-        const int x = xFromFrame(marker.frame);
-        const QColor markerColor = marker.action == RenderSyncAction::DuplicateFrame
-            ? QColor(QStringLiteral("#ff5b5b"))
-            : QColor(QStringLiteral("#ff9e3d"));
-        painter.setPen(QPen(markerColor, 2));
-        painter.drawLine(x, ruler.top() + 2, x, ruler.bottom() - 2);
-        painter.setPen(Qt::NoPen);
-        painter.setBrush(markerColor);
-        painter.drawRoundedRect(QRect(x - 9, ruler.bottom() - 8, 18, 6), 3, 3);
-    }
-    
     if (m_dropFrame >= 0) {
         const int x = xFromFrame(m_dropFrame);
         painter.setPen(QPen(QColor(QStringLiteral("#f7b955")), 2, Qt::DashLine));
@@ -1653,16 +2076,33 @@ inline void TimelineWidget::paintEvent(QPaintEvent*) {
     painter.setBrush(QColor(QStringLiteral("#ff6f61")));
     painter.setPen(Qt::NoPen);
     painter.drawRoundedRect(QRect(playheadX - 8, ruler.top(), 16, 12), 4, 4);
-    if (const RenderSyncMarker* marker = renderSyncMarkerAtFrame(m_currentFrame)) {
+    if (const RenderSyncMarker* marker = renderSyncMarkerAtFrame(m_selectedClipId, m_currentFrame)) {
         const QString label = marker->action == RenderSyncAction::DuplicateFrame
-            ? QStringLiteral("DUP")
-            : QStringLiteral("SKIP");
-        const QRect badgeRect(playheadX + 10, ruler.top() - 2, 42, 16);
+            ? QStringLiteral("DUP %1").arg(marker->count)
+            : QStringLiteral("SKIP %1").arg(marker->count);
+        const QRect badgeRect(playheadX + 10, ruler.top() - 2, 58, 16);
         painter.setBrush(marker->action == RenderSyncAction::DuplicateFrame
                              ? QColor(QStringLiteral("#ff5b5b"))
                              : QColor(QStringLiteral("#ff9e3d")));
         painter.drawRoundedRect(badgeRect, 6, 6);
         painter.setPen(QColor(QStringLiteral("#ffffff")));
         painter.drawText(badgeRect, Qt::AlignCenter, label);
+    }
+
+    for (const TimelineClip& clip : m_clips) {
+        for (const RenderSyncMarker& marker : m_renderSyncMarkers) {
+            if (marker.clipId != clip.id ||
+                marker.frame < clip.startFrame ||
+                marker.frame >= clip.startFrame + clip.durationFrames) {
+                continue;
+            }
+            const QRect markerRect = renderSyncMarkerRect(clip, marker);
+            const QColor markerColor = marker.action == RenderSyncAction::DuplicateFrame
+                ? QColor(QStringLiteral("#ff5b5b"))
+                : QColor(QStringLiteral("#ff9e3d"));
+            painter.setPen(QPen(markerColor.darker(135), 1));
+            painter.setBrush(QColor(markerColor.red(), markerColor.green(), markerColor.blue(), 230));
+            painter.drawRoundedRect(markerRect, 4, 4);
+        }
     }
 }
