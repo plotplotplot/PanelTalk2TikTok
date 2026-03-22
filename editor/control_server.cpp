@@ -1,4 +1,5 @@
 #include "control_server.h"
+#include "debug_controls.h"
 
 #include <QAbstractButton>
 #include <QApplication>
@@ -400,6 +401,43 @@ private:
             writeJson(socket, 200, QJsonObject{
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("profile"), profile}
+            });
+            return;
+        }
+
+        if (request.method == QStringLiteral("GET") && request.url.path() == QStringLiteral("/debug")) {
+            writeJson(socket, 200, QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("debug"), editor::debugControlsSnapshot()}
+            });
+            return;
+        }
+
+        if (request.method == QStringLiteral("POST") && request.url.path() == QStringLiteral("/debug")) {
+            QString error;
+            const QJsonObject body = parseJsonObject(request.body, &error);
+            if (!error.isEmpty()) {
+                writeError(socket, 400, error);
+                return;
+            }
+            bool updatedAny = false;
+            for (auto it = body.begin(); it != body.end(); ++it) {
+                if (it.key() == QStringLiteral("ok")) {
+                    continue;
+                }
+                if (!it.value().isBool() || !editor::setDebugControl(it.key(), it.value().toBool())) {
+                    writeError(socket, 400, QStringLiteral("invalid debug field: %1").arg(it.key()));
+                    return;
+                }
+                updatedAny = true;
+            }
+            if (!updatedAny) {
+                writeError(socket, 400, QStringLiteral("no debug fields supplied"));
+                return;
+            }
+            writeJson(socket, 200, QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("debug"), editor::debugControlsSnapshot()}
             });
             return;
         }

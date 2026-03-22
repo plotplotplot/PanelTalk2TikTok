@@ -2,6 +2,7 @@
 
 #include "editor_shared.h"
 
+#include <QImage>
 #include <QSize>
 #include <QString>
 #include <QVector>
@@ -17,6 +18,7 @@ struct RenderProgress {
     int64_t segmentStartFrame = 0;
     int64_t segmentEndFrame = 0;
     bool usingGpu = false;
+    QImage previewFrame;
 };
 
 struct RenderRequest {

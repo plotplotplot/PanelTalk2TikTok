@@ -1,4 +1,5 @@
 #include "async_decoder.h"
+#include "debug_controls.h"
 
 #include <QDebug>
 #include <QDateTime>
@@ -55,6 +56,9 @@ bool isStillImagePath(const QString& path) {
 }
 
 void decodeTrace(const QString& stage, const QString& detail = QString()) {
+    if (!debugDecodeEnabled()) {
+        return;
+    }
     static QHash<QString, qint64> lastLogByStage;
     const qint64 now = decodeTraceMs();
     if (stage.startsWith(QStringLiteral("AsyncDecoder::requestFrame")) ||

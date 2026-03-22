@@ -4,6 +4,7 @@
 #include "memory_budget.h"
 #include "gpu_compositor.h"
 #include "control_server.h"
+#include "debug_controls.h"
 #include "editor_shared.h"
 #include "audio_engine.h"
 #include "timeline_widget.h"
@@ -25,6 +26,7 @@
 #include <QFileIconProvider>
 #include <QFile>
 #include <QFileSystemModel>
+#include <QFontComboBox>
 #include <QFormLayout>
 #include <QFrame>
 #include <QHBoxLayout>
@@ -76,6 +78,7 @@
 #include <QStackedLayout>
 #include <QStackedWidget>
 #include <QTableWidget>
+#include <QTextDocument>
 #include <QPointer>
 #include <QElapsedTimer>
 
@@ -125,8 +128,7 @@ qint64 playbackTraceMs() {
 }
 
 bool playbackTraceEnabled() {
-    static const bool enabled = qEnvironmentVariableIntValue("EDITOR_DEBUG_PLAYBACK") == 1;
-    return enabled;
+    return debugPlaybackEnabled();
 }
 
 void playbackTrace(const QString& stage, const QString& detail = QString()) {
@@ -361,6 +363,7 @@ public:
         playbackTrace(QStringLiteral("PreviewWindow::setTimelineClips"),
                       QStringLiteral("clips=%1 cache=%2").arg(clips.size()).arg(m_cache != nullptr));
         m_clips = clips;
+        m_transcriptSectionsCache.clear();
         if (!m_cache) {
             m_registeredClips.clear();
             scheduleRepaint();
@@ -464,7 +467,7 @@ public:
             return false;
         }
 
-        static constexpr int kMaxVisibleBacklog = 2;
+        static constexpr int kMaxVisibleBacklog = 4;
         bool hasActiveClip = false;
 
         for (const TimelineClip& clip : m_clips) {
@@ -482,10 +485,6 @@ public:
             }
 
             if (m_cache->isVisibleRequestPending(clip.id, localFrame)) {
-                continue;
-            }
-
-            if (m_cache->pendingVisibleRequestCount() >= kMaxVisibleBacklog) {
                 continue;
             }
 
@@ -728,11 +727,18 @@ protected:
     void mouseMoveEvent(QMouseEvent* event) override {
         if (m_dragMode != PreviewDragMode::None && (event->buttons() & Qt::LeftButton) &&
             !m_selectedClipId.isEmpty() && m_dragOriginBounds.width() > 1.0 && m_dragOriginBounds.height() > 1.0) {
+            const PreviewOverlayInfo selectedInfo = m_overlayInfo.value(m_selectedClipId);
             if (m_dragMode == PreviewDragMode::Move) {
                 if (moveRequested) {
+                    const QRect compositeRect = scaledCanvasRect(previewCanvasBaseRect());
+                    const QPointF previewScale = previewCanvasScale(compositeRect);
                     moveRequested(m_selectedClipId,
-                                  m_dragOriginTransform.translationX + ((event->position().x() - m_dragOriginPos.x()) / m_previewZoom),
-                                  m_dragOriginTransform.translationY + ((event->position().y() - m_dragOriginPos.y()) / m_previewZoom),
+                                  m_dragOriginTransform.translationX +
+                                      ((event->position().x() - m_dragOriginPos.x()) /
+                                       qMax<qreal>(0.0001, previewScale.x())),
+                                  m_dragOriginTransform.translationY +
+                                      ((event->position().y() - m_dragOriginPos.y()) /
+                                       qMax<qreal>(0.0001, previewScale.y())),
                                   false);
                 }
                 event->accept();
@@ -740,6 +746,25 @@ protected:
             }
             qreal scaleX = m_dragOriginTransform.scaleX;
             qreal scaleY = m_dragOriginTransform.scaleY;
+            if (selectedInfo.kind == PreviewOverlayKind::TranscriptOverlay) {
+                const QRect compositeRect = scaledCanvasRect(previewCanvasBaseRect());
+                const QPointF previewScale = previewCanvasScale(compositeRect);
+                qreal width = transcriptOverlaySizeForSelectedClip().width();
+                qreal height = transcriptOverlaySizeForSelectedClip().height();
+                if (m_dragMode == PreviewDragMode::ResizeX || m_dragMode == PreviewDragMode::ResizeBoth) {
+                    width = qMax<qreal>(80.0, width + ((event->position().x() - m_dragOriginPos.x()) /
+                                                       qMax<qreal>(0.0001, previewScale.x())));
+                }
+                if (m_dragMode == PreviewDragMode::ResizeY || m_dragMode == PreviewDragMode::ResizeBoth) {
+                    height = qMax<qreal>(40.0, height + ((event->position().y() - m_dragOriginPos.y()) /
+                                                         qMax<qreal>(0.0001, previewScale.y())));
+                }
+                if (resizeRequested) {
+                    resizeRequested(m_selectedClipId, width, height, false);
+                }
+                event->accept();
+                return;
+            }
             if (m_dragMode == PreviewDragMode::ResizeX || m_dragMode == PreviewDragMode::ResizeBoth) {
                 scaleX = sanitizeScaleValue(
                     m_dragOriginTransform.scaleX *
@@ -776,13 +801,31 @@ protected:
 
     void mouseReleaseEvent(QMouseEvent* event) override {
         if (event->button() == Qt::LeftButton && m_dragMode != PreviewDragMode::None) {
+            const PreviewOverlayInfo selectedInfo = m_overlayInfo.value(m_selectedClipId);
             const TimelineClip::TransformKeyframe transform = evaluateTransformForSelectedClip();
             if (m_dragMode == PreviewDragMode::Move) {
                 if (moveRequested) {
-                    moveRequested(m_selectedClipId, transform.translationX, transform.translationY, true);
+                    if (selectedInfo.kind == PreviewOverlayKind::TranscriptOverlay) {
+                        for (const TimelineClip& clip : m_clips) {
+                            if (clip.id == m_selectedClipId) {
+                                moveRequested(m_selectedClipId,
+                                              clip.transcriptOverlay.translationX,
+                                              clip.transcriptOverlay.translationY,
+                                              true);
+                                break;
+                            }
+                        }
+                    } else {
+                        moveRequested(m_selectedClipId, transform.translationX, transform.translationY, true);
+                    }
                 }
             } else if (resizeRequested) {
-                resizeRequested(m_selectedClipId, transform.scaleX, transform.scaleY, true);
+                if (selectedInfo.kind == PreviewOverlayKind::TranscriptOverlay) {
+                    const QSizeF size = transcriptOverlaySizeForSelectedClip();
+                    resizeRequested(m_selectedClipId, size.width(), size.height(), true);
+                } else {
+                    resizeRequested(m_selectedClipId, transform.scaleX, transform.scaleY, true);
+                }
             }
             m_dragMode = PreviewDragMode::None;
             m_dragOriginBounds = QRectF();
@@ -817,7 +860,13 @@ protected:
     }
 
 private:
+    enum class PreviewOverlayKind {
+        VisualClip,
+        TranscriptOverlay,
+    };
+
     struct PreviewOverlayInfo {
+        PreviewOverlayKind kind = PreviewOverlayKind::VisualClip;
         QRectF bounds;
         QRectF rightHandle;
         QRectF bottomHandle;
@@ -861,6 +910,134 @@ private:
                      scaledSize.height());
     }
 
+    QPointF previewCanvasScale(const QRect& targetRect) const {
+        const QSize output = m_outputSize.isValid() ? m_outputSize : QSize(1080, 1920);
+        return QPointF(targetRect.width() / qMax<qreal>(1.0, output.width()),
+                       targetRect.height() / qMax<qreal>(1.0, output.height()));
+    }
+
+    bool clipShowsTranscriptOverlay(const TimelineClip& clip) const {
+        return clip.mediaType == ClipMediaType::Audio && clip.transcriptOverlay.enabled;
+    }
+
+    const QVector<TranscriptSection>& transcriptSectionsForClip(const TimelineClip& clip) const {
+        const QString key = clip.filePath;
+        auto it = m_transcriptSectionsCache.find(key);
+        if (it == m_transcriptSectionsCache.end()) {
+            it = m_transcriptSectionsCache.insert(key, loadTranscriptSections(transcriptPathForClipFile(clip.filePath)));
+        }
+        return it.value();
+    }
+
+    TranscriptOverlayLayout transcriptOverlayLayoutForClip(const TimelineClip& clip) const {
+        if (!clipShowsTranscriptOverlay(clip)) {
+            return {};
+        }
+        const QVector<TranscriptSection>& sections = transcriptSectionsForClip(clip);
+        if (sections.isEmpty()) {
+            return {};
+        }
+        const int64_t sourceFrame = sourceFrameForSample(clip, m_currentSample);
+        for (const TranscriptSection& section : sections) {
+            if (sourceFrame < section.startFrame) {
+                return {};
+            }
+            if (sourceFrame <= section.endFrame) {
+                return layoutTranscriptSection(section,
+                                               sourceFrame,
+                                               clip.transcriptOverlay.maxCharsPerLine,
+                                               clip.transcriptOverlay.maxLines,
+                                               clip.transcriptOverlay.autoScroll);
+            }
+        }
+        return {};
+    }
+
+    QRectF transcriptOverlayRectForTarget(const TimelineClip& clip, const QRect& targetRect) const {
+        const QPointF previewScale = previewCanvasScale(targetRect);
+        const QSizeF size(qMax<qreal>(40.0, clip.transcriptOverlay.boxWidth * previewScale.x()),
+                          qMax<qreal>(20.0, clip.transcriptOverlay.boxHeight * previewScale.y()));
+        const QPointF center(targetRect.center().x() + (clip.transcriptOverlay.translationX * previewScale.x()),
+                             targetRect.center().y() + (clip.transcriptOverlay.translationY * previewScale.y()));
+        return QRectF(center.x() - (size.width() / 2.0),
+                      center.y() - (size.height() / 2.0),
+                      size.width(),
+                      size.height());
+    }
+
+    QSizeF transcriptOverlaySizeForSelectedClip() const {
+        const PreviewOverlayInfo info = m_overlayInfo.value(m_selectedClipId);
+        const QRect compositeRect = scaledCanvasRect(previewCanvasBaseRect());
+        const QPointF previewScale = previewCanvasScale(compositeRect);
+        return QSizeF(info.bounds.width() / qMax<qreal>(0.0001, previewScale.x()),
+                      info.bounds.height() / qMax<qreal>(0.0001, previewScale.y()));
+    }
+
+    void drawTranscriptOverlay(QPainter* painter, const TimelineClip& clip, const QRect& targetRect) {
+        const TranscriptOverlayLayout overlayLayout = transcriptOverlayLayoutForClip(clip);
+        if (overlayLayout.lines.isEmpty()) {
+            return;
+        }
+        const QRectF bounds = transcriptOverlayRectForTarget(clip, targetRect);
+        const QRectF textBounds = bounds.adjusted(18.0, 14.0, -18.0, -14.0);
+        const QColor highlightFillColor(QStringLiteral("#fff2a8"));
+        const QColor highlightTextColor(QStringLiteral("#181818"));
+        const QString shadowHtml = transcriptOverlayHtml(overlayLayout,
+                                                         QColor(0, 0, 0, 200),
+                                                         QColor(0, 0, 0, 200),
+                                                         QColor(0, 0, 0, 0));
+        const QString textHtml = transcriptOverlayHtml(overlayLayout,
+                                                       clip.transcriptOverlay.textColor,
+                                                       highlightTextColor,
+                                                       highlightFillColor);
+        if (textHtml.isEmpty()) {
+            return;
+        }
+        painter->save();
+        painter->setPen(Qt::NoPen);
+        painter->setBrush(QColor(0, 0, 0, 120));
+        painter->drawRoundedRect(bounds, 14.0, 14.0);
+        QFont font(clip.transcriptOverlay.fontFamily);
+        font.setPixelSize(qMax(8, qRound(clip.transcriptOverlay.fontPointSize * previewCanvasScale(targetRect).y())));
+        font.setBold(clip.transcriptOverlay.bold);
+        font.setItalic(clip.transcriptOverlay.italic);
+        QTextDocument shadowDoc;
+        shadowDoc.setDefaultFont(font);
+        shadowDoc.setDocumentMargin(0.0);
+        shadowDoc.setTextWidth(textBounds.width());
+        shadowDoc.setHtml(shadowHtml);
+        QTextDocument textDoc;
+        textDoc.setDefaultFont(font);
+        textDoc.setDocumentMargin(0.0);
+        textDoc.setTextWidth(textBounds.width());
+        textDoc.setHtml(textHtml);
+        const qreal textY = textBounds.top() + qMax<qreal>(0.0, (textBounds.height() - textDoc.size().height()) / 2.0);
+        painter->translate(textBounds.left() + 3.0, textY + 3.0);
+        shadowDoc.drawContents(painter);
+        painter->translate(-3.0, -3.0);
+        textDoc.drawContents(painter);
+        painter->restore();
+
+        PreviewOverlayInfo info;
+        info.kind = PreviewOverlayKind::TranscriptOverlay;
+        info.bounds = bounds;
+        constexpr qreal kHandleSize = 12.0;
+        info.rightHandle = QRectF(bounds.right() - kHandleSize,
+                                  bounds.center().y() - kHandleSize,
+                                  kHandleSize,
+                                  kHandleSize * 2.0);
+        info.bottomHandle = QRectF(bounds.center().x() - kHandleSize,
+                                   bounds.bottom() - kHandleSize,
+                                   kHandleSize * 2.0,
+                                   kHandleSize);
+        info.cornerHandle = QRectF(bounds.right() - kHandleSize * 1.5,
+                                   bounds.bottom() - kHandleSize * 1.5,
+                                   kHandleSize * 1.5,
+                                   kHandleSize * 1.5);
+        m_overlayInfo.insert(clip.id, info);
+        m_paintOrder.push_back(clip.id);
+    }
+
     bool usingCpuFallback() const {
         return !context() || !isValid() || !m_shaderProgram;
     }
@@ -879,7 +1056,9 @@ private:
         m_cache = std::make_unique<TimelineCache>(m_decoder.get(),
                                                   m_decoder->memoryBudget(),
                                                   this);
-        m_cache->setMaxMemory(512 * 1024 * 1024);
+        m_cache->setMaxMemory(256 * 1024 * 1024);
+        m_cache->setLookaheadFrames(18);
+        m_cache->setPlaybackSpeed(1.0);
         m_cache->setPlaybackState(m_playing ?
             TimelineCache::PlaybackState::Playing :
             TimelineCache::PlaybackState::Stopped);
@@ -1010,8 +1189,9 @@ private:
 
         const QRect fitted = fitRect(frame.size(), targetRect);
         const TimelineClip::TransformKeyframe transform = evaluateClipTransformAtPosition(clip, m_currentFramePosition);
-        const QPointF center(fitted.center().x() + transform.translationX,
-                             fitted.center().y() + transform.translationY);
+        const QPointF previewScale = previewCanvasScale(targetRect);
+        const QPointF center(fitted.center().x() + (transform.translationX * previewScale.x()),
+                             fitted.center().y() + (transform.translationY * previewScale.y()));
 
         QMatrix4x4 projection;
         projection.ortho(0.0f, static_cast<float>(width()),
@@ -1069,6 +1249,9 @@ private:
         m_overlayInfo.clear();
         m_paintOrder.clear();
         for (const TimelineClip& clip : activeClips) {
+            if (!clipHasVisuals(clip)) {
+                continue;
+            }
             const int64_t localFrame = sourceFrameForSample(clip, m_currentSample);
             const FrameHandle frame = m_cache ? m_cache->getBestCachedFrame(clip.id, localFrame) : FrameHandle();
             if (frame.isNull()) {
@@ -1079,6 +1262,7 @@ private:
             const QRectF bounds = renderFrameLayerGL(compositeRect, clip, frame);
             if (!bounds.isEmpty()) {
                 PreviewOverlayInfo info;
+                info.kind = PreviewOverlayKind::VisualClip;
                 info.bounds = bounds;
                 constexpr qreal kHandleSize = 12.0;
                 info.rightHandle = QRectF(bounds.right() - kHandleSize,
@@ -1151,6 +1335,12 @@ private:
         }
 
         for (const TimelineClip& clip : activeClips) {
+            if (clipShowsTranscriptOverlay(clip)) {
+                drawTranscriptOverlay(painter, clip, compositeRect);
+            }
+        }
+
+        for (const TimelineClip& clip : activeClips) {
             const PreviewOverlayInfo info = m_overlayInfo.value(clip.id);
             if (clip.id == m_selectedClipId && info.bounds.isValid()) {
                 painter->setPen(QPen(QColor(QStringLiteral("#fff4c2")), 2.0));
@@ -1210,7 +1400,7 @@ private:
     }
 
     void requestFramesForCurrentPosition() {
-        static constexpr int kMaxVisibleBacklog = 2;
+        static constexpr int kMaxVisibleBacklog = 4;
         QVector<const TimelineClip*> activeClips;
         activeClips.reserve(m_clips.size());
         for (const TimelineClip& clip : m_clips) {
@@ -1359,6 +1549,11 @@ private:
         if (!activeAudioClips.isEmpty()) {
             drawAudioBadge(painter, compositeRect, activeAudioClips);
         }
+        for (const TimelineClip& clip : activeClips) {
+            if (clipShowsTranscriptOverlay(clip)) {
+                drawTranscriptOverlay(painter, clip, compositeRect);
+            }
+        }
         
         painter->restore();
     }
@@ -1394,9 +1589,11 @@ private:
         if (!frame.isNull() && frame.hasCpuImage()) {
             const QImage img = m_bypassGrading ? frame.cpuImage() : applyClipGrade(frame.cpuImage(), clip);
             const QRect fitted = fitRect(img.size(), targetRect);
-        const TimelineClip::TransformKeyframe transform = evaluateClipTransformAtPosition(clip, m_currentFramePosition);
-            painter->translate(fitted.center().x() + transform.translationX,
-                               fitted.center().y() + transform.translationY);
+            const TimelineClip::TransformKeyframe transform =
+                evaluateClipTransformAtPosition(clip, m_currentFramePosition);
+            const QPointF previewScale = previewCanvasScale(targetRect);
+            painter->translate(fitted.center().x() + (transform.translationX * previewScale.x()),
+                               fitted.center().y() + (transform.translationY * previewScale.y()));
             painter->rotate(transform.rotation);
             painter->scale(transform.scaleX, transform.scaleY);
             const QRectF drawRect(-fitted.width() / 2.0,
@@ -1406,12 +1603,13 @@ private:
             painter->drawImage(drawRect, img);
 
             QTransform overlayTransform;
-            overlayTransform.translate(fitted.center().x() + transform.translationX,
-                                       fitted.center().y() + transform.translationY);
+            overlayTransform.translate(fitted.center().x() + (transform.translationX * previewScale.x()),
+                                       fitted.center().y() + (transform.translationY * previewScale.y()));
             overlayTransform.rotate(transform.rotation);
             overlayTransform.scale(transform.scaleX, transform.scaleY);
             const QRectF bounds = overlayTransform.mapRect(drawRect);
             PreviewOverlayInfo info;
+            info.kind = PreviewOverlayKind::VisualClip;
             info.bounds = bounds;
             constexpr qreal kHandleSize = 12.0;
             info.rightHandle = QRectF(bounds.right() - kHandleSize,
@@ -1611,6 +1809,7 @@ private:
     qreal m_previewZoom = 1.0;
     QPointF m_previewPanOffset;
     QHash<QString, PreviewOverlayInfo> m_overlayInfo;
+    mutable QHash<QString, QVector<TranscriptSection>> m_transcriptSectionsCache;
     QHash<QString, TextureCacheEntry> m_textureCache;
     QVector<QString> m_paintOrder;
     PreviewDragMode m_dragMode = PreviewDragMode::None;
@@ -1850,42 +2049,134 @@ protected:
 
 private slots:
     void advanceFrame() {
+        // Audio is always the master clock when available
         if (m_audioEngine && m_audioEngine->hasPlayableAudio()) {
-            const int64_t audioSample = qMax<int64_t>(0, m_audioEngine->currentSample());
-            const qreal audioFramePosition = samplesToFramePosition(audioSample);
-            const int64_t audioFrame = qBound<int64_t>(0,
-                                                       static_cast<int64_t>(std::floor(audioFramePosition)),
-                                                       m_timeline->totalFrames());
+            int64_t audioSample = qMax<int64_t>(0, m_audioEngine->currentSample());
+            qreal audioFramePosition = samplesToFramePosition(audioSample);
+            int64_t audioFrame = qBound<int64_t>(0,
+                                                static_cast<int64_t>(std::floor(audioFramePosition)),
+                                                m_timeline->totalFrames());
+
+            // When speech filter is active, check if audio is in a gap and seek it forward
+            if (speechFilterPlaybackEnabled()) {
+                const QVector<ExportRangeSegment> ranges = effectivePlaybackRanges();
+                if (!ranges.isEmpty()) {
+                    // Check if current audio position is in a gap (between word ranges)
+                    bool inGap = true;
+                    int64_t nextWordStart = -1;
+                    for (const auto& range : ranges) {
+                        if (audioFrame >= range.startFrame && audioFrame <= range.endFrame) {
+                            // Audio is inside a word range - normal playback
+                            inGap = false;
+                            break;
+                        }
+                        if (audioFrame < range.startFrame) {
+                            // Audio is before this range - we're in a gap
+                            nextWordStart = range.startFrame;
+                            break;
+                        }
+                    }
+
+                    if (inGap && nextWordStart >= 0) {
+                        // Audio is in a gap - seek it to the next word
+                        playbackTrace(QStringLiteral("EditorWindow::advanceFrame.speechFilterSkip"),
+                                      QStringLiteral("from=%1 to=%2").arg(audioFrame).arg(nextWordStart));
+                        m_audioEngine->seek(nextWordStart);
+                        audioSample = m_audioEngine->currentSample();
+                        audioFramePosition = samplesToFramePosition(audioSample);
+                        audioFrame = qBound<int64_t>(0,
+                                                    static_cast<int64_t>(std::floor(audioFramePosition)),
+                                                    m_timeline->totalFrames());
+                    } else if (inGap) {
+                        // Past all words - loop back to start
+                        m_audioEngine->seek(ranges.constFirst().startFrame);
+                        audioSample = m_audioEngine->currentSample();
+                        audioFramePosition = samplesToFramePosition(audioSample);
+                        audioFrame = qBound<int64_t>(0,
+                                                    static_cast<int64_t>(std::floor(audioFramePosition)),
+                                                    m_timeline->totalFrames());
+                    }
+                }
+            }
+
             if (audioFrame == m_timeline->currentFrame()) {
                 if (m_preview) {
                     m_preview->setCurrentPlaybackSample(audioSample);
                 }
                 return;
             }
-            if (m_preview && !m_preview->preparePlaybackAdvanceSample(audioSample)) {
-                playbackTrace(QStringLiteral("EditorWindow::advanceFrame.wait"),
-                              QStringLiteral("audioSample=%1 audioFrame=%2").arg(audioSample).arg(audioFramePosition, 0, 'f', 3));
-                return;
+            if (m_preview) {
+                const bool ready = m_preview->preparePlaybackAdvanceSample(audioSample);
+                if (!ready) {
+                    playbackTrace(QStringLiteral("EditorWindow::advanceFrame.catchup"),
+                                  QStringLiteral("audioSample=%1 audioFrame=%2")
+                                      .arg(audioSample)
+                                      .arg(audioFramePosition, 0, 'f', 3));
+                }
             }
             playbackTrace(QStringLiteral("EditorWindow::advanceFrame"),
                           QStringLiteral("clock=audio sample=%1 frame=%2").arg(audioSample).arg(audioFramePosition, 0, 'f', 3));
-            setCurrentPlaybackSample(audioSample, false);
+            // Audio is master - don't sync audio to itself, just update video/timeline
+            setCurrentPlaybackSample(audioSample, false, /*duringPlayback=*/true);
             return;
         }
 
-        const int64_t nextFrame = m_timeline->currentFrame() + 1;
-        const int64_t wrapped = nextFrame > m_timeline->totalFrames() ? 0 : nextFrame;
-        if (m_preview && !m_preview->preparePlaybackAdvance(wrapped)) {
-            playbackTrace(QStringLiteral("EditorWindow::advanceFrame.wait"),
-                          QStringLiteral("next=%1").arg(wrapped));
-            return;
+        // No audio engine - video is master (fallback)
+        const int64_t nextFrame = nextPlaybackFrame(m_timeline->currentFrame());
+        if (m_preview) {
+            const bool ready = m_preview->preparePlaybackAdvance(nextFrame);
+            if (!ready) {
+                playbackTrace(QStringLiteral("EditorWindow::advanceFrame.catchup"),
+                              QStringLiteral("next=%1").arg(nextFrame));
+            }
         }
         playbackTrace(QStringLiteral("EditorWindow::advanceFrame"),
-                      QStringLiteral("clock=video current=%1 next=%2").arg(m_timeline->currentFrame()).arg(wrapped));
-        setCurrentFrame(wrapped, false);
+                      QStringLiteral("clock=video current=%1 next=%2").arg(m_timeline->currentFrame()).arg(nextFrame));
+        setCurrentPlaybackSample(frameToSamples(nextFrame), false, /*duringPlayback=*/true);
     }
 
 private:
+    bool speechFilterPlaybackEnabled() const {
+        return m_exportOnlyTranscriptWordsCheckBox && m_exportOnlyTranscriptWordsCheckBox->isChecked();
+    }
+
+    QVector<ExportRangeSegment> effectivePlaybackRanges() const {
+        if (!m_timeline) {
+            return {};
+        }
+        QVector<ExportRangeSegment> ranges = m_timeline->exportRanges();
+        if (!speechFilterPlaybackEnabled()) {
+            return ranges;
+        }
+        return transcriptWordExportRanges(ranges, m_timeline->clips(), m_timeline->renderSyncMarkers());
+    }
+
+    int64_t nextPlaybackFrame(int64_t currentFrame) const {
+        if (!m_timeline) {
+            return 0;
+        }
+
+        const QVector<ExportRangeSegment> ranges = effectivePlaybackRanges();
+        if (ranges.isEmpty()) {
+            const int64_t nextFrame = currentFrame + 1;
+            return nextFrame > m_timeline->totalFrames() ? 0 : nextFrame;
+        }
+
+        for (const ExportRangeSegment& range : ranges) {
+            if (currentFrame < range.startFrame) {
+                // Jump to the start of the next word range
+                return range.startFrame;
+            }
+            if (currentFrame >= range.startFrame && currentFrame < range.endFrame) {
+                // Inside a word range - advance normally
+                return currentFrame + 1;
+            }
+            // If currentFrame == range.endFrame, continue to find next range
+        }
+        // Finished all ranges - loop back to start
+        return ranges.constFirst().startFrame;
+    }
+
     QString projectsDirPath() const {
         return QDir(QDir::currentPath()).filePath(QStringLiteral("projects"));
     }
@@ -2858,8 +3149,7 @@ private:
     }
 
     QString transcriptPathForClip(const TimelineClip& clip) const {
-        const QFileInfo info(clip.filePath);
-        return info.dir().filePath(info.completeBaseName() + QStringLiteral(".json"));
+        return transcriptPathForClipFile(clip.filePath);
     }
 
     QString secondsToTranscriptTime(double seconds) const {
@@ -2948,9 +3238,40 @@ private:
         ranges.last().endFrame = qMax(ranges.last().endFrame, frame);
     }
 
+    // Cache for transcript word ranges to avoid re-parsing JSON on every frame
+    mutable QHash<QString, QVector<ExportRangeSegment>> m_transcriptWordRangesCache;
+    mutable qint64 m_transcriptWordRangesCacheVersion = -1;
+
     QVector<ExportRangeSegment> transcriptWordExportRanges(const QVector<ExportRangeSegment>& baseRanges,
                                                            const QVector<TimelineClip>& clips,
                                                            const QVector<RenderSyncMarker>& markers) const {
+        // Check if cache is still valid (based on timeline clip count and version)
+        const qint64 currentVersion = m_timeline ? m_timeline->clips().size() : 0;
+        if (m_transcriptWordRangesCacheVersion == currentVersion && !m_transcriptWordRangesCache.isEmpty()) {
+            // Return cached ranges (they're already mapped to timeline frames)
+            QVector<ExportRangeSegment> result;
+            for (auto it = m_transcriptWordRangesCache.constBegin(); it != m_transcriptWordRangesCache.constEnd(); ++it) {
+                result.append(it.value());
+            }
+            // Merge overlapping ranges from different clips
+            std::sort(result.begin(), result.end(),
+                      [](const ExportRangeSegment& a, const ExportRangeSegment& b) {
+                          return a.startFrame < b.startFrame;
+                      });
+            QVector<ExportRangeSegment> merged;
+            for (const auto& range : result) {
+                if (merged.isEmpty() || range.startFrame > merged.last().endFrame + 1) {
+                    merged.append(range);
+                } else {
+                    merged.last().endFrame = qMax(merged.last().endFrame, range.endFrame);
+                }
+            }
+            return merged;
+        }
+
+        m_transcriptWordRangesCache.clear();
+        m_transcriptWordRangesCacheVersion = currentVersion;
+
         QVector<ExportRangeSegment> resolvedBaseRanges = baseRanges;
         if (resolvedBaseRanges.isEmpty()) {
             int64_t endFrame = 0;
@@ -2960,7 +3281,8 @@ private:
             resolvedBaseRanges.push_back(ExportRangeSegment{0, endFrame});
         }
 
-        QVector<ExportRangeSegment> transcriptRanges;
+        QVector<ExportRangeSegment> allTranscriptRanges;
+
         for (const TimelineClip& clip : clips) {
             if (clip.durationFrames <= 0) {
                 continue;
@@ -2978,6 +3300,7 @@ private:
                 continue;
             }
 
+            // Build source word ranges from transcript
             QVector<ExportRangeSegment> sourceWordRanges;
             const QJsonArray segments = transcriptDoc.object().value(QStringLiteral("segments")).toArray();
             for (const QJsonValue& segmentValue : segments) {
@@ -2988,11 +3311,16 @@ private:
                         continue;
                     }
 
-                    const double startSeconds = wordObj.value(QStringLiteral("start")).toDouble(-1.0);
+                    double startSeconds = wordObj.value(QStringLiteral("start")).toDouble(-1.0);
                     const double endSeconds = wordObj.value(QStringLiteral("end")).toDouble(-1.0);
                     if (startSeconds < 0.0 || endSeconds < startSeconds) {
                         continue;
                     }
+
+                    // Apply runtime prepend offset (in seconds)
+                    const double prependSeconds = m_transcriptPrependMs / 1000.0;
+                    startSeconds = qMax(0.0, startSeconds + prependSeconds);
+                    // Clamp to not overlap with previous word (handled by sorting/merging later)
 
                     const int64_t startFrame =
                         qMax<int64_t>(0, static_cast<int64_t>(std::floor(startSeconds * kTimelineFps)));
@@ -3006,6 +3334,7 @@ private:
                 continue;
             }
 
+            // Sort and merge overlapping word ranges at source level
             std::sort(sourceWordRanges.begin(), sourceWordRanges.end(),
                       [](const ExportRangeSegment& a, const ExportRangeSegment& b) {
                           if (a.startFrame == b.startFrame) {
@@ -3024,6 +3353,9 @@ private:
                 }
             }
 
+            // Map source word ranges to timeline ranges efficiently (O(n) instead of O(n*m))
+            QVector<ExportRangeSegment> clipTimelineRanges;
+
             for (const ExportRangeSegment& baseRange : resolvedBaseRanges) {
                 const int64_t clipStart = qMax<int64_t>(clip.startFrame, baseRange.startFrame);
                 const int64_t clipEnd =
@@ -3032,24 +3364,64 @@ private:
                     continue;
                 }
 
-                for (int64_t timelineFrame = clipStart; timelineFrame <= clipEnd; ++timelineFrame) {
-                    const int64_t localTimelineFrame = timelineFrame - clip.startFrame;
-                    const int64_t sourceFrame =
-                        clip.sourceInFrame + adjustedLocalFrameForClip(clip, localTimelineFrame, markers);
-                    for (const ExportRangeSegment& wordRange : std::as_const(mergedSourceWordRanges)) {
-                        if (sourceFrame < wordRange.startFrame) {
-                            break;
-                        }
-                        if (sourceFrame <= wordRange.endFrame) {
-                            appendMergedExportFrame(transcriptRanges, timelineFrame);
-                            break;
-                        }
+                // For each source word range, map it to timeline frames
+                for (const ExportRangeSegment& wordRange : std::as_const(mergedSourceWordRanges)) {
+                    // Map source word range to timeline
+                    // sourceFrame = clip.sourceInFrame + adjustedLocalFrameForClip(clip, localTimelineFrame, markers)
+                    // So we need to find timeline frames where sourceFrame is within wordRange
+
+                    // This is a simplified mapping that assumes linear time mapping
+                    // For more complex mappings with markers, we'd need inverse mapping
+                    const int64_t wordStartInSource = wordRange.startFrame;
+                    const int64_t wordEndInSource = wordRange.endFrame;
+
+                    // Map source range to timeline range (clip-relative)
+                    int64_t localStart = wordStartInSource - clip.sourceInFrame;
+                    int64_t localEnd = wordEndInSource - clip.sourceInFrame;
+
+                    // Clamp to clip duration
+                    localStart = qMax<int64_t>(0, localStart);
+                    localEnd = qMin<int64_t>(clip.durationFrames - 1, localEnd);
+
+                    if (localEnd < localStart) {
+                        continue;
+                    }
+
+                    // Map to absolute timeline frames
+                    int64_t timelineStart = clip.startFrame + localStart;
+                    int64_t timelineEnd = clip.startFrame + localEnd;
+
+                    // Intersect with base range
+                    timelineStart = qMax(timelineStart, clipStart);
+                    timelineEnd = qMin(timelineEnd, clipEnd);
+
+                    if (timelineEnd >= timelineStart) {
+                        clipTimelineRanges.push_back(ExportRangeSegment{timelineStart, timelineEnd});
                     }
                 }
             }
+
+            // Cache ranges for this clip
+            if (!clipTimelineRanges.isEmpty()) {
+                m_transcriptWordRangesCache[clip.id] = clipTimelineRanges;
+                allTranscriptRanges.append(clipTimelineRanges);
+            }
         }
 
-        return transcriptRanges;
+        // Sort and merge all ranges from all clips
+        std::sort(allTranscriptRanges.begin(), allTranscriptRanges.end(),
+                  [](const ExportRangeSegment& a, const ExportRangeSegment& b) {
+                      return a.startFrame < b.startFrame;
+                  });
+        QVector<ExportRangeSegment> merged;
+        for (const auto& range : allTranscriptRanges) {
+            if (merged.isEmpty() || range.startFrame > merged.last().endFrame + 1) {
+                merged.append(range);
+            } else {
+                merged.last().endFrame = qMax(merged.last().endFrame, range.endFrame);
+            }
+        }
+        return merged;
     }
 
     QString clipLabelForId(const QString& clipId) const {
@@ -3170,6 +3542,23 @@ private:
             keyframes.push_back(keyframeObj);
         }
         obj[QStringLiteral("transformKeyframes")] = keyframes;
+        QJsonObject transcriptOverlayObj;
+        transcriptOverlayObj[QStringLiteral("enabled")] = clip.transcriptOverlay.enabled;
+        transcriptOverlayObj[QStringLiteral("autoScroll")] = clip.transcriptOverlay.autoScroll;
+        transcriptOverlayObj[QStringLiteral("translationX")] = clip.transcriptOverlay.translationX;
+        transcriptOverlayObj[QStringLiteral("translationY")] = clip.transcriptOverlay.translationY;
+        transcriptOverlayObj[QStringLiteral("boxWidth")] = clip.transcriptOverlay.boxWidth;
+        transcriptOverlayObj[QStringLiteral("boxHeight")] = clip.transcriptOverlay.boxHeight;
+        transcriptOverlayObj[QStringLiteral("maxLines")] = clip.transcriptOverlay.maxLines;
+        transcriptOverlayObj[QStringLiteral("maxCharsPerLine")] = clip.transcriptOverlay.maxCharsPerLine;
+        transcriptOverlayObj[QStringLiteral("fontFamily")] = clip.transcriptOverlay.fontFamily;
+        transcriptOverlayObj[QStringLiteral("fontPointSize")] = clip.transcriptOverlay.fontPointSize;
+        transcriptOverlayObj[QStringLiteral("bold")] = clip.transcriptOverlay.bold;
+        transcriptOverlayObj[QStringLiteral("italic")] = clip.transcriptOverlay.italic;
+        transcriptOverlayObj[QStringLiteral("textColor")] =
+            clip.transcriptOverlay.textColor.name(QColor::HexArgb);
+        obj[QStringLiteral("transcriptOverlay")] = transcriptOverlayObj;
+        obj[QStringLiteral("fadeSamples")] = clip.fadeSamples;
         return obj;
     }
     
@@ -3231,6 +3620,25 @@ private:
             keyframe.interpolated = keyframeObj.value(QStringLiteral("interpolated")).toBool(true);
             clip.transformKeyframes.push_back(keyframe);
         }
+        const QJsonObject transcriptOverlayObj = obj.value(QStringLiteral("transcriptOverlay")).toObject();
+        clip.transcriptOverlay.enabled = transcriptOverlayObj.value(QStringLiteral("enabled")).toBool(false);
+        clip.transcriptOverlay.autoScroll = transcriptOverlayObj.value(QStringLiteral("autoScroll")).toBool(false);
+        clip.transcriptOverlay.translationX = transcriptOverlayObj.value(QStringLiteral("translationX")).toDouble(0.0);
+        clip.transcriptOverlay.translationY = transcriptOverlayObj.value(QStringLiteral("translationY")).toDouble(640.0);
+        clip.transcriptOverlay.boxWidth = transcriptOverlayObj.value(QStringLiteral("boxWidth")).toDouble(900.0);
+        clip.transcriptOverlay.boxHeight = transcriptOverlayObj.value(QStringLiteral("boxHeight")).toDouble(220.0);
+        clip.transcriptOverlay.maxLines = qMax(1, transcriptOverlayObj.value(QStringLiteral("maxLines")).toInt(2));
+        clip.transcriptOverlay.maxCharsPerLine =
+            qMax(1, transcriptOverlayObj.value(QStringLiteral("maxCharsPerLine")).toInt(28));
+        clip.transcriptOverlay.fontFamily =
+            transcriptOverlayObj.value(QStringLiteral("fontFamily")).toString(QStringLiteral("DejaVu Sans"));
+        clip.transcriptOverlay.fontPointSize =
+            qMax(8, transcriptOverlayObj.value(QStringLiteral("fontPointSize")).toInt(42));
+        clip.transcriptOverlay.bold = transcriptOverlayObj.value(QStringLiteral("bold")).toBool(true);
+        clip.transcriptOverlay.italic = transcriptOverlayObj.value(QStringLiteral("italic")).toBool(false);
+        clip.transcriptOverlay.textColor =
+            QColor(transcriptOverlayObj.value(QStringLiteral("textColor")).toString(QStringLiteral("#ffffffff")));
+        clip.fadeSamples = qMax(0, obj.value(QStringLiteral("fadeSamples")).toInt(250));
         normalizeClipTransformKeyframes(clip);
         return clip;
     }
@@ -3752,6 +4160,11 @@ private:
             }
             const int64_t currentFrame = m_timeline->currentFrame();
             const bool updated = m_timeline->updateClipById(clipId, [this, currentFrame, scaleX, scaleY](TimelineClip& clip) {
+                if (clip.mediaType == ClipMediaType::Audio && clip.transcriptOverlay.enabled) {
+                    clip.transcriptOverlay.boxWidth = qMax<qreal>(80.0, scaleX);
+                    clip.transcriptOverlay.boxHeight = qMax<qreal>(40.0, scaleY);
+                    return;
+                }
                 if (!clipHasVisuals(clip)) {
                     return;
                 }
@@ -3792,6 +4205,11 @@ private:
             }
             const int64_t currentFrame = m_timeline->currentFrame();
             const bool updated = m_timeline->updateClipById(clipId, [this, currentFrame, translationX, translationY](TimelineClip& clip) {
+                if (clip.mediaType == ClipMediaType::Audio && clip.transcriptOverlay.enabled) {
+                    clip.transcriptOverlay.translationX = translationX;
+                    clip.transcriptOverlay.translationY = translationY;
+                    return;
+                }
                 if (!clipHasVisuals(clip)) {
                     return;
                 }
@@ -4040,6 +4458,34 @@ private:
         m_audioInspectorDetailsLabel->setWordWrap(true);
         audioLayout->addWidget(m_audioInspectorClipLabel);
         audioLayout->addWidget(m_audioInspectorDetailsLabel);
+        
+        // Fade samples control for crossfade with previous clip
+        auto* fadeLayout = new QHBoxLayout();
+        fadeLayout->addWidget(new QLabel(QStringLiteral("Fade (samples):"), audioTab));
+        m_audioFadeSamplesSpin = new QSpinBox(audioTab);
+        m_audioFadeSamplesSpin->setRange(0, 10000);
+        m_audioFadeSamplesSpin->setValue(250);
+        m_audioFadeSamplesSpin->setSingleStep(10);
+        m_audioFadeSamplesSpin->setToolTip(QStringLiteral("Crossfade with previous audio clip (0 = no fade)"));
+        fadeLayout->addWidget(m_audioFadeSamplesSpin);
+        fadeLayout->addStretch();
+        audioLayout->addLayout(fadeLayout);
+        
+        connect(m_audioFadeSamplesSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+            if (!m_timeline || m_updatingAudioInspector) {
+                return;
+            }
+            const TimelineClip* clip = m_timeline->selectedClip();
+            if (!clip || !clipIsAudioOnly(*clip)) {
+                return;
+            }
+            m_timeline->updateClipById(clip->id, [value](TimelineClip& c) {
+                c.fadeSamples = value;
+            });
+            scheduleSaveState();
+            pushHistorySnapshot();
+        });
+        
         audioLayout->addStretch(1);
         m_inspectorTabs->addTab(audioTab, QStringLiteral("Audio"));
 
@@ -4054,19 +4500,159 @@ private:
         m_transcriptInspectorDetailsLabel->setWordWrap(true);
         transcriptLayout->addWidget(m_transcriptInspectorClipLabel);
         transcriptLayout->addWidget(m_transcriptInspectorDetailsLabel);
+        auto* transcriptOverlayForm = new QFormLayout;
+        m_transcriptOverlayEnabledCheckBox = new QCheckBox(QStringLiteral("Show Transcript Overlay"), transcriptTab);
+        transcriptOverlayForm->addRow(QStringLiteral("Overlay"), m_transcriptOverlayEnabledCheckBox);
+        m_transcriptMaxLinesSpin = new QSpinBox(transcriptTab);
+        m_transcriptMaxLinesSpin->setRange(1, 6);
+        transcriptOverlayForm->addRow(QStringLiteral("Line Count"), m_transcriptMaxLinesSpin);
+        m_transcriptMaxCharsSpin = new QSpinBox(transcriptTab);
+        m_transcriptMaxCharsSpin->setRange(4, 80);
+        transcriptOverlayForm->addRow(QStringLiteral("Max Chars/Line"), m_transcriptMaxCharsSpin);
+        m_transcriptAutoScrollCheckBox = new QCheckBox(QStringLiteral("Auto-scroll current word"), transcriptTab);
+        transcriptOverlayForm->addRow(QStringLiteral(""), m_transcriptAutoScrollCheckBox);
+        m_transcriptOverlayXSpin = new QDoubleSpinBox(transcriptTab);
+        m_transcriptOverlayXSpin->setRange(-4000.0, 4000.0);
+        m_transcriptOverlayXSpin->setDecimals(1);
+        transcriptOverlayForm->addRow(QStringLiteral("Position X"), m_transcriptOverlayXSpin);
+        m_transcriptOverlayYSpin = new QDoubleSpinBox(transcriptTab);
+        m_transcriptOverlayYSpin->setRange(-4000.0, 4000.0);
+        m_transcriptOverlayYSpin->setDecimals(1);
+        transcriptOverlayForm->addRow(QStringLiteral("Position Y"), m_transcriptOverlayYSpin);
+        m_transcriptOverlayWidthSpin = new QSpinBox(transcriptTab);
+        m_transcriptOverlayWidthSpin->setRange(80, 4000);
+        transcriptOverlayForm->addRow(QStringLiteral("Box Width"), m_transcriptOverlayWidthSpin);
+        m_transcriptOverlayHeightSpin = new QSpinBox(transcriptTab);
+        m_transcriptOverlayHeightSpin->setRange(40, 2000);
+        transcriptOverlayForm->addRow(QStringLiteral("Box Height"), m_transcriptOverlayHeightSpin);
+        m_transcriptFontFamilyCombo = new QFontComboBox(transcriptTab);
+        transcriptOverlayForm->addRow(QStringLiteral("Font"), m_transcriptFontFamilyCombo);
+        m_transcriptFontSizeSpin = new QSpinBox(transcriptTab);
+        m_transcriptFontSizeSpin->setRange(8, 240);
+        transcriptOverlayForm->addRow(QStringLiteral("Font Size"), m_transcriptFontSizeSpin);
+        m_transcriptBoldCheckBox = new QCheckBox(QStringLiteral("Bold"), transcriptTab);
+        transcriptOverlayForm->addRow(QStringLiteral(""), m_transcriptBoldCheckBox);
+        m_transcriptItalicCheckBox = new QCheckBox(QStringLiteral("Italic"), transcriptTab);
+        transcriptOverlayForm->addRow(QStringLiteral(""), m_transcriptItalicCheckBox);
+        transcriptLayout->addLayout(transcriptOverlayForm);
         m_transcriptTable = new QTableWidget(transcriptTab);
         m_transcriptTable->setColumnCount(3);
         m_transcriptTable->setHorizontalHeaderLabels(
             {QStringLiteral("Start"), QStringLiteral("End"), QStringLiteral("Text")});
         m_transcriptTable->setSelectionBehavior(QAbstractItemView::SelectRows);
-        m_transcriptTable->setSelectionMode(QAbstractItemView::SingleSelection);
+        m_transcriptTable->setSelectionMode(QAbstractItemView::ExtendedSelection); // Allow Shift+Ctrl multi-select
         m_transcriptTable->setEditTriggers(QAbstractItemView::DoubleClicked |
                                            QAbstractItemView::EditKeyPressed |
                                            QAbstractItemView::SelectedClicked);
+        
+        // Delete key handler for transcript words
+        auto* transcriptDeleteShortcut = new QShortcut(QKeySequence::Delete, m_transcriptTable);
+        connect(transcriptDeleteShortcut, &QShortcut::activated, this, [this]() {
+            if (!m_transcriptTable || m_updatingTranscriptInspector || 
+                m_loadedTranscriptPath.isEmpty() || m_loadedTranscriptDoc.isNull()) {
+                return;
+            }
+            
+            // Get selected rows (sorted in descending order to delete from bottom up)
+            QList<int> rowsToDelete;
+            for (int row = 0; row < m_transcriptTable->rowCount(); ++row) {
+                if (m_transcriptTable->selectionModel()->isRowSelected(row, QModelIndex())) {
+                    rowsToDelete.append(row);
+                }
+            }
+            if (rowsToDelete.isEmpty()) {
+                return;
+            }
+            
+            // Sort descending so we can delete without index shifting issues
+            std::sort(rowsToDelete.begin(), rowsToDelete.end(), std::greater<int>());
+            
+            QJsonObject root = m_loadedTranscriptDoc.object();
+            QJsonArray segments = root.value(QStringLiteral("segments")).toArray();
+            
+            // Track which words to delete from which segments
+            QHash<int, QList<int>> wordsToDeleteBySegment; // segmentIndex -> list of wordIndices
+            
+            for (int row : rowsToDelete) {
+                QTableWidgetItem* item = m_transcriptTable->item(row, 0);
+                if (!item) continue;
+                int segmentIndex = item->data(Qt::UserRole).toInt();
+                int wordIndex = item->data(Qt::UserRole + 1).toInt();
+                wordsToDeleteBySegment[segmentIndex].append(wordIndex);
+            }
+            
+            // Delete words from each segment
+            bool modified = false;
+            for (auto it = wordsToDeleteBySegment.begin(); it != wordsToDeleteBySegment.end(); ++it) {
+                int segmentIndex = it.key();
+                QList<int> wordIndices = it.value();
+                
+                if (segmentIndex < 0 || segmentIndex >= segments.size()) continue;
+                
+                QJsonObject segmentObj = segments[segmentIndex].toObject();
+                QJsonArray words = segmentObj.value(QStringLiteral("words")).toArray();
+                
+                // Sort descending to delete from end first
+                std::sort(wordIndices.begin(), wordIndices.end(), std::greater<int>());
+                
+                for (int wordIndex : wordIndices) {
+                    if (wordIndex >= 0 && wordIndex < words.size()) {
+                        words.removeAt(wordIndex);
+                        modified = true;
+                    }
+                }
+                
+                // Update segment
+                segmentObj[QStringLiteral("words")] = words;
+                segments[segmentIndex] = segmentObj;
+            }
+            
+            if (!modified) {
+                return;
+            }
+            
+            root[QStringLiteral("segments")] = segments;
+            m_loadedTranscriptDoc = QJsonDocument(root);
+            
+            if (!saveTranscriptJson(m_loadedTranscriptPath, m_loadedTranscriptDoc)) {
+                QMessageBox::warning(this,
+                                     QStringLiteral("Transcript Save Failed"),
+                                     QStringLiteral("Could not save transcript changes."));
+            }
+            
+            // Refresh the table
+            refreshInspector();
+        });
+        m_transcriptTable->setTextElideMode(Qt::ElideNone);
+        m_transcriptTable->setWordWrap(true);
         m_transcriptTable->verticalHeader()->setVisible(false);
+        m_transcriptTable->verticalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
         m_transcriptTable->horizontalHeader()->setStretchLastSection(true);
         m_transcriptTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
         m_transcriptTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        m_transcriptFollowCurrentWordCheckBox = new QCheckBox(QStringLiteral("Follow current word in table"), transcriptTab);
+        m_transcriptFollowCurrentWordCheckBox->setChecked(true);
+        transcriptLayout->addWidget(m_transcriptFollowCurrentWordCheckBox);
+        
+        // Runtime prepend offset (not saved to ground truth)
+        auto* prependLayout = new QHBoxLayout();
+        prependLayout->addWidget(new QLabel(QStringLiteral("Prepend (ms):"), transcriptTab));
+        m_transcriptPrependMsSpin = new QSpinBox(transcriptTab);
+        m_transcriptPrependMsSpin->setRange(-1000, 1000);
+        m_transcriptPrependMsSpin->setValue(0);
+        m_transcriptPrependMsSpin->setSingleStep(10);
+        m_transcriptPrependMsSpin->setToolTip(QStringLiteral("Runtime offset applied to word start times (not saved to file)"));
+        prependLayout->addWidget(m_transcriptPrependMsSpin);
+        prependLayout->addStretch();
+        transcriptLayout->addLayout(prependLayout);
+        
+        connect(m_transcriptPrependMsSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this]() {
+            // Just update the cached value - applied at runtime
+            m_transcriptPrependMs = m_transcriptPrependMsSpin->value();
+            // Rebuild ranges with new offset
+            m_transcriptWordRangesCache.clear();
+        });
+        
         transcriptLayout->addWidget(m_transcriptTable, 1);
         m_inspectorTabs->addTab(transcriptTab, QStringLiteral("Transcript"));
 
@@ -4123,6 +4709,10 @@ private:
             refreshInspector();
         });
         connect(m_exportOnlyTranscriptWordsCheckBox, &QCheckBox::toggled, this, [this](bool) {
+            if (m_playbackTimer.isActive()) {
+                setPlaybackActive(false);
+                setPlaybackActive(true);
+            }
             scheduleSaveState();
             refreshInspector();
         });
@@ -4145,6 +4735,32 @@ private:
                 m_preview->setBypassGrading(checked);
             }
             refreshInspector();
+        });
+        // Single click on a row to seek to that word's start time
+        connect(m_transcriptTable, &QTableWidget::cellClicked, this, [this](int row, int column) {
+            Q_UNUSED(column)
+            if (!m_transcriptTable || row < 0 || !m_timeline) {
+                return;
+            }
+            // Don't seek if we're in edit mode (editing text)
+            if (m_transcriptTable->isPersistentEditorOpen(m_transcriptTable->currentIndex())) {
+                return;
+            }
+            QTableWidgetItem* startItem = m_transcriptTable->item(row, 0);
+            if (!startItem) {
+                return;
+            }
+            const int64_t startFrame = startItem->data(Qt::UserRole + 2).toLongLong();
+            if (startFrame >= 0) {
+                // Map source frame to timeline position for the selected clip
+                const TimelineClip* clip = m_timeline->selectedClip();
+                if (clip && clip->mediaType == ClipMediaType::Audio) {
+                    // Calculate timeline frame from source frame
+                    const int64_t localFrame = startFrame - clip->sourceInFrame;
+                    const int64_t timelineFrame = clip->startFrame + localFrame;
+                    setCurrentFrame(timelineFrame);
+                }
+            }
         });
         connect(m_transcriptTable, &QTableWidget::cellChanged, this, [this](int row, int column) {
             if (m_updatingTranscriptInspector || !m_transcriptTable || row < 0 || column < 0 ||
@@ -4199,7 +4815,37 @@ private:
                                      QStringLiteral("Could not save transcript changes to:\n%1")
                                          .arg(QDir::toNativeSeparators(m_loadedTranscriptPath)));
             }
+            if (m_preview && m_timeline) {
+                m_preview->setTimelineClips(m_timeline->clips());
+            }
             refreshInspector();
+        });
+        auto connectTranscriptOverlayLive = [this](auto* widget, auto signal) {
+            connect(widget, signal, this, [this](auto) {
+                applySelectedTranscriptOverlayFromInspector(false);
+            });
+        };
+        connect(m_transcriptOverlayEnabledCheckBox, &QCheckBox::toggled, this, [this](bool) {
+            applySelectedTranscriptOverlayFromInspector(true);
+        });
+        connectTranscriptOverlayLive(m_transcriptMaxLinesSpin, qOverload<int>(&QSpinBox::valueChanged));
+        connectTranscriptOverlayLive(m_transcriptMaxCharsSpin, qOverload<int>(&QSpinBox::valueChanged));
+        connect(m_transcriptAutoScrollCheckBox, &QCheckBox::toggled, this, [this](bool) {
+            applySelectedTranscriptOverlayFromInspector(false);
+        });
+        connectTranscriptOverlayLive(m_transcriptOverlayXSpin, qOverload<double>(&QDoubleSpinBox::valueChanged));
+        connectTranscriptOverlayLive(m_transcriptOverlayYSpin, qOverload<double>(&QDoubleSpinBox::valueChanged));
+        connectTranscriptOverlayLive(m_transcriptOverlayWidthSpin, qOverload<int>(&QSpinBox::valueChanged));
+        connectTranscriptOverlayLive(m_transcriptOverlayHeightSpin, qOverload<int>(&QSpinBox::valueChanged));
+        connect(m_transcriptFontFamilyCombo, &QFontComboBox::currentFontChanged, this, [this](const QFont&) {
+            applySelectedTranscriptOverlayFromInspector(false);
+        });
+        connectTranscriptOverlayLive(m_transcriptFontSizeSpin, qOverload<int>(&QSpinBox::valueChanged));
+        connect(m_transcriptBoldCheckBox, &QCheckBox::toggled, this, [this](bool) {
+            applySelectedTranscriptOverlayFromInspector(false);
+        });
+        connect(m_transcriptItalicCheckBox, &QCheckBox::toggled, this, [this](bool) {
+            applySelectedTranscriptOverlayFromInspector(false);
         });
         connect(m_syncTable, &QTableWidget::cellChanged, this, [this](int row, int column) {
             if (m_updatingSyncInspector || !m_timeline || !m_syncTable || row < 0 || column < 0) {
@@ -4454,6 +5100,13 @@ private:
             statusLabel->setWordWrap(true);
             auto* detailLabel = new QLabel(QStringLiteral("Scanning export ranges..."), progressDialog);
             detailLabel->setWordWrap(true);
+            auto* previewLabel = new QLabel(progressDialog);
+            previewLabel->setAlignment(Qt::AlignCenter);
+            previewLabel->setMinimumSize(240, 426);
+            previewLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+            previewLabel->setStyleSheet(QStringLiteral(
+                "QLabel { background: #05080c; border: 1px solid #202934; border-radius: 12px; color: #7f8b99; }"));
+            previewLabel->setText(QStringLiteral("Render preview will appear here"));
             auto* progressBar = new QProgressBar(progressDialog);
             progressBar->setRange(0, 1000);
             progressBar->setValue(0);
@@ -4463,6 +5116,7 @@ private:
             progressLayout->addWidget(pipelineLabel);
             progressLayout->addWidget(statusLabel);
             progressLayout->addWidget(detailLabel);
+            progressLayout->addWidget(previewLabel, 1);
             progressLayout->addWidget(progressBar);
             progressLayout->addWidget(cancelButton, 0, Qt::AlignRight);
 
@@ -4481,7 +5135,7 @@ private:
             QApplication::setOverrideCursor(Qt::WaitCursor);
             const RenderResult renderResult = renderTimelineToFile(
                 request,
-                [this, &cancelRequested, progressDialog, progressBar, pipelineLabel, statusLabel, detailLabel](const RenderProgress& progress) {
+                [this, &cancelRequested, progressDialog, progressBar, pipelineLabel, statusLabel, detailLabel, previewLabel](const RenderProgress& progress) {
                     if (cancelRequested) {
                         return false;
                     }
@@ -4504,6 +5158,12 @@ private:
                             .arg(progress.timelineFrame)
                             .arg(progress.segmentStartFrame)
                             .arg(progress.segmentEndFrame));
+                    if (!progress.previewFrame.isNull() && previewLabel) {
+                        const QSize targetSize = previewLabel->contentsRect().size().expandedTo(QSize(1, 1));
+                        const QPixmap pixmap = QPixmap::fromImage(
+                            progress.previewFrame.scaled(targetSize, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+                        previewLabel->setPixmap(pixmap);
+                    }
                     if (progressDialog) {
                         progressDialog->update();
                     }
@@ -4890,6 +5550,54 @@ private:
             pushHistorySnapshot();
         }
     }
+
+    void applySelectedTranscriptOverlayFromInspector(bool pushHistoryAfterChange = false) {
+        if (!m_timeline || m_updatingTranscriptInspector) {
+            return;
+        }
+        const QString clipId = m_timeline->selectedClipId();
+        if (clipId.isEmpty()) {
+            return;
+        }
+
+        const bool updated = m_timeline->updateClipById(clipId, [this](TimelineClip& clip) {
+            clip.transcriptOverlay.enabled =
+                m_transcriptOverlayEnabledCheckBox && m_transcriptOverlayEnabledCheckBox->isChecked();
+            clip.transcriptOverlay.maxLines = m_transcriptMaxLinesSpin ? m_transcriptMaxLinesSpin->value() : 2;
+            clip.transcriptOverlay.maxCharsPerLine =
+                m_transcriptMaxCharsSpin ? m_transcriptMaxCharsSpin->value() : 28;
+            clip.transcriptOverlay.autoScroll =
+                m_transcriptAutoScrollCheckBox && m_transcriptAutoScrollCheckBox->isChecked();
+            clip.transcriptOverlay.translationX =
+                m_transcriptOverlayXSpin ? m_transcriptOverlayXSpin->value() : 0.0;
+            clip.transcriptOverlay.translationY =
+                m_transcriptOverlayYSpin ? m_transcriptOverlayYSpin->value() : 640.0;
+            clip.transcriptOverlay.boxWidth =
+                m_transcriptOverlayWidthSpin ? m_transcriptOverlayWidthSpin->value() : 900.0;
+            clip.transcriptOverlay.boxHeight =
+                m_transcriptOverlayHeightSpin ? m_transcriptOverlayHeightSpin->value() : 220.0;
+            clip.transcriptOverlay.fontFamily =
+                m_transcriptFontFamilyCombo ? m_transcriptFontFamilyCombo->currentFont().family()
+                                            : QStringLiteral("DejaVu Sans");
+            clip.transcriptOverlay.fontPointSize =
+                m_transcriptFontSizeSpin ? m_transcriptFontSizeSpin->value() : 42;
+            clip.transcriptOverlay.bold = m_transcriptBoldCheckBox && m_transcriptBoldCheckBox->isChecked();
+            clip.transcriptOverlay.italic =
+                m_transcriptItalicCheckBox && m_transcriptItalicCheckBox->isChecked();
+        });
+        if (!updated) {
+            return;
+        }
+
+        if (m_preview) {
+            m_preview->setTimelineClips(m_timeline->clips());
+        }
+        refreshInspector();
+        scheduleSaveState();
+        if (pushHistoryAfterChange) {
+            pushHistorySnapshot();
+        }
+    }
     
     void setCurrentFrame(int64_t frame, bool syncAudio = true) {
         setCurrentPlaybackSample(frameToSamples(frame), syncAudio);
@@ -4920,7 +5628,7 @@ private:
         setPlaybackActive(!m_playbackTimer.isActive());
     }
 
-    void setCurrentPlaybackSample(int64_t samplePosition, bool syncAudio = true) {
+    void setCurrentPlaybackSample(int64_t samplePosition, bool syncAudio = true, bool duringPlayback = false) {
         const int64_t boundedSample = qBound<int64_t>(0, samplePosition, frameToSamples(m_timeline->totalFrames()));
         const qreal framePosition = samplesToFramePosition(boundedSample);
         const int64_t bounded = qBound<int64_t>(0,
@@ -4934,6 +5642,7 @@ private:
         if (!m_timeline || bounded != m_timeline->currentFrame()) {
             m_lastPlayheadAdvanceMs.store(nowMs());
         }
+        m_currentPlaybackSample = boundedSample;
         m_fastCurrentFrame.store(bounded);
         if (syncAudio && m_audioEngine && m_audioEngine->hasPlayableAudio()) {
             m_audioEngine->seek(bounded);
@@ -4946,8 +5655,65 @@ private:
         m_ignoreSeekSignal = false;
         
         m_timecodeLabel->setText(frameToTimecode(bounded));
-        refreshInspector();
+        
+        // During playback, only update cheap transport labels and sync transcript table
+        // instead of doing a full refreshInspector() which rebuilds all tables
+        if (duringPlayback) {
+            updateTransportLabels();
+            syncTranscriptTableToPlayhead();
+        } else {
+            refreshInspector();
+        }
         scheduleSaveState();
+    }
+
+    void syncTranscriptTableToPlayhead() {
+        if (!m_timeline || !m_transcriptTable || m_updatingTranscriptInspector) {
+            return;
+        }
+
+        // Skip all table updates when "Follow current word" is disabled
+        if (!m_transcriptFollowCurrentWordCheckBox || !m_transcriptFollowCurrentWordCheckBox->isChecked()) {
+            return;
+        }
+
+        const TimelineClip* clip = m_timeline->selectedClip();
+        if (!clip || clip->mediaType != ClipMediaType::Audio || m_loadedTranscriptPath.isEmpty()) {
+            m_transcriptTable->clearSelection();
+            return;
+        }
+
+        const int64_t sourceFrame =
+            sourceFrameForClipAtTimelinePosition(*clip,
+                                                 samplesToFramePosition(m_currentPlaybackSample),
+                                                 {});
+        int matchingRow = -1;
+        for (int row = 0; row < m_transcriptTable->rowCount(); ++row) {
+            QTableWidgetItem* startItem = m_transcriptTable->item(row, 0);
+            if (!startItem) {
+                continue;
+            }
+            const int64_t startFrame = startItem->data(Qt::UserRole + 2).toLongLong();
+            const int64_t endFrame = startItem->data(Qt::UserRole + 3).toLongLong();
+            if (sourceFrame >= startFrame && sourceFrame <= endFrame) {
+                matchingRow = row;
+                break;
+            }
+        }
+
+        if (matchingRow < 0) {
+            m_transcriptTable->clearSelection();
+            return;
+        }
+
+        if (!m_transcriptTable->selectionModel()->isRowSelected(matchingRow, QModelIndex())) {
+            m_transcriptTable->setCurrentCell(matchingRow, 0);
+            m_transcriptTable->selectRow(matchingRow);
+        }
+        // Scroll to the matching word
+        if (QTableWidgetItem* item = m_transcriptTable->item(matchingRow, 0)) {
+            m_transcriptTable->scrollToItem(item, QAbstractItemView::PositionAtCenter);
+        }
     }
     
     QString frameToTimecode(int64_t frame) const {
@@ -4963,7 +5729,8 @@ private:
             .arg(frames, 2, 10, QLatin1Char('0'));
     }
     
-    void refreshInspector() {
+    // Lightweight update for transport labels - safe to call during playback
+    void updateTransportLabels() {
         const bool playing = m_playbackTimer.isActive();
         const QString state = playing ? QStringLiteral("PLAYING") : QStringLiteral("PAUSED");
         const int clipCount = m_timeline ? m_timeline->clips().size() : 0;
@@ -4987,6 +5754,13 @@ private:
         m_audioNowPlayingLabel->setText(activeAudio.isEmpty()
                                             ? QStringLiteral("Audio idle")
                                             : QStringLiteral("Audio  %1").arg(activeAudio));
+    }
+
+    void refreshInspector() {
+        const bool playing = m_playbackTimer.isActive();
+        
+        // Update cheap transport labels
+        updateTransportLabels();
         if (m_bypassGradingCheckBox) {
             QSignalBlocker block(m_bypassGradingCheckBox);
             m_bypassGradingCheckBox->setChecked(m_preview && m_preview->bypassGrading());
@@ -5045,6 +5819,48 @@ private:
             m_audioInspectorDetailsLabel->setText(QStringLiteral("Select an audio clip to inspect playback details."));
             m_transcriptInspectorClipLabel->setText(QStringLiteral("No transcript selected"));
             m_transcriptInspectorDetailsLabel->setText(QStringLiteral("Select a clip with a WhisperX JSON transcript."));
+            if (m_transcriptOverlayEnabledCheckBox) {
+                QSignalBlocker block1(m_transcriptOverlayEnabledCheckBox);
+                QSignalBlocker block2(m_transcriptMaxLinesSpin);
+                QSignalBlocker block3(m_transcriptMaxCharsSpin);
+                QSignalBlocker block4(m_transcriptAutoScrollCheckBox);
+                QSignalBlocker block5(m_transcriptOverlayXSpin);
+                QSignalBlocker block6(m_transcriptOverlayYSpin);
+                QSignalBlocker block7(m_transcriptOverlayWidthSpin);
+                QSignalBlocker block8(m_transcriptOverlayHeightSpin);
+                QSignalBlocker block9(m_transcriptFontFamilyCombo);
+                QSignalBlocker block10(m_transcriptFontSizeSpin);
+                QSignalBlocker block11(m_transcriptBoldCheckBox);
+                QSignalBlocker block12(m_transcriptItalicCheckBox);
+                m_transcriptOverlayEnabledCheckBox->setChecked(false);
+                m_transcriptMaxLinesSpin->setValue(2);
+                m_transcriptMaxCharsSpin->setValue(28);
+                m_transcriptAutoScrollCheckBox->setChecked(false);
+                m_transcriptOverlayXSpin->setValue(0.0);
+                m_transcriptOverlayYSpin->setValue(640.0);
+                m_transcriptOverlayWidthSpin->setValue(900);
+                m_transcriptOverlayHeightSpin->setValue(220);
+                m_transcriptFontFamilyCombo->setCurrentFont(QFont(QStringLiteral("DejaVu Sans")));
+                m_transcriptFontSizeSpin->setValue(42);
+                m_transcriptBoldCheckBox->setChecked(true);
+                m_transcriptItalicCheckBox->setChecked(false);
+                for (QWidget* widget : {static_cast<QWidget*>(m_transcriptOverlayEnabledCheckBox),
+                                        static_cast<QWidget*>(m_transcriptMaxLinesSpin),
+                                        static_cast<QWidget*>(m_transcriptMaxCharsSpin),
+                                        static_cast<QWidget*>(m_transcriptAutoScrollCheckBox),
+                                        static_cast<QWidget*>(m_transcriptOverlayXSpin),
+                                        static_cast<QWidget*>(m_transcriptOverlayYSpin),
+                                        static_cast<QWidget*>(m_transcriptOverlayWidthSpin),
+                                        static_cast<QWidget*>(m_transcriptOverlayHeightSpin),
+                                        static_cast<QWidget*>(m_transcriptFontFamilyCombo),
+                                        static_cast<QWidget*>(m_transcriptFontSizeSpin),
+                                        static_cast<QWidget*>(m_transcriptBoldCheckBox),
+                                        static_cast<QWidget*>(m_transcriptItalicCheckBox)}) {
+                    if (widget) {
+                        widget->setEnabled(false);
+                    }
+                }
+            }
             m_updatingVideoInspector = true;
             m_videoKeyframeTable->clearContents();
             m_videoKeyframeTable->setRowCount(0);
@@ -5300,23 +6116,40 @@ private:
                     m_loadedTranscriptPath = transcriptPath;
                     const QJsonArray segments = transcriptDoc.object().value(QStringLiteral("segments")).toArray();
                     int row = 0;
+                    const double prependSeconds = m_transcriptPrependMs / 1000.0;
                     for (int segmentIndex = 0; segmentIndex < segments.size(); ++segmentIndex) {
                         const QJsonObject segmentObj = segments[segmentIndex].toObject();
                         const QJsonArray words = segmentObj.value(QStringLiteral("words")).toArray();
                         for (int wordIndex = 0; wordIndex < words.size(); ++wordIndex) {
                             const QJsonObject wordObj = words[wordIndex].toObject();
                             m_transcriptTable->insertRow(row);
-                            auto* startItem = new QTableWidgetItem(
-                                secondsToTranscriptTime(wordObj.value(QStringLiteral("start")).toDouble()));
-                            auto* endItem = new QTableWidgetItem(
-                                secondsToTranscriptTime(wordObj.value(QStringLiteral("end")).toDouble()));
+                            // Ground truth times
+                            const double gtStart = wordObj.value(QStringLiteral("start")).toDouble();
+                            const double gtEnd = wordObj.value(QStringLiteral("end")).toDouble();
+                            // Display times with runtime offset applied
+                            const double displayStart = qMax(0.0, gtStart + prependSeconds);
+                            auto* startItem = new QTableWidgetItem(secondsToTranscriptTime(displayStart));
+                            auto* endItem = new QTableWidgetItem(secondsToTranscriptTime(gtEnd));
                             auto* textItem = new QTableWidgetItem(wordObj.value(QStringLiteral("word")).toString());
+                            // Use display-adjusted frame for playhead sync
+                            const int64_t startFrame = qMax<int64_t>(
+                                0, static_cast<int64_t>(std::floor(displayStart * kTimelineFps)));
+                            const int64_t endFrame = qMax<int64_t>(
+                                startFrame,
+                                static_cast<int64_t>(std::ceil(gtEnd * kTimelineFps)) - 1);
                             startItem->setData(Qt::UserRole, segmentIndex);
                             startItem->setData(Qt::UserRole + 1, wordIndex);
+                            startItem->setData(Qt::UserRole + 2, QVariant::fromValue<qlonglong>(startFrame));
+                            startItem->setData(Qt::UserRole + 3, QVariant::fromValue<qlonglong>(endFrame));
                             endItem->setData(Qt::UserRole, segmentIndex);
                             endItem->setData(Qt::UserRole + 1, wordIndex);
+                            endItem->setData(Qt::UserRole + 2, QVariant::fromValue<qlonglong>(startFrame));
+                            endItem->setData(Qt::UserRole + 3, QVariant::fromValue<qlonglong>(endFrame));
                             textItem->setData(Qt::UserRole, segmentIndex);
                             textItem->setData(Qt::UserRole + 1, wordIndex);
+                            textItem->setData(Qt::UserRole + 2, QVariant::fromValue<qlonglong>(startFrame));
+                            textItem->setData(Qt::UserRole + 3, QVariant::fromValue<qlonglong>(endFrame));
+                            textItem->setToolTip(textItem->text());
                             m_transcriptTable->setItem(row, 0, startItem);
                             m_transcriptTable->setItem(row, 1, endItem);
                             m_transcriptTable->setItem(row, 2, textItem);
@@ -5331,19 +6164,76 @@ private:
             }
         }
         m_updatingTranscriptInspector = false;
+        const bool transcriptOverlayAvailable =
+            clip->mediaType == ClipMediaType::Audio && !m_loadedTranscriptPath.isEmpty();
+        for (QWidget* widget : {static_cast<QWidget*>(m_transcriptOverlayEnabledCheckBox),
+                                static_cast<QWidget*>(m_transcriptMaxLinesSpin),
+                                static_cast<QWidget*>(m_transcriptMaxCharsSpin),
+                                static_cast<QWidget*>(m_transcriptAutoScrollCheckBox),
+                                static_cast<QWidget*>(m_transcriptOverlayXSpin),
+                                static_cast<QWidget*>(m_transcriptOverlayYSpin),
+                                static_cast<QWidget*>(m_transcriptOverlayWidthSpin),
+                                static_cast<QWidget*>(m_transcriptOverlayHeightSpin),
+                                static_cast<QWidget*>(m_transcriptFontFamilyCombo),
+                                static_cast<QWidget*>(m_transcriptFontSizeSpin),
+                                static_cast<QWidget*>(m_transcriptBoldCheckBox),
+                                static_cast<QWidget*>(m_transcriptItalicCheckBox)}) {
+            if (widget) {
+                widget->setEnabled(transcriptOverlayAvailable);
+            }
+        }
+        if (transcriptOverlayAvailable) {
+            QSignalBlocker block1(m_transcriptOverlayEnabledCheckBox);
+            QSignalBlocker block2(m_transcriptMaxLinesSpin);
+            QSignalBlocker block3(m_transcriptMaxCharsSpin);
+            QSignalBlocker block4(m_transcriptAutoScrollCheckBox);
+            QSignalBlocker block5(m_transcriptOverlayXSpin);
+            QSignalBlocker block6(m_transcriptOverlayYSpin);
+            QSignalBlocker block7(m_transcriptOverlayWidthSpin);
+            QSignalBlocker block8(m_transcriptOverlayHeightSpin);
+            QSignalBlocker block9(m_transcriptFontFamilyCombo);
+            QSignalBlocker block10(m_transcriptFontSizeSpin);
+            QSignalBlocker block11(m_transcriptBoldCheckBox);
+            QSignalBlocker block12(m_transcriptItalicCheckBox);
+            m_transcriptOverlayEnabledCheckBox->setChecked(clip->transcriptOverlay.enabled);
+            m_transcriptMaxLinesSpin->setValue(clip->transcriptOverlay.maxLines);
+            m_transcriptMaxCharsSpin->setValue(clip->transcriptOverlay.maxCharsPerLine);
+            m_transcriptAutoScrollCheckBox->setChecked(clip->transcriptOverlay.autoScroll);
+            m_transcriptOverlayXSpin->setValue(clip->transcriptOverlay.translationX);
+            m_transcriptOverlayYSpin->setValue(clip->transcriptOverlay.translationY);
+            m_transcriptOverlayWidthSpin->setValue(qRound(clip->transcriptOverlay.boxWidth));
+            m_transcriptOverlayHeightSpin->setValue(qRound(clip->transcriptOverlay.boxHeight));
+            m_transcriptFontFamilyCombo->setCurrentFont(QFont(clip->transcriptOverlay.fontFamily));
+            m_transcriptFontSizeSpin->setValue(clip->transcriptOverlay.fontPointSize);
+            m_transcriptBoldCheckBox->setChecked(clip->transcriptOverlay.bold);
+            m_transcriptItalicCheckBox->setChecked(clip->transcriptOverlay.italic);
+            m_transcriptInspectorDetailsLabel->setText(
+                m_transcriptInspectorDetailsLabel->text() +
+                QStringLiteral("\nOverlay: %1, %2 lines, %3 chars/line")
+                    .arg(clip->transcriptOverlay.enabled ? QStringLiteral("on") : QStringLiteral("off"))
+                    .arg(clip->transcriptOverlay.maxLines)
+                    .arg(clip->transcriptOverlay.maxCharsPerLine));
+        }
+        syncTranscriptTableToPlayhead();
         if (clipHasVisuals(*clip)) {
             m_gradingPathLabel->setText(QDir::toNativeSeparators(clip->filePath));
         } else {
             m_gradingPathLabel->setText(QStringLiteral("Audio clips do not use visual grading controls."));
         }
-        if (clipIsAudioOnly(*clip)) {
+        const bool isAudioClip = clipIsAudioOnly(*clip);
+        m_audioFadeSamplesSpin->setEnabled(isAudioClip);
+        if (isAudioClip) {
             m_audioInspectorClipLabel->setText(QStringLiteral("Track %1  %2").arg(clip->trackIndex + 1).arg(clip->label));
             m_audioInspectorDetailsLabel->setText(
-                QStringLiteral("Path: %1\nDuration: %2\nTransport volume: %3%%\nMuted: %4")
+                QStringLiteral("Path: %1\nDuration: %2\nTransport volume: %3%%\nMuted: %4\nFade: %5 samples")
                     .arg(QDir::toNativeSeparators(clip->filePath))
                     .arg(frameToTimecode(clip->durationFrames))
                     .arg(m_preview ? m_preview->audioVolumePercent() : 0)
-                    .arg(m_preview && m_preview->audioMuted() ? QStringLiteral("yes") : QStringLiteral("no")));
+                    .arg(m_preview && m_preview->audioMuted() ? QStringLiteral("yes") : QStringLiteral("no"))
+                    .arg(clip->fadeSamples));
+            m_updatingAudioInspector = true;
+            m_audioFadeSamplesSpin->setValue(clip->fadeSamples);
+            m_updatingAudioInspector = false;
         } else {
             m_audioInspectorClipLabel->setText(QStringLiteral("No audio clip selected"));
             m_audioInspectorDetailsLabel->setText(QStringLiteral("Select an audio clip to inspect playback details."));
@@ -5367,6 +6257,7 @@ private:
             {QStringLiteral("timeline_clip_count"), m_timeline ? m_timeline->clips().size() : 0},
             {QStringLiteral("current_frame"), m_timeline ? static_cast<qint64>(m_timeline->currentFrame()) : 0},
             {QStringLiteral("explorer_root"), m_currentRootPath},
+            {QStringLiteral("debug"), debugControlsSnapshot()},
             {QStringLiteral("main_thread_heartbeat_ms"), m_lastMainThreadHeartbeatMs.load()},
             {QStringLiteral("last_playhead_advance_ms"), m_lastPlayheadAdvanceMs.load()},
             {QStringLiteral("main_thread_heartbeat_age_ms"), m_lastMainThreadHeartbeatMs.load() > 0 ? now - m_lastMainThreadHeartbeatMs.load() : -1},
@@ -5413,6 +6304,8 @@ private:
     QLabel* m_keyframesInspectorDetailsLabel = nullptr;
     QLabel* m_audioInspectorClipLabel = nullptr;
     QLabel* m_audioInspectorDetailsLabel = nullptr;
+    QSpinBox* m_audioFadeSamplesSpin = nullptr;
+    bool m_updatingAudioInspector = false;
     QLabel* m_transcriptInspectorClipLabel = nullptr;
     QLabel* m_transcriptInspectorDetailsLabel = nullptr;
     QLabel* m_syncInspectorClipLabel = nullptr;
@@ -5438,6 +6331,21 @@ private:
     QCheckBox* m_mirrorVerticalCheckBox = nullptr;
     QCheckBox* m_lockVideoScaleCheckBox = nullptr;
     QCheckBox* m_keyframeSpaceCheckBox = nullptr;
+    QCheckBox* m_transcriptOverlayEnabledCheckBox = nullptr;
+    QSpinBox* m_transcriptMaxLinesSpin = nullptr;
+    QSpinBox* m_transcriptMaxCharsSpin = nullptr;
+    QCheckBox* m_transcriptAutoScrollCheckBox = nullptr;
+    QCheckBox* m_transcriptFollowCurrentWordCheckBox = nullptr;
+    QSpinBox* m_transcriptPrependMsSpin = nullptr;
+    int m_transcriptPrependMs = 0;  // Runtime offset (not persisted)
+    QDoubleSpinBox* m_transcriptOverlayXSpin = nullptr;
+    QDoubleSpinBox* m_transcriptOverlayYSpin = nullptr;
+    QSpinBox* m_transcriptOverlayWidthSpin = nullptr;
+    QSpinBox* m_transcriptOverlayHeightSpin = nullptr;
+    QFontComboBox* m_transcriptFontFamilyCombo = nullptr;
+    QSpinBox* m_transcriptFontSizeSpin = nullptr;
+    QCheckBox* m_transcriptBoldCheckBox = nullptr;
+    QCheckBox* m_transcriptItalicCheckBox = nullptr;
     QTableWidget* m_videoKeyframeTable = nullptr;
     QTableWidget* m_transcriptTable = nullptr;
     QTableWidget* m_syncTable = nullptr;
@@ -5454,6 +6362,7 @@ private:
     bool m_updatingProjectsList = false;
     bool m_pendingSaveAfterLoad = false;
     bool m_restoringHistory = false;
+    int64_t m_currentPlaybackSample = 0;
     QString m_currentRootPath;
     QString m_galleryFolderPath;
     QString m_currentProjectId;

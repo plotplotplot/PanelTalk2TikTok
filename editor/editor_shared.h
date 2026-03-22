@@ -25,6 +25,22 @@ struct TimelineClip {
         bool interpolated = true;
     };
 
+    struct TranscriptOverlaySettings {
+        bool enabled = false;
+        bool autoScroll = false;
+        qreal translationX = 0.0;
+        qreal translationY = 640.0;
+        qreal boxWidth = 900.0;
+        qreal boxHeight = 220.0;
+        int maxLines = 2;
+        int maxCharsPerLine = 28;
+        QString fontFamily = QStringLiteral("DejaVu Sans");
+        int fontPointSize = 42;
+        bool bold = true;
+        bool italic = false;
+        QColor textColor = QColor(QStringLiteral("#ffffff"));
+    };
+
     QString id;
     QString filePath;
     QString label;
@@ -48,6 +64,8 @@ struct TimelineClip {
     qreal baseScaleX = 1.0;
     qreal baseScaleY = 1.0;
     QVector<TransformKeyframe> transformKeyframes;
+    TranscriptOverlaySettings transcriptOverlay;
+    int fadeSamples = 250;  // Crossfade with previous audio clip (0 = no fade)
 };
 
 struct TimelineTrack {
@@ -77,6 +95,30 @@ struct MediaProbeResult {
     bool hasAudio = false;
     bool hasVideo = false;
     int64_t durationFrames = 120;
+};
+
+struct TranscriptWord {
+    int64_t startFrame = 0;
+    int64_t endFrame = 0;
+    QString text;
+};
+
+struct TranscriptSection {
+    int64_t startFrame = 0;
+    int64_t endFrame = 0;
+    QString text;
+    QVector<TranscriptWord> words;
+};
+
+struct TranscriptOverlayLine {
+    QStringList words;
+    int activeWord = -1;
+};
+
+struct TranscriptOverlayLayout {
+    QVector<TranscriptOverlayLine> lines;
+    bool truncatedTop = false;
+    bool truncatedBottom = false;
 };
 
 constexpr int kTimelineFps = 30;
@@ -117,3 +159,15 @@ int64_t sourceFrameForClipAtTimelinePosition(const TimelineClip& clip,
 
 MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames = 120);
 QImage applyClipGrade(const QImage& source, const TimelineClip& clip);
+QString transcriptPathForClipFile(const QString& filePath);
+QVector<TranscriptSection> loadTranscriptSections(const QString& transcriptPath);
+QString wrappedTranscriptSectionText(const QString& text, int maxCharsPerLine, int maxLines);
+TranscriptOverlayLayout layoutTranscriptSection(const TranscriptSection& section,
+                                               int64_t sourceFrame,
+                                               int maxCharsPerLine,
+                                               int maxLines,
+                                               bool autoScroll);
+QString transcriptOverlayHtml(const TranscriptOverlayLayout& layout,
+                              const QColor& textColor,
+                              const QColor& highlightTextColor,
+                              const QColor& highlightFillColor);

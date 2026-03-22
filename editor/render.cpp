@@ -17,6 +17,7 @@
 #include <QOpenGLShaderProgram>
 #include <QOpenGLTexture>
 #include <QPainter>
+#include <QTextDocument>
 #include <QSurfaceFormat>
 
 #include <algorithm>
@@ -55,6 +56,103 @@ QRect fitRect(const QSize& source, const QSize& bounds) {
     const QPoint topLeft((bounds.width() - scaled.width()) / 2,
                          (bounds.height() - scaled.height()) / 2);
     return QRect(topLeft, scaled);
+}
+
+TranscriptOverlayLayout transcriptOverlayLayoutForFrame(const TimelineClip& clip,
+                                                        int64_t timelineFrame,
+                                                        const QVector<RenderSyncMarker>& markers,
+                                                        QHash<QString, QVector<TranscriptSection>>& transcriptCache) {
+    if (!(clip.mediaType == ClipMediaType::Audio && clip.transcriptOverlay.enabled)) {
+        return {};
+    }
+    const QString cacheKey = clip.filePath;
+    if (!transcriptCache.contains(cacheKey)) {
+        transcriptCache.insert(cacheKey, loadTranscriptSections(transcriptPathForClipFile(clip.filePath)));
+    }
+    const QVector<TranscriptSection>& sections = transcriptCache.value(cacheKey);
+    if (sections.isEmpty()) {
+        return {};
+    }
+    const int64_t sourceFrame = sourceFrameForClipAtTimelinePosition(clip,
+                                                                     static_cast<qreal>(timelineFrame),
+                                                                     markers);
+    for (const TranscriptSection& section : sections) {
+        if (sourceFrame < section.startFrame) {
+            return {};
+        }
+        if (sourceFrame <= section.endFrame) {
+            return layoutTranscriptSection(section,
+                                           sourceFrame,
+                                           clip.transcriptOverlay.maxCharsPerLine,
+                                           clip.transcriptOverlay.maxLines,
+                                           clip.transcriptOverlay.autoScroll);
+        }
+    }
+    return {};
+}
+
+void renderTranscriptOverlays(QImage* canvas,
+                              const RenderRequest& request,
+                              int64_t timelineFrame,
+                              const QVector<TimelineClip>& orderedClips,
+                              QHash<QString, QVector<TranscriptSection>>& transcriptCache) {
+    if (!canvas || canvas->isNull()) {
+        return;
+    }
+
+    QPainter painter(canvas);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+    for (const TimelineClip& clip : orderedClips) {
+        if (timelineFrame < clip.startFrame || timelineFrame >= clip.startFrame + clip.durationFrames) {
+            continue;
+        }
+        const TranscriptOverlayLayout overlayLayout =
+            transcriptOverlayLayoutForFrame(clip, timelineFrame, request.renderSyncMarkers, transcriptCache);
+        if (overlayLayout.lines.isEmpty()) {
+            continue;
+        }
+
+        const QRectF bounds((request.outputSize.width() / 2.0) + clip.transcriptOverlay.translationX -
+                                (clip.transcriptOverlay.boxWidth / 2.0),
+                            (request.outputSize.height() / 2.0) + clip.transcriptOverlay.translationY -
+                                (clip.transcriptOverlay.boxHeight / 2.0),
+                            clip.transcriptOverlay.boxWidth,
+                            clip.transcriptOverlay.boxHeight);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(0, 0, 0, 120));
+        painter.drawRoundedRect(bounds, 14.0, 14.0);
+        QFont font(clip.transcriptOverlay.fontFamily);
+        font.setPixelSize(clip.transcriptOverlay.fontPointSize);
+        font.setBold(clip.transcriptOverlay.bold);
+        font.setItalic(clip.transcriptOverlay.italic);
+        const QRectF textBounds = bounds.adjusted(18.0, 14.0, -18.0, -14.0);
+        const QColor highlightFillColor(QStringLiteral("#fff2a8"));
+        const QColor highlightTextColor(QStringLiteral("#181818"));
+        QTextDocument shadowDoc;
+        shadowDoc.setDefaultFont(font);
+        shadowDoc.setDocumentMargin(0.0);
+        shadowDoc.setTextWidth(textBounds.width());
+        shadowDoc.setHtml(transcriptOverlayHtml(overlayLayout,
+                                                QColor(0, 0, 0, 200),
+                                                QColor(0, 0, 0, 200),
+                                                QColor(0, 0, 0, 0)));
+        QTextDocument textDoc;
+        textDoc.setDefaultFont(font);
+        textDoc.setDocumentMargin(0.0);
+        textDoc.setTextWidth(textBounds.width());
+        textDoc.setHtml(transcriptOverlayHtml(overlayLayout,
+                                              clip.transcriptOverlay.textColor,
+                                              highlightTextColor,
+                                              highlightFillColor));
+        const qreal textY = textBounds.top() + qMax<qreal>(0.0, (textBounds.height() - textDoc.size().height()) / 2.0);
+        painter.save();
+        painter.translate(textBounds.left() + 5.0, textY + 5.0);
+        shadowDoc.drawContents(&painter);
+        painter.translate(-5.0, -5.0);
+        textDoc.drawContents(&painter);
+        painter.restore();
+    }
 }
 
 const AVCodec* codecForRequest(const QString& outputFormat, QString* codecLabel) {
@@ -1304,6 +1402,7 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
     int64_t outputPts = 0;
     int64_t framesCompleted = 0;
     QHash<QString, editor::DecoderContext*> decoders;
+    QHash<QString, QVector<TranscriptSection>> transcriptCache;
     QString errorMessage;
 
     for (int segmentIndex = 0; segmentIndex < exportRanges.size(); ++segmentIndex) {
@@ -1327,7 +1426,7 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
                     break;
                 }
             }
-            const QImage rendered = useGpuRenderer
+            QImage rendered = useGpuRenderer
                 ? gpuRenderer.renderFrame(request, timelineFrame, decoders, orderedClips)
                 : renderTimelineFrame(request, timelineFrame, decoders, orderedClips);
             if (rendered.isNull()) {
@@ -1335,6 +1434,26 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
                     ? QStringLiteral("Failed to render GPU timeline frame %1.").arg(timelineFrame)
                     : QStringLiteral("Failed to render timeline frame %1.").arg(timelineFrame);
                 break;
+            }
+
+            renderTranscriptOverlays(&rendered, request, timelineFrame, orderedClips, transcriptCache);
+
+            if (progressCallback) {
+                RenderProgress progress;
+                progress.framesCompleted = framesCompleted;
+                progress.totalFrames = totalFramesToRender;
+                progress.segmentIndex = segmentIndex + 1;
+                progress.segmentCount = exportRanges.size();
+                progress.timelineFrame = timelineFrame;
+                progress.segmentStartFrame = exportStart;
+                progress.segmentEndFrame = exportEnd;
+                progress.usingGpu = useGpuRenderer;
+                progress.previewFrame = rendered;
+                if (!progressCallback(progress)) {
+                    result.cancelled = true;
+                    errorMessage = QStringLiteral("Render cancelled.");
+                    break;
+                }
             }
 
             if (av_frame_make_writable(sourceFrame) < 0 || av_frame_make_writable(encodedFrame) < 0) {

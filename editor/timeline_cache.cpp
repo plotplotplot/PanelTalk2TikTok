@@ -1,4 +1,5 @@
 #include "timeline_cache.h"
+#include "debug_controls.h"
 
 #include <QDebug>
 #include <QDateTime>
@@ -7,6 +8,7 @@
 #include <QHash>
 #include <QPointer>
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 namespace editor {
@@ -23,6 +25,9 @@ qint64 cacheTraceMs() {
 }
 
 void cacheTrace(const QString& stage, const QString& detail = QString()) {
+    if (!debugCacheEnabled()) {
+        return;
+    }
     static QHash<QString, qint64> lastLogByStage;
     const qint64 now = cacheTraceMs();
     if (stage.startsWith(QStringLiteral("TimelineCache::onPrefetchTimer")) ||
@@ -188,7 +193,7 @@ QList<CacheEntryInfo> ClipCache::entries() const {
 
 TimelineCache::TimelineCache(AsyncDecoder* decoder, MemoryBudget* budget, QObject* parent)
     : QObject(parent), m_decoder(decoder), m_budget(budget) {
-    m_prefetchTimer.setInterval(33);  // ~30fps
+    m_prefetchTimer.setInterval(16);  // ~60fps scheduling cadence
     connect(&m_prefetchTimer, &QTimer::timeout, this, &TimelineCache::onPrefetchTimer);
 
     if (m_budget) {
@@ -212,8 +217,8 @@ TimelineCache::~TimelineCache() {
 
 void TimelineCache::setMaxMemory(size_t bytes) {
     if (m_budget) {
-        m_budget->setMaxCpuMemory(bytes / 2);
-        m_budget->setMaxGpuMemory(bytes / 2);
+        m_budget->setMaxCpuMemory((bytes * 3) / 4);
+        m_budget->setMaxGpuMemory(bytes / 4);
     }
 }
 
@@ -329,6 +334,10 @@ void TimelineCache::requestFrame(const QString& clipId, int64_t frameNumber,
     
     // Request from decoder
     if (m_decoder) {
+        if (m_state.load() == PlaybackState::Playing && !info.isSingleFrame) {
+            m_decoder->cancelForFileBefore(info.path, canonicalFrame);
+        }
+
         int priority = calculatePriority(canonicalFrame);
         QPointer<TimelineCache> self(this);
         const std::shared_ptr<std::atomic<bool>> aliveToken = m_aliveToken;
@@ -486,7 +495,9 @@ void TimelineCache::trimCache() {
     }
 
     // Evict oldest frames globally
-    evictOldestFrames(m_budget ? m_budget->maxCpuMemory() / 2 : 256 * 1024 * 1024);
+    const size_t targetMemory = m_budget ? static_cast<size_t>(m_budget->maxCpuMemory() * 0.7)
+                                         : (192 * 1024 * 1024);
+    evictOldestFrames(targetMemory);
     m_trimInProgress.store(false);
 }
 
@@ -525,7 +536,10 @@ void TimelineCache::preloadRange(const QString& clipId, int64_t startFrame, int6
 }
 
 void TimelineCache::onPrefetchTimer() {
-    if (m_state.load() != PlaybackState::Playing) return;
+    if (m_state.load() != PlaybackState::Playing) {
+        return;
+    }
+    schedulePredictiveLoads();
 }
 
 void TimelineCache::onFrameDecoded(FrameHandle frame) {
@@ -624,8 +638,8 @@ void TimelineCache::dropStaleRequestsForPlayhead(int64_t playheadFrame) {
 }
 
 void TimelineCache::schedulePredictiveLoads() {
-    static constexpr int kMaxPrefetchQueueDepth = 8;
-    static constexpr int kMaxInflightPrefetch = 4;
+    static constexpr int kMaxPrefetchQueueDepth = 3;
+    static constexpr int kMaxInflightPrefetch = 1;
     static constexpr int kMaxPrefetchPerTick = 2;
 
     int64_t playhead = m_playhead.load();
@@ -636,14 +650,11 @@ void TimelineCache::schedulePredictiveLoads() {
         return;
     }
 
-    {
-        QMutexLocker pendingLock(&m_pendingMutex);
-        if (!m_pendingVisibleRequests.isEmpty()) {
-            cacheTrace(QStringLiteral("TimelineCache::prefetch.skip"),
-                       QStringLiteral("reason=visible-pending count=%1")
-                           .arg(m_pendingVisibleRequests.size()));
-            return;
-        }
+    const int pendingVisible = pendingVisibleRequestCount();
+    if (pendingVisible > 0) {
+        cacheTrace(QStringLiteral("TimelineCache::prefetch.skip"),
+                   QStringLiteral("reason=visible-pending count=%1").arg(pendingVisible));
+        return;
     }
 
     if (m_decoder->pendingRequestCount() >= kMaxPrefetchQueueDepth ||
@@ -655,39 +666,59 @@ void TimelineCache::schedulePredictiveLoads() {
         return;
     }
     
-    // Calculate lookahead based on speed
-    int lookahead = static_cast<int>(m_lookaheadFrames * qMax(1.0, speed));
+    // Keep predictive loads narrow and sequential so playback-visible decode
+    // remains local to the active clip instead of bouncing around the queue.
+    int lookahead = qBound(4,
+                           static_cast<int>(std::ceil(qMax(1.0, speed) * 4.0)),
+                           qMin(m_lookaheadFrames, 8));
     int scheduledThisTick = 0;
-    
+
     QMutexLocker lock(&m_clipsMutex);
-    
-    for (auto it = m_clips.begin(); it != m_clips.end(); ++it) {
-        const QString& id = it.key();
+
+    QVector<ClipInfo> activeClips;
+    activeClips.reserve(m_clips.size());
+    for (auto it = m_clips.cbegin(); it != m_clips.cend(); ++it) {
         const ClipInfo& info = it.value();
-        
-        // Check if clip is near playhead
-        if (playhead < info.startFrame - lookahead || 
-            playhead > info.startFrame + info.duration + lookahead) {
-            continue;  // Clip not visible
+        if (playhead < info.startFrame || playhead >= info.startFrame + info.duration) {
+            continue;
         }
-        
+        activeClips.push_back(info);
+    }
+
+    std::sort(activeClips.begin(), activeClips.end(),
+              [](const ClipInfo& a, const ClipInfo& b) {
+                  if (a.startFrame == b.startFrame) {
+                      return a.id < b.id;
+                  }
+                  return a.startFrame < b.startFrame;
+              });
+
+    for (const ClipInfo& info : activeClips) {
+        const QString& id = info.id;
         int64_t localFrame = normalizeFrameNumber(info, playhead - info.startFrame);
-        if (localFrame < 0 || localFrame >= info.duration) continue;
-        
-        // Schedule loads for upcoming frames
-        int step = dir == Direction::Forward ? 1 : -1;
+        if (localFrame < 0 || localFrame >= info.duration) {
+            continue;
+        }
+
+        const int step = dir == Direction::Forward ? 1 : -1;
         for (int i = 1; i <= lookahead; ++i) {
-            int64_t targetFrame = normalizeFrameNumber(info, localFrame + (i * step));
-            if (targetFrame < 0 || targetFrame >= info.duration) continue;
-            if (scheduledThisTick >= kMaxPrefetchPerTick) return;
+            const int64_t targetLocalFrame = localFrame + (i * step);
+            if (targetLocalFrame < 0 || targetLocalFrame >= info.duration) {
+                continue;
+            }
+            const int64_t targetFrame = normalizeFrameNumber(info, targetLocalFrame);
+            if (scheduledThisTick >= kMaxPrefetchPerTick) {
+                return;
+            }
             if (m_decoder->pendingRequestCount() >= kMaxPrefetchQueueDepth ||
                 m_inflightPrefetches.load() >= kMaxInflightPrefetch) {
                 return;
             }
-            
-            // Skip if already cached
+
             ClipCache* cache = m_caches.value(id);
-            if (cache && cache->contains(targetFrame)) continue;
+            if (cache && cache->contains(targetFrame)) {
+                continue;
+            }
 
             const QString key = requestKey(id, targetFrame);
             {
@@ -698,10 +729,9 @@ void TimelineCache::schedulePredictiveLoads() {
                 m_pendingPrefetchRequests.insert(key);
                 m_inflightPrefetches.fetch_add(1);
             }
-            
-            // Request with lower priority
-            int priority = 20 - i;  // Decreasing priority
-            
+
+            const int priority = qMax(8, 24 - (i * 2));
+
             lock.unlock();
             m_prefetches++;
             scheduledThisTick++;
@@ -712,7 +742,7 @@ void TimelineCache::schedulePredictiveLoads() {
                            .arg(id)
                            .arg(targetFrame)
                            .arg(priority));
-            
+
             m_decoder->requestFrame(info.path, targetFrame, priority, 5000,
                 [self, aliveToken, id, targetFrame, key](FrameHandle frame) {
                     if (!aliveToken->load() || !self) {
