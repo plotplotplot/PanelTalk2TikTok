@@ -8,6 +8,7 @@
 #include "editor_shared.h"
 #include "audio_engine.h"
 #include "timeline_widget.h"
+#include "preview.h"
 #include "render.h"
 
 #include <QApplication>
@@ -98,7 +99,8 @@
 #include <deque>
 #include <thread>
 
-extern "C" {
+extern "C"
+{
 #include <alsa/asoundlib.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -112,1737 +114,79 @@ extern "C" {
 
 using namespace editor;
 
-namespace {
-qint64 nowMs() {
-    return QDateTime::currentMSecsSinceEpoch();
-}
-
-qint64 playbackTraceMs() {
-    static QElapsedTimer timer;
-    static bool started = false;
-    if (!started) {
-        timer.start();
-        started = true;
-    }
-    return timer.elapsed();
-}
-
-bool playbackTraceEnabled() {
-    return debugPlaybackEnabled();
-}
-
-void playbackTrace(const QString& stage, const QString& detail = QString()) {
-    if (!playbackTraceEnabled()) {
-        return;
-    }
-    static QHash<QString, qint64> lastLogByStage;
-    const qint64 now = playbackTraceMs();
-    if (stage.startsWith(QStringLiteral("PreviewWindow::requestFramesForCurrentPosition")) ||
-        stage.startsWith(QStringLiteral("EditorWindow::advanceFrame")) ||
-        stage.startsWith(QStringLiteral("PreviewWindow::setCurrentFrame")) ||
-        stage.startsWith(QStringLiteral("PreviewWindow::visible-request"))) {
-        const qint64 last = lastLogByStage.value(stage, std::numeric_limits<qint64>::min());
-        if (now - last < 250) {
-            return;
-        }
-        lastLogByStage.insert(stage, now);
-    }
-    qDebug().noquote() << QStringLiteral("[PLAYBACK %1 ms] %2%3")
-                              .arg(now, 6)
-                              .arg(stage)
-                              .arg(detail.isEmpty() ? QString() : QStringLiteral(" | ") + detail);
-}
-
-}
-
-// ============================================================================
-// PreviewRenderer - GPU-accelerated preview rendering
-// ============================================================================
-class PreviewRenderer {
-public:
-    explicit PreviewRenderer() = default;
-    ~PreviewRenderer() { release(); }
-    
-    bool initialize() {
-        if (m_initialized) return true;
-        
-        QElapsedTimer initTimer;
-        initTimer.start();
-
-        if (qEnvironmentVariableIntValue("EDITOR_FORCE_NULL_RHI") == 1) {
-            qDebug() << "[STARTUP] Forcing QRhi Null backend";
-            QRhiInitParams nullParams;
-            m_rhi.reset(QRhi::create(QRhi::Null, &nullParams, QRhi::Flags()));
-            if (!m_rhi) {
-                qWarning() << "Failed to initialize forced Null QRhi backend";
-                return false;
-            }
-            m_backendName = QString::fromLatin1(m_rhi->backendName()) + QStringLiteral(" (forced)");
-
-            qDebug() << "[STARTUP] Initializing GPUCompositor...";
-            QElapsedTimer compositorTimer;
-            compositorTimer.start();
-            m_compositor = std::make_unique<GPUCompositor>(m_rhi.get());
-            if (!m_compositor->initialize()) {
-                qWarning() << "Failed to initialize GPU compositor";
-            }
-            qDebug() << "[STARTUP] GPUCompositor initialized in" << compositorTimer.elapsed() << "ms";
-
-            m_initialized = true;
-            qDebug() << "[STARTUP] PreviewRenderer::initialize() total:" << initTimer.elapsed() << "ms";
-            return true;
-        }
-        
-        // Create offscreen surface for RHI
-        m_fallbackSurface = std::make_unique<QOffscreenSurface>();
-        m_fallbackSurface->setFormat(QSurfaceFormat::defaultFormat());
-        m_fallbackSurface->create();
-        qDebug() << "[STARTUP] Offscreen surface created in" << initTimer.elapsed() << "ms";
-        
-        if (!m_fallbackSurface->isValid()) {
-            qWarning() << "Failed to create fallback surface";
-            return false;
-        }
-        
-        // Try OpenGL ES 2 backend
-        qDebug() << "[STARTUP] Creating QRhi OpenGL context...";
-        QElapsedTimer rhiTimer;
-        rhiTimer.start();
-        QRhiGles2InitParams params;
-        params.format = QSurfaceFormat::defaultFormat();
-        params.fallbackSurface = m_fallbackSurface.get();
-        
-        m_rhi.reset(QRhi::create(QRhi::OpenGLES2, &params, QRhi::Flags()));
-        qDebug() << "[STARTUP] QRhi::create(OpenGLES2) took" << rhiTimer.elapsed() << "ms";
-        
-        if (m_rhi) {
-            m_backendName = QString::fromLatin1(m_rhi->backendName());
-            qDebug() << "PreviewRenderer: Using backend:" << m_backendName;
-        } else {
-            // Fall back to Null backend
-            QRhiInitParams nullParams;
-            m_rhi.reset(QRhi::create(QRhi::Null, &nullParams, QRhi::Flags()));
-            
-            if (m_rhi) {
-                m_backendName = QString::fromLatin1(m_rhi->backendName()) + QStringLiteral(" (fallback)");
-            } else {
-                qWarning() << "Failed to initialize any RHI backend";
-                return false;
-            }
-        }
-        
-        // Create compositor
-        qDebug() << "[STARTUP] Initializing GPUCompositor...";
-        QElapsedTimer compositorTimer;
-        compositorTimer.start();
-        m_compositor = std::make_unique<GPUCompositor>(m_rhi.get());
-        if (!m_compositor->initialize()) {
-            qWarning() << "Failed to initialize GPU compositor";
-            // Continue without compositor - we'll use CPU fallback
-        }
-        qDebug() << "[STARTUP] GPUCompositor initialized in" << compositorTimer.elapsed() << "ms";
-        
-        m_initialized = true;
-        qDebug() << "[STARTUP] PreviewRenderer::initialize() total:" << initTimer.elapsed() << "ms";
-        return true;
-    }
-    
-    void release() {
-        m_compositor.reset();
-        m_rhi.reset();
-        m_fallbackSurface.reset();
-        m_initialized = false;
-    }
-    
-    QRhi* rhi() const { return m_rhi.get(); }
-    GPUCompositor* compositor() const { return m_compositor.get(); }
-    QString backendName() const { return m_backendName; }
-    bool isInitialized() const { return m_initialized; }
-    
-private:
-    std::unique_ptr<QOffscreenSurface> m_fallbackSurface;
-    std::unique_ptr<QRhi> m_rhi;
-    std::unique_ptr<GPUCompositor> m_compositor;
-    QString m_backendName = QStringLiteral("not initialized");
-    bool m_initialized = false;
-};
-
-// ============================================================================
-// PreviewWindow - Video preview widget with professional pipeline
-// ============================================================================
-class PreviewWindow final : public QOpenGLWidget, protected QOpenGLFunctions {
-    Q_OBJECT
-public:
-    PreviewWindow(QWidget* parent = nullptr)
-        : QOpenGLWidget(parent)
-        , m_quadBuffer(QOpenGLBuffer::VertexBuffer)
+namespace
+{
+    qint64 nowMs()
     {
-        setMinimumSize(640, 360);
-        setMouseTracking(true);
-        m_lastPaintMs = nowMs();
-        m_repaintTimer.setSingleShot(true);
-        m_repaintTimer.setInterval(16);
-        connect(&m_repaintTimer, &QTimer::timeout, this, [this]() {
-            update();
-        });
-    }
-    
-    ~PreviewWindow() override {
-        if (m_cache) {
-            m_cache->stopPrefetching();
-        }
-        if (context()) {
-            makeCurrent();
-            releaseGlResources();
-            doneCurrent();
-        }
-    }
-    
-    void setPlaybackState(bool playing) {
-        playbackTrace(QStringLiteral("PreviewWindow::setPlaybackState"),
-                      QStringLiteral("playing=%1 clips=%2 cache=%3")
-                          .arg(playing)
-                          .arg(m_clips.size())
-                          .arg(m_cache != nullptr));
-        m_playing = playing;
-        if (playing && !m_clips.isEmpty()) {
-            ensurePipeline();
-        }
-        if (m_cache) {
-            m_cache->setPlaybackState(playing ?
-                TimelineCache::PlaybackState::Playing :
-                TimelineCache::PlaybackState::Stopped);
-        }
-    }
-    
-    void setCurrentFrame(int64_t frame) {
-        playbackTrace(QStringLiteral("PreviewWindow::setCurrentFrame"),
-                      QStringLiteral("frame=%1 visible=%2 cache=%3")
-                          .arg(frame)
-                          .arg(isVisible())
-                          .arg(m_cache != nullptr));
-        setCurrentPlaybackSample(frameToSamples(frame));
+        return QDateTime::currentMSecsSinceEpoch();
     }
 
-    void setCurrentPlaybackSample(int64_t samplePosition) {
-        const int64_t sanitizedSample = qMax<int64_t>(0, samplePosition);
-        const qreal framePosition = samplesToFramePosition(sanitizedSample);
-        const int64_t displayFrame = qMax<int64_t>(0, static_cast<int64_t>(std::floor(framePosition)));
-        playbackTrace(QStringLiteral("PreviewWindow::setCurrentPlaybackSample"),
-                      QStringLiteral("sample=%1 frame=%2 visible=%3 cache=%4")
-                          .arg(sanitizedSample)
-                          .arg(framePosition, 0, 'f', 3)
-                          .arg(isVisible())
-                          .arg(m_cache != nullptr));
-        m_currentSample = sanitizedSample;
-        m_currentFramePosition = framePosition;
-        m_currentFrame = displayFrame;
-        if (m_cache) {
-            m_cache->setPlayheadFrame(displayFrame);
+    qint64 playbackTraceMs()
+    {
+        static QElapsedTimer timer;
+        static bool started = false;
+        if (!started)
+        {
+            timer.start();
+            started = true;
         }
-        if (isVisible()) {
-            requestFramesForCurrentPosition();
-        }
-        scheduleRepaint();
-    }
-    
-    void setClipCount(int count) {
-        m_clipCount = count;
-        scheduleRepaint();
+        return timer.elapsed();
     }
 
-    void setSelectedClipId(const QString& clipId) {
-        if (m_selectedClipId == clipId) {
+    bool playbackTraceEnabled()
+    {
+        return debugPlaybackEnabled();
+    }
+
+    void playbackTrace(const QString &stage, const QString &detail = QString())
+    {
+        if (!playbackTraceEnabled())
+        {
             return;
         }
-        m_selectedClipId = clipId;
-        scheduleRepaint();
-    }
-    
-    void setTimelineClips(const QVector<TimelineClip>& clips) {
-        playbackTrace(QStringLiteral("PreviewWindow::setTimelineClips"),
-                      QStringLiteral("clips=%1 cache=%2").arg(clips.size()).arg(m_cache != nullptr));
-        m_clips = clips;
-        m_transcriptSectionsCache.clear();
-        if (!m_cache) {
-            m_registeredClips.clear();
-            scheduleRepaint();
-            return;
-        }
-        
-        // Update cache with new clips
-        QSet<QString> registeredIds;
-        for (const auto& clip : clips) {
-            if (!clipHasVisuals(clip)) {
-                continue;
-            }
-            registeredIds.insert(clip.id);
-            if (!m_registeredClips.contains(clip.id)) {
-                m_cache->registerClip(clip.id, clip.filePath, 
-                                     clip.startFrame, clip.durationFrames);
-                m_registeredClips.insert(clip.id);
-            }
-        }
-        
-        // Unregister removed clips
-        for (const QString& id : m_registeredClips) {
-            if (!registeredIds.contains(id)) {
-                m_cache->unregisterClip(id);
-            }
-        }
-        m_registeredClips = registeredIds;
-        
-        requestFramesForCurrentPosition();
-        scheduleRepaint();
-    }
-
-    void setRenderSyncMarkers(const QVector<RenderSyncMarker>& markers) {
-        m_renderSyncMarkers = markers;
-        requestFramesForCurrentPosition();
-        scheduleRepaint();
-    }
-    
-    QString backendName() const {
-        return usingCpuFallback() ? QStringLiteral("CPU Preview Fallback")
-                                  : QStringLiteral("OpenGL Shader Preview");
-    }
-
-    void setAudioMuted(bool muted) {
-        m_audioMuted = muted;
-    }
-
-    void setAudioVolume(qreal volume) {
-        m_audioVolume = qBound<qreal>(0.0, volume, 1.0);
-    }
-
-    void setOutputSize(const QSize& size) {
-        const QSize sanitized(qMax(16, size.width()), qMax(16, size.height()));
-        if (m_outputSize == sanitized) {
-            return;
-        }
-        m_outputSize = sanitized;
-        scheduleRepaint();
-    }
-
-    void setBypassGrading(bool bypass) {
-        if (m_bypassGrading == bypass) {
-            return;
-        }
-        m_bypassGrading = bypass;
-        scheduleRepaint();
-    }
-
-    bool bypassGrading() const {
-        return m_bypassGrading;
-    }
-
-    bool audioMuted() const {
-        return m_audioMuted;
-    }
-
-    int audioVolumePercent() const {
-        return qRound(m_audioVolume * 100.0);
-    }
-
-    QString activeAudioClipLabel() const {
-        for (const TimelineClip& clip : m_clips) {
-            if (clip.hasAudio && isSampleWithinClip(clip, m_currentSample)) {
-                return clip.label;
-            }
-        }
-        return QString();
-    }
-
-    bool preparePlaybackAdvance(int64_t targetFrame) {
-        return preparePlaybackAdvanceSample(frameToSamples(targetFrame));
-    }
-
-    bool preparePlaybackAdvanceSample(int64_t targetSample) {
-        if (m_clips.isEmpty()) {
-            return true;
-        }
-
-        ensurePipeline();
-        if (!m_cache) {
-            return false;
-        }
-
-        static constexpr int kMaxVisibleBacklog = 4;
-        bool hasActiveClip = false;
-
-        for (const TimelineClip& clip : m_clips) {
-            if (!clipHasVisuals(clip)) {
-                continue;
-            }
-            if (!isSampleWithinClip(clip, targetSample)) {
-                continue;
-            }
-
-            hasActiveClip = true;
-            const int64_t localFrame = sourceFrameForSample(clip, targetSample);
-            if (m_cache->isFrameCached(clip.id, localFrame)) {
-                continue;
-            }
-
-            if (m_cache->isVisibleRequestPending(clip.id, localFrame)) {
-                continue;
-            }
-
-            m_cache->requestFrame(clip.id, localFrame,
-                [this](FrameHandle frame) {
-                    Q_UNUSED(frame)
-                    QMetaObject::invokeMethod(this, [this]() { scheduleRepaint(); }, Qt::QueuedConnection);
-                });
-        }
-
-        return true;
-    }
-
-    QJsonObject profilingSnapshot() const {
-        const qint64 now = nowMs();
-        QJsonObject snapshot{
-            {QStringLiteral("backend"), backendName()},
-            {QStringLiteral("playing"), m_playing},
-            {QStringLiteral("current_frame"), static_cast<qint64>(m_currentFrame)},
-            {QStringLiteral("clip_count"), m_clips.size()},
-            {QStringLiteral("pipeline_initialized"), m_cache != nullptr},
-            {QStringLiteral("last_frame_request_ms"), m_lastFrameRequestMs},
-            {QStringLiteral("last_frame_ready_ms"), m_lastFrameReadyMs},
-            {QStringLiteral("last_paint_ms"), m_lastPaintMs},
-            {QStringLiteral("last_repaint_schedule_ms"), m_lastRepaintScheduleMs},
-            {QStringLiteral("last_frame_request_age_ms"), m_lastFrameRequestMs > 0 ? now - m_lastFrameRequestMs : -1},
-            {QStringLiteral("last_frame_ready_age_ms"), m_lastFrameReadyMs > 0 ? now - m_lastFrameReadyMs : -1},
-            {QStringLiteral("last_paint_age_ms"), m_lastPaintMs > 0 ? now - m_lastPaintMs : -1},
-            {QStringLiteral("repaint_timer_active"), m_repaintTimer.isActive()},
-            {QStringLiteral("bypass_grading"), m_bypassGrading}
-        };
-
-        if (m_decoder) {
-            snapshot[QStringLiteral("decoder")] = QJsonObject{
-                {QStringLiteral("worker_count"), m_decoder->workerCount()},
-                {QStringLiteral("pending_requests"), m_decoder->pendingRequestCount()}
-            };
-
-            if (MemoryBudget* budget = m_decoder->memoryBudget()) {
-                snapshot[QStringLiteral("memory_budget")] = QJsonObject{
-                    {QStringLiteral("cpu_usage"), static_cast<qint64>(budget->currentCpuUsage())},
-                    {QStringLiteral("gpu_usage"), static_cast<qint64>(budget->currentGpuUsage())},
-                    {QStringLiteral("cpu_pressure"), budget->cpuPressure()},
-                    {QStringLiteral("gpu_pressure"), budget->gpuPressure()},
-                    {QStringLiteral("cpu_max"), static_cast<qint64>(budget->maxCpuMemory())},
-                    {QStringLiteral("gpu_max"), static_cast<qint64>(budget->maxGpuMemory())}
-                };
-            }
-        }
-
-        if (m_cache) {
-            snapshot[QStringLiteral("cache")] = QJsonObject{
-                {QStringLiteral("hit_rate"), m_cache->cacheHitRate()},
-                {QStringLiteral("total_memory_usage"), static_cast<qint64>(m_cache->totalMemoryUsage())},
-                {QStringLiteral("total_cached_frames"), m_cache->totalCachedFrames()},
-                {QStringLiteral("pending_visible_requests"), m_cache->pendingVisibleRequestCount()}
-            };
-        }
-
-        return snapshot;
-    }
-
-protected:
-    void paintEvent(QPaintEvent* event) override {
-        if (!usingCpuFallback()) {
-            QOpenGLWidget::paintEvent(event);
-            return;
-        }
-
-        if (!QWidget::paintEngine()) {
-            return;
-        }
-
-        Q_UNUSED(event)
-        m_lastPaintMs = nowMs();
-
-        QPainter painter(this);
-        painter.setRenderHint(QPainter::Antialiasing, true);
-        drawBackground(&painter);
-        const QList<TimelineClip> activeClips = getActiveClips();
-        const QRect safeRect = rect().adjusted(24, 24, -24, -24);
-        drawCompositedPreview(&painter, safeRect, activeClips);
-        drawPreviewChrome(&painter, safeRect, activeClips.size());
-    }
-
-    void initializeGL() override {
-        initializeOpenGLFunctions();
-        glDisable(GL_DEPTH_TEST);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-
-        static const char* kVertexShader = R"(
-            attribute vec2 a_position;
-            attribute vec2 a_texCoord;
-            uniform mat4 u_mvp;
-            varying vec2 v_texCoord;
-            void main() {
-                v_texCoord = a_texCoord;
-                gl_Position = u_mvp * vec4(a_position, 0.0, 1.0);
-            }
-        )";
-
-        static const char* kFragmentShader = R"(
-            uniform sampler2D u_texture;
-            uniform float u_brightness;
-            uniform float u_contrast;
-            uniform float u_saturation;
-            uniform float u_opacity;
-            varying vec2 v_texCoord;
-
-            void main() {
-                vec4 color = texture2D(u_texture, v_texCoord);
-                float sourceAlpha = color.a;
-                vec3 rgb = color.rgb;
-                if (sourceAlpha > 0.0001) {
-                    rgb /= sourceAlpha;
-                } else {
-                    rgb = vec3(0.0);
-                }
-                rgb = ((rgb - 0.5) * u_contrast) + 0.5 + vec3(u_brightness);
-                float luminance = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
-                rgb = mix(vec3(luminance), rgb, u_saturation);
-                rgb = clamp(rgb, 0.0, 1.0);
-                color.a = clamp(sourceAlpha * u_opacity, 0.0, 1.0);
-                color.rgb = rgb * color.a;
-                gl_FragColor = color;
-            }
-        )";
-
-        m_shaderProgram = std::make_unique<QOpenGLShaderProgram>();
-        if (!m_shaderProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, kVertexShader) ||
-            !m_shaderProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, kFragmentShader) ||
-            !m_shaderProgram->link()) {
-            qWarning() << "Failed to build preview shader program" << m_shaderProgram->log();
-            m_shaderProgram.reset();
-            return;
-        }
-
-        static const GLfloat kQuadVertices[] = {
-            -0.5f, -0.5f, 0.0f, 0.0f,
-             0.5f, -0.5f, 1.0f, 0.0f,
-            -0.5f,  0.5f, 0.0f, 1.0f,
-             0.5f,  0.5f, 1.0f, 1.0f,
-        };
-
-        m_quadBuffer.create();
-        m_quadBuffer.bind();
-        m_quadBuffer.allocate(kQuadVertices, sizeof(kQuadVertices));
-        m_quadBuffer.release();
-
-        connect(context(), &QOpenGLContext::aboutToBeDestroyed, this, [this]() {
-            makeCurrent();
-            releaseGlResources();
-            doneCurrent();
-        }, Qt::DirectConnection);
-    }
-
-    void resizeGL(int w, int h) override {
-        Q_UNUSED(w)
-        Q_UNUSED(h)
-    }
-
-    void showEvent(QShowEvent* event) override {
-        QOpenGLWidget::showEvent(event);
-        QTimer::singleShot(0, this, [this]() {
-            requestFramesForCurrentPosition();
-        });
-    }
-    
-    void paintGL() override {
-        m_lastPaintMs = nowMs();
-
-        glDisable(GL_DEPTH_TEST);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-
-        const float phase = static_cast<float>(m_currentFrame % 180) / 179.0f;
-        const float clipFactor = qBound(0.0f, static_cast<float>(m_clipCount) / 8.0f, 1.0f);
-        const float motion = m_playing ? phase : 0.25f;
-        glViewport(0, 0, width() * devicePixelRatio(), height() * devicePixelRatio());
-        glClearColor(0.08f + 0.12f * motion,
-                     0.08f + 0.10f * clipFactor,
-                     0.10f + 0.16f * (1.0f - motion),
-                     1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-
-        QList<TimelineClip> activeClips = getActiveClips();
-        const QRect safeRect = rect().adjusted(24, 24, -24, -24);
-        const QRect compositeRect = scaledCanvasRect(previewCanvasBaseRect());
-        QPainter painter(this);
-        painter.setRenderHint(QPainter::Antialiasing, true);
-        bool drewAnyFrame = false;
-        bool waitingForFrame = false;
-        renderCompositedPreviewGL(compositeRect, activeClips, drewAnyFrame, waitingForFrame);
-        drawCompositedPreviewOverlay(&painter, safeRect, compositeRect, activeClips, drewAnyFrame, waitingForFrame);
-        drawPreviewChrome(&painter, safeRect, activeClips.size());
-    }
-
-    void mousePressEvent(QMouseEvent* event) override {
-        if (event->button() != Qt::LeftButton) {
-            QWidget::mousePressEvent(event);
-            return;
-        }
-
-        const PreviewOverlayInfo selectedInfo = m_overlayInfo.value(m_selectedClipId);
-        if (!m_selectedClipId.isEmpty()) {
-            if (selectedInfo.cornerHandle.contains(event->position())) {
-                m_dragMode = PreviewDragMode::ResizeBoth;
-            } else if (selectedInfo.rightHandle.contains(event->position())) {
-                m_dragMode = PreviewDragMode::ResizeX;
-            } else if (selectedInfo.bottomHandle.contains(event->position())) {
-                m_dragMode = PreviewDragMode::ResizeY;
-            } else if (selectedInfo.bounds.contains(event->position())) {
-                m_dragMode = PreviewDragMode::Move;
-            }
-            if (m_dragMode != PreviewDragMode::None) {
-                m_dragOriginPos = event->position();
-                m_dragOriginTransform = evaluateTransformForSelectedClip();
-                m_dragOriginBounds = selectedInfo.bounds;
-                event->accept();
+        static QHash<QString, qint64> lastLogByStage;
+        const qint64 now = playbackTraceMs();
+        if (stage.startsWith(QStringLiteral("PreviewWindow::requestFramesForCurrentPosition")) ||
+            stage.startsWith(QStringLiteral("EditorWindow::advanceFrame")) ||
+            stage.startsWith(QStringLiteral("PreviewWindow::setCurrentFrame")) ||
+            stage.startsWith(QStringLiteral("PreviewWindow::visible-request")))
+        {
+            const qint64 last = lastLogByStage.value(stage, std::numeric_limits<qint64>::min());
+            if (now - last < 250)
+            {
                 return;
             }
+            lastLogByStage.insert(stage, now);
         }
-
-        const QString hitClipId = clipIdAtPosition(event->position());
-        if (!hitClipId.isEmpty()) {
-            m_selectedClipId = hitClipId;
-            if (selectionRequested) {
-                selectionRequested(hitClipId);
-            }
-            updatePreviewCursor(event->position());
-            update();
-            event->accept();
-            return;
-        }
-
-        QWidget::mousePressEvent(event);
+        qDebug().noquote() << QStringLiteral("[PLAYBACK %1 ms] %2%3")
+                                  .arg(now, 6)
+                                  .arg(stage)
+                                  .arg(detail.isEmpty() ? QString() : QStringLiteral(" | ") + detail);
     }
 
-    void mouseMoveEvent(QMouseEvent* event) override {
-        if (m_dragMode != PreviewDragMode::None && (event->buttons() & Qt::LeftButton) &&
-            !m_selectedClipId.isEmpty() && m_dragOriginBounds.width() > 1.0 && m_dragOriginBounds.height() > 1.0) {
-            const PreviewOverlayInfo selectedInfo = m_overlayInfo.value(m_selectedClipId);
-            if (m_dragMode == PreviewDragMode::Move) {
-                if (moveRequested) {
-                    const QRect compositeRect = scaledCanvasRect(previewCanvasBaseRect());
-                    const QPointF previewScale = previewCanvasScale(compositeRect);
-                    moveRequested(m_selectedClipId,
-                                  m_dragOriginTransform.translationX +
-                                      ((event->position().x() - m_dragOriginPos.x()) /
-                                       qMax<qreal>(0.0001, previewScale.x())),
-                                  m_dragOriginTransform.translationY +
-                                      ((event->position().y() - m_dragOriginPos.y()) /
-                                       qMax<qreal>(0.0001, previewScale.y())),
-                                  false);
-                }
-                event->accept();
-                return;
-            }
-            qreal scaleX = m_dragOriginTransform.scaleX;
-            qreal scaleY = m_dragOriginTransform.scaleY;
-            if (selectedInfo.kind == PreviewOverlayKind::TranscriptOverlay) {
-                const QRect compositeRect = scaledCanvasRect(previewCanvasBaseRect());
-                const QPointF previewScale = previewCanvasScale(compositeRect);
-                qreal width = transcriptOverlaySizeForSelectedClip().width();
-                qreal height = transcriptOverlaySizeForSelectedClip().height();
-                if (m_dragMode == PreviewDragMode::ResizeX || m_dragMode == PreviewDragMode::ResizeBoth) {
-                    width = qMax<qreal>(80.0, width + ((event->position().x() - m_dragOriginPos.x()) /
-                                                       qMax<qreal>(0.0001, previewScale.x())));
-                }
-                if (m_dragMode == PreviewDragMode::ResizeY || m_dragMode == PreviewDragMode::ResizeBoth) {
-                    height = qMax<qreal>(40.0, height + ((event->position().y() - m_dragOriginPos.y()) /
-                                                         qMax<qreal>(0.0001, previewScale.y())));
-                }
-                if (resizeRequested) {
-                    resizeRequested(m_selectedClipId, width, height, false);
-                }
-                event->accept();
-                return;
-            }
-            if (m_dragMode == PreviewDragMode::ResizeX || m_dragMode == PreviewDragMode::ResizeBoth) {
-                scaleX = sanitizeScaleValue(
-                    m_dragOriginTransform.scaleX *
-                    ((m_dragOriginBounds.width() + (event->position().x() - m_dragOriginPos.x())) /
-                     m_dragOriginBounds.width()));
-            }
-            if (m_dragMode == PreviewDragMode::ResizeY || m_dragMode == PreviewDragMode::ResizeBoth) {
-                scaleY = sanitizeScaleValue(
-                    m_dragOriginTransform.scaleY *
-                    ((m_dragOriginBounds.height() + (event->position().y() - m_dragOriginPos.y())) /
-                     m_dragOriginBounds.height()));
-            }
-            if (m_dragMode == PreviewDragMode::ResizeBoth) {
-                const qreal factorX =
-                    (m_dragOriginBounds.width() + (event->position().x() - m_dragOriginPos.x())) /
-                    m_dragOriginBounds.width();
-                const qreal factorY =
-                    (m_dragOriginBounds.height() + (event->position().y() - m_dragOriginPos.y())) /
-                    m_dragOriginBounds.height();
-                const qreal uniformFactor = std::abs(factorX) >= std::abs(factorY) ? factorX : factorY;
-                scaleX = sanitizeScaleValue(m_dragOriginTransform.scaleX * uniformFactor);
-                scaleY = sanitizeScaleValue(m_dragOriginTransform.scaleY * uniformFactor);
-            }
-            if (resizeRequested) {
-                resizeRequested(m_selectedClipId, scaleX, scaleY, false);
-            }
-            event->accept();
-            return;
-        }
-
-        updatePreviewCursor(event->position());
-        QWidget::mouseMoveEvent(event);
-    }
-
-    void mouseReleaseEvent(QMouseEvent* event) override {
-        if (event->button() == Qt::LeftButton && m_dragMode != PreviewDragMode::None) {
-            const PreviewOverlayInfo selectedInfo = m_overlayInfo.value(m_selectedClipId);
-            const TimelineClip::TransformKeyframe transform = evaluateTransformForSelectedClip();
-            if (m_dragMode == PreviewDragMode::Move) {
-                if (moveRequested) {
-                    if (selectedInfo.kind == PreviewOverlayKind::TranscriptOverlay) {
-                        for (const TimelineClip& clip : m_clips) {
-                            if (clip.id == m_selectedClipId) {
-                                moveRequested(m_selectedClipId,
-                                              clip.transcriptOverlay.translationX,
-                                              clip.transcriptOverlay.translationY,
-                                              true);
-                                break;
-                            }
-                        }
-                    } else {
-                        moveRequested(m_selectedClipId, transform.translationX, transform.translationY, true);
-                    }
-                }
-            } else if (resizeRequested) {
-                if (selectedInfo.kind == PreviewOverlayKind::TranscriptOverlay) {
-                    const QSizeF size = transcriptOverlaySizeForSelectedClip();
-                    resizeRequested(m_selectedClipId, size.width(), size.height(), true);
-                } else {
-                    resizeRequested(m_selectedClipId, transform.scaleX, transform.scaleY, true);
-                }
-            }
-            m_dragMode = PreviewDragMode::None;
-            m_dragOriginBounds = QRectF();
-            updatePreviewCursor(event->position());
-            event->accept();
-            return;
-        }
-        QWidget::mouseReleaseEvent(event);
-    }
-
-    void wheelEvent(QWheelEvent* event) override {
-        if (event->angleDelta().y() == 0) {
-            QWidget::wheelEvent(event);
-            return;
-        }
-        const QRect baseRect = previewCanvasBaseRect();
-        const QRect oldRect = scaledCanvasRect(baseRect);
-        const qreal factor = event->angleDelta().y() > 0 ? 1.1 : (1.0 / 1.1);
-        const qreal nextZoom = qBound<qreal>(0.25, m_previewZoom * factor, 4.0);
-        const QPointF anchor =
-            QPointF((event->position().x() - oldRect.left()) / qMax(1.0, static_cast<qreal>(oldRect.width())),
-                    (event->position().y() - oldRect.top()) / qMax(1.0, static_cast<qreal>(oldRect.height())));
-        m_previewZoom = nextZoom;
-        const QSizeF newSize(baseRect.width() * m_previewZoom, baseRect.height() * m_previewZoom);
-        const QPointF centeredTopLeft(baseRect.center().x() - (newSize.width() / 2.0),
-                                      baseRect.center().y() - (newSize.height() / 2.0));
-        const QPointF anchoredTopLeft(event->position().x() - (anchor.x() * newSize.width()),
-                                      event->position().y() - (anchor.y() * newSize.height()));
-        m_previewPanOffset = anchoredTopLeft - centeredTopLeft;
-        scheduleRepaint();
-        event->accept();
-    }
-
-private:
-    enum class PreviewOverlayKind {
-        VisualClip,
-        TranscriptOverlay,
-    };
-
-    struct PreviewOverlayInfo {
-        PreviewOverlayKind kind = PreviewOverlayKind::VisualClip;
-        QRectF bounds;
-        QRectF rightHandle;
-        QRectF bottomHandle;
-        QRectF cornerHandle;
-    };
-
-    struct TextureCacheEntry {
-        QOpenGLTexture* texture = nullptr;
-        qint64 decodeTimestamp = 0;
-        qint64 lastUsedMs = 0;
-        QSize size;
-    };
-
-    enum class PreviewDragMode {
-        None,
-        Move,
-        ResizeX,
-        ResizeY,
-        ResizeBoth,
-    };
-
-    QRect previewCanvasBaseRect() const {
-        const QRect available = rect().adjusted(36, 36, -36, -36);
-        if (!available.isValid()) {
-            return available;
-        }
-        QSize fitted = (m_outputSize.isValid() ? m_outputSize : QSize(1080, 1920));
-        fitted.scale(available.size(), Qt::KeepAspectRatio);
-        const QPoint topLeft(available.center().x() - fitted.width() / 2,
-                             available.center().y() - fitted.height() / 2);
-        return QRect(topLeft, fitted);
-    }
-
-    QRect scaledCanvasRect(const QRect& baseRect) const {
-        const QSize scaledSize(qMax(1, qRound(baseRect.width() * m_previewZoom)),
-                               qMax(1, qRound(baseRect.height() * m_previewZoom)));
-        const QPoint center = baseRect.center();
-        return QRect(qRound(center.x() - scaledSize.width() / 2.0 + m_previewPanOffset.x()),
-                     qRound(center.y() - scaledSize.height() / 2.0 + m_previewPanOffset.y()),
-                     scaledSize.width(),
-                     scaledSize.height());
-    }
-
-    QPointF previewCanvasScale(const QRect& targetRect) const {
-        const QSize output = m_outputSize.isValid() ? m_outputSize : QSize(1080, 1920);
-        return QPointF(targetRect.width() / qMax<qreal>(1.0, output.width()),
-                       targetRect.height() / qMax<qreal>(1.0, output.height()));
-    }
-
-    bool clipShowsTranscriptOverlay(const TimelineClip& clip) const {
-        return clip.mediaType == ClipMediaType::Audio && clip.transcriptOverlay.enabled;
-    }
-
-    const QVector<TranscriptSection>& transcriptSectionsForClip(const TimelineClip& clip) const {
-        const QString key = clip.filePath;
-        auto it = m_transcriptSectionsCache.find(key);
-        if (it == m_transcriptSectionsCache.end()) {
-            it = m_transcriptSectionsCache.insert(key, loadTranscriptSections(transcriptPathForClipFile(clip.filePath)));
-        }
-        return it.value();
-    }
-
-    TranscriptOverlayLayout transcriptOverlayLayoutForClip(const TimelineClip& clip) const {
-        if (!clipShowsTranscriptOverlay(clip)) {
-            return {};
-        }
-        const QVector<TranscriptSection>& sections = transcriptSectionsForClip(clip);
-        if (sections.isEmpty()) {
-            return {};
-        }
-        const int64_t sourceFrame = sourceFrameForSample(clip, m_currentSample);
-        for (const TranscriptSection& section : sections) {
-            if (sourceFrame < section.startFrame) {
-                return {};
-            }
-            if (sourceFrame <= section.endFrame) {
-                return layoutTranscriptSection(section,
-                                               sourceFrame,
-                                               clip.transcriptOverlay.maxCharsPerLine,
-                                               clip.transcriptOverlay.maxLines,
-                                               clip.transcriptOverlay.autoScroll);
-            }
-        }
-        return {};
-    }
-
-    QRectF transcriptOverlayRectForTarget(const TimelineClip& clip, const QRect& targetRect) const {
-        const QPointF previewScale = previewCanvasScale(targetRect);
-        const QSizeF size(qMax<qreal>(40.0, clip.transcriptOverlay.boxWidth * previewScale.x()),
-                          qMax<qreal>(20.0, clip.transcriptOverlay.boxHeight * previewScale.y()));
-        const QPointF center(targetRect.center().x() + (clip.transcriptOverlay.translationX * previewScale.x()),
-                             targetRect.center().y() + (clip.transcriptOverlay.translationY * previewScale.y()));
-        return QRectF(center.x() - (size.width() / 2.0),
-                      center.y() - (size.height() / 2.0),
-                      size.width(),
-                      size.height());
-    }
-
-    QSizeF transcriptOverlaySizeForSelectedClip() const {
-        const PreviewOverlayInfo info = m_overlayInfo.value(m_selectedClipId);
-        const QRect compositeRect = scaledCanvasRect(previewCanvasBaseRect());
-        const QPointF previewScale = previewCanvasScale(compositeRect);
-        return QSizeF(info.bounds.width() / qMax<qreal>(0.0001, previewScale.x()),
-                      info.bounds.height() / qMax<qreal>(0.0001, previewScale.y()));
-    }
-
-    void drawTranscriptOverlay(QPainter* painter, const TimelineClip& clip, const QRect& targetRect) {
-        const TranscriptOverlayLayout overlayLayout = transcriptOverlayLayoutForClip(clip);
-        if (overlayLayout.lines.isEmpty()) {
-            return;
-        }
-        const QRectF bounds = transcriptOverlayRectForTarget(clip, targetRect);
-        const QRectF textBounds = bounds.adjusted(18.0, 14.0, -18.0, -14.0);
-        const QColor highlightFillColor(QStringLiteral("#fff2a8"));
-        const QColor highlightTextColor(QStringLiteral("#181818"));
-        const QString shadowHtml = transcriptOverlayHtml(overlayLayout,
-                                                         QColor(0, 0, 0, 200),
-                                                         QColor(0, 0, 0, 200),
-                                                         QColor(0, 0, 0, 0));
-        const QString textHtml = transcriptOverlayHtml(overlayLayout,
-                                                       clip.transcriptOverlay.textColor,
-                                                       highlightTextColor,
-                                                       highlightFillColor);
-        if (textHtml.isEmpty()) {
-            return;
-        }
-        painter->save();
-        painter->setPen(Qt::NoPen);
-        painter->setBrush(QColor(0, 0, 0, 120));
-        painter->drawRoundedRect(bounds, 14.0, 14.0);
-        QFont font(clip.transcriptOverlay.fontFamily);
-        font.setPixelSize(qMax(8, qRound(clip.transcriptOverlay.fontPointSize * previewCanvasScale(targetRect).y())));
-        font.setBold(clip.transcriptOverlay.bold);
-        font.setItalic(clip.transcriptOverlay.italic);
-        QTextDocument shadowDoc;
-        shadowDoc.setDefaultFont(font);
-        shadowDoc.setDocumentMargin(0.0);
-        shadowDoc.setTextWidth(textBounds.width());
-        shadowDoc.setHtml(shadowHtml);
-        QTextDocument textDoc;
-        textDoc.setDefaultFont(font);
-        textDoc.setDocumentMargin(0.0);
-        textDoc.setTextWidth(textBounds.width());
-        textDoc.setHtml(textHtml);
-        const qreal textY = textBounds.top() + qMax<qreal>(0.0, (textBounds.height() - textDoc.size().height()) / 2.0);
-        painter->translate(textBounds.left() + 3.0, textY + 3.0);
-        shadowDoc.drawContents(painter);
-        painter->translate(-3.0, -3.0);
-        textDoc.drawContents(painter);
-        painter->restore();
-
-        PreviewOverlayInfo info;
-        info.kind = PreviewOverlayKind::TranscriptOverlay;
-        info.bounds = bounds;
-        constexpr qreal kHandleSize = 12.0;
-        info.rightHandle = QRectF(bounds.right() - kHandleSize,
-                                  bounds.center().y() - kHandleSize,
-                                  kHandleSize,
-                                  kHandleSize * 2.0);
-        info.bottomHandle = QRectF(bounds.center().x() - kHandleSize,
-                                   bounds.bottom() - kHandleSize,
-                                   kHandleSize * 2.0,
-                                   kHandleSize);
-        info.cornerHandle = QRectF(bounds.right() - kHandleSize * 1.5,
-                                   bounds.bottom() - kHandleSize * 1.5,
-                                   kHandleSize * 1.5,
-                                   kHandleSize * 1.5);
-        m_overlayInfo.insert(clip.id, info);
-        m_paintOrder.push_back(clip.id);
-    }
-
-    bool usingCpuFallback() const {
-        return !context() || !isValid() || !m_shaderProgram;
-    }
-
-    void ensurePipeline() {
-        if (m_cache) {
-            return;
-        }
-
-        playbackTrace(QStringLiteral("PreviewWindow::ensurePipeline.begin"),
-                      QStringLiteral("clips=%1 frame=%2").arg(m_clips.size()).arg(m_currentFramePosition, 0, 'f', 3));
-
-        m_decoder = std::make_unique<AsyncDecoder>(this);
-        m_decoder->initialize();
-
-        m_cache = std::make_unique<TimelineCache>(m_decoder.get(),
-                                                  m_decoder->memoryBudget(),
-                                                  this);
-        m_cache->setMaxMemory(256 * 1024 * 1024);
-        m_cache->setLookaheadFrames(18);
-        m_cache->setPlaybackSpeed(1.0);
-        m_cache->setPlaybackState(m_playing ?
-            TimelineCache::PlaybackState::Playing :
-            TimelineCache::PlaybackState::Stopped);
-        m_cache->setPlayheadFrame(m_currentFrame);
-        m_registeredClips.clear();
-        for (const TimelineClip& clip : m_clips) {
-            if (!clipHasVisuals(clip)) {
-                continue;
-            }
-                m_cache->registerClip(clip.id, clip.filePath, clip.startFrame, clip.durationFrames);
-            m_registeredClips.insert(clip.id);
-        }
-        m_cache->startPrefetching();
-        playbackTrace(QStringLiteral("PreviewWindow::ensurePipeline.end"),
-                      QStringLiteral("workers=%1").arg(m_decoder ? m_decoder->workerCount() : 0));
-    }
-
-    void releaseGlResources() {
-        for (auto it = m_textureCache.begin(); it != m_textureCache.end(); ++it) {
-            delete it.value().texture;
-            it.value().texture = nullptr;
-        }
-        m_textureCache.clear();
-        if (m_quadBuffer.isCreated()) {
-            m_quadBuffer.destroy();
-        }
-        m_shaderProgram.reset();
-    }
-
-    QString textureCacheKey(const FrameHandle& frame) const {
-        return QStringLiteral("%1|%2").arg(frame.sourcePath()).arg(frame.frameNumber());
-    }
-
-    QOpenGLTexture* textureForFrame(const FrameHandle& frame) {
-        if (frame.isNull() || !frame.hasCpuImage()) {
-            return nullptr;
-        }
-
-        const QString key = textureCacheKey(frame);
-        const qint64 decodeTimestamp = frame.data() ? frame.data()->decodeTimestamp : 0;
-        TextureCacheEntry entry = m_textureCache.value(key);
-        if (entry.texture && entry.decodeTimestamp == decodeTimestamp) {
-            entry.lastUsedMs = nowMs();
-            m_textureCache.insert(key, entry);
-            return entry.texture;
-        }
-
-        if (entry.texture) {
-            delete entry.texture;
-            entry.texture = nullptr;
-        }
-
-        QImage uploadImage = frame.cpuImage();
-        if (uploadImage.format() != QImage::Format_ARGB32_Premultiplied) {
-            uploadImage = uploadImage.convertToFormat(QImage::Format_ARGB32_Premultiplied);
-        }
-
-        auto* texture = new QOpenGLTexture(QOpenGLTexture::Target2D);
-        texture->setFormat(QOpenGLTexture::RGBA8_UNorm);
-        texture->setSize(uploadImage.width(), uploadImage.height());
-        texture->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt8);
-        QOpenGLPixelTransferOptions uploadOptions;
-        uploadOptions.setAlignment(4);
-        texture->setData(QOpenGLTexture::BGRA,
-                         QOpenGLTexture::UInt8,
-                         uploadImage.constBits(),
-                         &uploadOptions);
-        if (!texture->isCreated()) {
-            delete texture;
-            return nullptr;
-        }
-        texture->setMinMagFilters(QOpenGLTexture::Linear, QOpenGLTexture::Linear);
-        texture->setWrapMode(QOpenGLTexture::ClampToEdge);
-
-        entry.texture = texture;
-        entry.decodeTimestamp = decodeTimestamp;
-        entry.lastUsedMs = nowMs();
-        entry.size = uploadImage.size();
-        m_textureCache.insert(key, entry);
-        trimTextureCache();
-        return texture;
-    }
-
-    void trimTextureCache() {
-        static constexpr int kMaxTextureCacheEntries = 180;
-        if (m_textureCache.size() <= kMaxTextureCacheEntries) {
-            return;
-        }
-
-        QVector<QString> keys = m_textureCache.keys().toVector();
-        std::sort(keys.begin(), keys.end(), [this](const QString& a, const QString& b) {
-            return m_textureCache.value(a).lastUsedMs < m_textureCache.value(b).lastUsedMs;
-        });
-
-        const int removeCount = m_textureCache.size() - kMaxTextureCacheEntries;
-        for (int i = 0; i < removeCount; ++i) {
-            TextureCacheEntry entry = m_textureCache.take(keys[i]);
-            delete entry.texture;
-        }
-    }
-
-    bool isSampleWithinClip(const TimelineClip& clip, int64_t samplePosition) const {
-        const int64_t clipStartSample = clipTimelineStartSamples(clip);
-        const int64_t clipEndSample = clipStartSample + frameToSamples(clip.durationFrames);
-        return samplePosition >= clipStartSample && samplePosition < clipEndSample;
-    }
-
-    int64_t sourceSampleForPlaybackSample(const TimelineClip& clip, int64_t samplePosition) const {
-        return qMax<int64_t>(0, clipSourceInSamples(clip) + (samplePosition - clipTimelineStartSamples(clip)));
-    }
-
-    int64_t sourceFrameForSample(const TimelineClip& clip, int64_t samplePosition) const {
-        return sourceFrameForClipAtTimelinePosition(
-            clip,
-            samplesToFramePosition(samplePosition),
-            m_renderSyncMarkers);
-    }
-
-    QRectF renderFrameLayerGL(const QRect& targetRect, const TimelineClip& clip, const FrameHandle& frame) {
-        if (!m_shaderProgram) {
-            return QRectF();
-        }
-
-        QOpenGLTexture* texture = textureForFrame(frame);
-        if (!texture) {
-            return QRectF();
-        }
-
-        const QRect fitted = fitRect(frame.size(), targetRect);
-        const TimelineClip::TransformKeyframe transform = evaluateClipTransformAtPosition(clip, m_currentFramePosition);
-        const QPointF previewScale = previewCanvasScale(targetRect);
-        const QPointF center(fitted.center().x() + (transform.translationX * previewScale.x()),
-                             fitted.center().y() + (transform.translationY * previewScale.y()));
-
-        QMatrix4x4 projection;
-        projection.ortho(0.0f, static_cast<float>(width()),
-                         static_cast<float>(height()), 0.0f,
-                         -1.0f, 1.0f);
-
-        QMatrix4x4 model;
-        model.translate(center.x(), center.y());
-        model.rotate(transform.rotation, 0.0f, 0.0f, 1.0f);
-        model.scale(fitted.width() * transform.scaleX, fitted.height() * transform.scaleY, 1.0f);
-
-        const qreal brightness = m_bypassGrading ? 0.0 : clip.brightness;
-        const qreal contrast = m_bypassGrading ? 1.0 : clip.contrast;
-        const qreal saturation = m_bypassGrading ? 1.0 : clip.saturation;
-        const qreal opacity = m_bypassGrading ? 1.0 : clip.opacity;
-
-        m_shaderProgram->bind();
-        m_shaderProgram->setUniformValue("u_mvp", projection * model);
-        m_shaderProgram->setUniformValue("u_brightness", GLfloat(brightness));
-        m_shaderProgram->setUniformValue("u_contrast", GLfloat(contrast));
-        m_shaderProgram->setUniformValue("u_saturation", GLfloat(saturation));
-        m_shaderProgram->setUniformValue("u_opacity", GLfloat(opacity));
-        m_shaderProgram->setUniformValue("u_texture", 0);
-
-        glActiveTexture(GL_TEXTURE0);
-        texture->bind();
-        m_quadBuffer.bind();
-        const int positionLoc = m_shaderProgram->attributeLocation("a_position");
-        const int texCoordLoc = m_shaderProgram->attributeLocation("a_texCoord");
-        m_shaderProgram->enableAttributeArray(positionLoc);
-        m_shaderProgram->enableAttributeArray(texCoordLoc);
-        m_shaderProgram->setAttributeBuffer(positionLoc, GL_FLOAT, 0, 2, 4 * sizeof(GLfloat));
-        m_shaderProgram->setAttributeBuffer(texCoordLoc, GL_FLOAT, 2 * sizeof(GLfloat), 2, 4 * sizeof(GLfloat));
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        m_shaderProgram->disableAttributeArray(positionLoc);
-        m_shaderProgram->disableAttributeArray(texCoordLoc);
-        m_quadBuffer.release();
-        texture->release();
-        m_shaderProgram->release();
-
-        QTransform overlayTransform;
-        overlayTransform.translate(center.x(), center.y());
-        overlayTransform.rotate(transform.rotation);
-        overlayTransform.scale(transform.scaleX, transform.scaleY);
-        return overlayTransform.mapRect(QRectF(-fitted.width() / 2.0,
-                                               -fitted.height() / 2.0,
-                                               fitted.width(),
-                                               fitted.height()));
-    }
-
-    void renderCompositedPreviewGL(const QRect& compositeRect,
-                                   const QList<TimelineClip>& activeClips,
-                                   bool& drewAnyFrame,
-                                   bool& waitingForFrame) {
-        m_overlayInfo.clear();
-        m_paintOrder.clear();
-        for (const TimelineClip& clip : activeClips) {
-            if (!clipHasVisuals(clip)) {
-                continue;
-            }
-            const int64_t localFrame = sourceFrameForSample(clip, m_currentSample);
-            const FrameHandle frame = m_cache ? m_cache->getBestCachedFrame(clip.id, localFrame) : FrameHandle();
-            if (frame.isNull()) {
-                waitingForFrame = true;
-                continue;
-            }
-
-            const QRectF bounds = renderFrameLayerGL(compositeRect, clip, frame);
-            if (!bounds.isEmpty()) {
-                PreviewOverlayInfo info;
-                info.kind = PreviewOverlayKind::VisualClip;
-                info.bounds = bounds;
-                constexpr qreal kHandleSize = 12.0;
-                info.rightHandle = QRectF(bounds.right() - kHandleSize,
-                                          bounds.center().y() - kHandleSize,
-                                          kHandleSize,
-                                          kHandleSize * 2.0);
-                info.bottomHandle = QRectF(bounds.center().x() - kHandleSize,
-                                           bounds.bottom() - kHandleSize,
-                                           kHandleSize * 2.0,
-                                           kHandleSize);
-                info.cornerHandle = QRectF(bounds.right() - kHandleSize * 1.5,
-                                           bounds.bottom() - kHandleSize * 1.5,
-                                           kHandleSize * 1.5,
-                                           kHandleSize * 1.5);
-                m_overlayInfo.insert(clip.id, info);
-                m_paintOrder.push_back(clip.id);
-            }
-            drewAnyFrame = true;
-        }
-    }
-
-    void drawCompositedPreviewOverlay(QPainter* painter,
-                                      const QRect& safeRect,
-                                      const QRect& compositeRect,
-                                      const QList<TimelineClip>& activeClips,
-                                      bool drewAnyFrame,
-                                      bool waitingForFrame) {
-        painter->save();
-        painter->setPen(QPen(QColor(255, 255, 255, 40), 1.5));
-        painter->setBrush(QColor(255, 255, 255, 18));
-        painter->drawRoundedRect(safeRect, 18, 18);
-
-        if (activeClips.isEmpty()) {
-            QList<TimelineClip> activeAudioClips;
-            for (const TimelineClip& clip : m_clips) {
-                if (clipIsAudioOnly(clip) && isSampleWithinClip(clip, m_currentSample)) {
-                    activeAudioClips.push_back(clip);
-                }
-            }
-            if (!activeAudioClips.isEmpty()) {
-                drawAudioPlaceholder(painter, safeRect, activeAudioClips);
-            } else {
-                drawEmptyState(painter, safeRect);
-            }
-            painter->restore();
-            return;
-        }
-
-        painter->setPen(QPen(QColor(255, 255, 255, 36), 1.0));
-        painter->setBrush(Qt::NoBrush);
-        painter->drawRoundedRect(compositeRect.adjusted(0, 0, -1, -1), 12, 12);
-
-        if (!drewAnyFrame) {
-            const TimelineClip& primaryClip = activeClips.constFirst();
-            drawFramePlaceholder(painter, compositeRect, primaryClip,
-                                 waitingForFrame
-                                     ? QStringLiteral("Frame loading...")
-                                     : QStringLiteral("No composited frame available"));
-        } else if (waitingForFrame) {
-            painter->save();
-            painter->setPen(Qt::NoPen);
-            painter->setBrush(QColor(9, 12, 16, 170));
-            const QRect badgeRect(compositeRect.left() + 16, compositeRect.top() + 16, 150, 28);
-            painter->drawRoundedRect(badgeRect, 10, 10);
-            painter->setPen(QColor(QStringLiteral("#edf3f8")));
-            painter->drawText(badgeRect.adjusted(12, 0, -12, 0),
-                              Qt::AlignLeft | Qt::AlignVCenter,
-                              QStringLiteral("Overlay loading..."));
-            painter->restore();
-        }
-
-        for (const TimelineClip& clip : activeClips) {
-            if (clipShowsTranscriptOverlay(clip)) {
-                drawTranscriptOverlay(painter, clip, compositeRect);
-            }
-        }
-
-        for (const TimelineClip& clip : activeClips) {
-            const PreviewOverlayInfo info = m_overlayInfo.value(clip.id);
-            if (clip.id == m_selectedClipId && info.bounds.isValid()) {
-                painter->setPen(QPen(QColor(QStringLiteral("#fff4c2")), 2.0));
-                painter->setBrush(Qt::NoBrush);
-                painter->drawRect(info.bounds);
-                painter->setBrush(QColor(QStringLiteral("#fff4c2")));
-                painter->drawRect(info.rightHandle);
-                painter->drawRect(info.bottomHandle);
-                painter->drawRect(info.cornerHandle);
-            }
-        }
-
-        QList<TimelineClip> activeAudioClips;
-        for (const TimelineClip& clip : m_clips) {
-            if (clipIsAudioOnly(clip) && isSampleWithinClip(clip, m_currentSample)) {
-                activeAudioClips.push_back(clip);
-            }
-        }
-        if (!activeAudioClips.isEmpty()) {
-            drawAudioBadge(painter, compositeRect, activeAudioClips);
-        }
-        painter->restore();
-    }
-
-    void drawBackground(QPainter* painter) {
-        const float phase = std::fmod(static_cast<float>(m_currentFramePosition), 180.0f) / 179.0f;
-        const float clipFactor = qBound(0.0f, static_cast<float>(m_clipCount) / 8.0f, 1.0f);
-        const float motion = m_playing ? phase : 0.25f;
-        
-        QLinearGradient gradient(rect().topLeft(), rect().bottomRight());
-        gradient.setColorAt(0.0, QColor::fromRgbF(0.08f + 0.22f * motion,
-                                                  0.10f + 0.18f * clipFactor,
-                                                  0.13f + 0.35f * (1.0f - motion),
-                                                  1.0f));
-        gradient.setColorAt(1.0, QColor::fromRgbF(0.14f + 0.10f * clipFactor,
-                                                  0.07f + 0.08f * motion,
-                                                  0.09f + 0.25f * clipFactor,
-                                                  1.0f));
-        painter->fillRect(rect(), gradient);
-    }
-    
-    QList<TimelineClip> getActiveClips() const {
-        QList<TimelineClip> active;
-        for (const TimelineClip& clip : m_clips) {
-            if (isSampleWithinClip(clip, m_currentSample)) {
-                active.push_back(clip);
-            }
-        }
-        std::sort(active.begin(), active.end(), 
-            [](const TimelineClip& a, const TimelineClip& b) {
-                if (a.trackIndex == b.trackIndex) {
-                    return a.startFrame < b.startFrame;
-                }
-                return a.trackIndex < b.trackIndex;
-            });
-        return active;
-    }
-
-    void requestFramesForCurrentPosition() {
-        static constexpr int kMaxVisibleBacklog = 4;
-        QVector<const TimelineClip*> activeClips;
-        activeClips.reserve(m_clips.size());
-        for (const TimelineClip& clip : m_clips) {
-            if (!clipHasVisuals(clip)) {
-                continue;
-            }
-            if (isSampleWithinClip(clip, m_currentSample)) {
-                activeClips.push_back(&clip);
-            }
-        }
-
-        if (activeClips.isEmpty()) {
-            playbackTrace(QStringLiteral("PreviewWindow::requestFramesForCurrentPosition"),
-                          QStringLiteral("no-active-clips frame=%1").arg(m_currentFramePosition, 0, 'f', 3));
-            return;
-        }
-
-        ensurePipeline();
-        if (!m_cache) {
-            playbackTrace(QStringLiteral("PreviewWindow::requestFramesForCurrentPosition"),
-                          QStringLiteral("cache-unavailable frame=%1").arg(m_currentFramePosition, 0, 'f', 3));
-            return;
-        }
-
-        playbackTrace(QStringLiteral("PreviewWindow::requestFramesForCurrentPosition"),
-                      QStringLiteral("active=%1 frame=%2 pending=%3")
-                          .arg(activeClips.size())
-                          .arg(m_currentFramePosition, 0, 'f', 3)
-                          .arg(m_decoder ? m_decoder->pendingRequestCount() : 0));
-
-        if (m_cache->pendingVisibleRequestCount() >= kMaxVisibleBacklog) {
-            playbackTrace(QStringLiteral("PreviewWindow::requestFramesForCurrentPosition.skip"),
-                          QStringLiteral("reason=visible-backlog count=%1")
-                              .arg(m_cache->pendingVisibleRequestCount()));
-            return;
-        }
-
-        for (const TimelineClip* clip : activeClips) {
-            const int64_t localFrame = sourceFrameForSample(*clip, m_currentSample);
-            const bool cached = m_cache->isFrameCached(clip->id, localFrame);
-            playbackTrace(QStringLiteral("PreviewWindow::visible-request"),
-                          QStringLiteral("clip=%1 localFrame=%2 cached=%3")
-                              .arg(clip->id)
-                              .arg(localFrame)
-                              .arg(cached));
-
-            // Request if not cached
-            if (!cached && !m_cache->isVisibleRequestPending(clip->id, localFrame)) {
-                m_lastFrameRequestMs = nowMs();
-                const qint64 requestedAt = playbackTraceMs();
-                m_cache->requestFrame(clip->id, localFrame,
-                    [this, clipId = clip->id, localFrame, requestedAt](FrameHandle frame) {
-                        if (!frame.isNull()) {
-                            m_lastFrameReadyMs = nowMs();
-                        }
-                        playbackTrace(QStringLiteral("PreviewWindow::visible-request.callback"),
-                                      QStringLiteral("clip=%1 localFrame=%2 null=%3 waitMs=%4")
-                                          .arg(clipId)
-                                          .arg(localFrame)
-                                          .arg(frame.isNull())
-                                          .arg(playbackTraceMs() - requestedAt));
-                        // Frame loaded - trigger repaint
-                        QMetaObject::invokeMethod(this, [this]() {
-                            scheduleRepaint();
-                        }, Qt::QueuedConnection);
-                    });
-            }
-        }
-    }
-
-    void scheduleRepaint() {
-        m_lastRepaintScheduleMs = nowMs();
-        if (!m_repaintTimer.isActive()) {
-            m_repaintTimer.start();
-        }
-    }
-    
-    void drawCompositedPreview(QPainter* painter, const QRect& safeRect, 
-                               const QList<TimelineClip>& activeClips) {
-        painter->save();
-        m_overlayInfo.clear();
-        m_paintOrder.clear();
-        
-        // Draw background panel
-        painter->setPen(QPen(QColor(255, 255, 255, 40), 1.5));
-        painter->setBrush(QColor(255, 255, 255, 18));
-        painter->drawRoundedRect(safeRect, 18, 18);
-        
-        if (activeClips.isEmpty()) {
-            QList<TimelineClip> activeAudioClips;
-            for (const TimelineClip& clip : m_clips) {
-                if (clipIsAudioOnly(clip) && isSampleWithinClip(clip, m_currentSample)) {
-                    activeAudioClips.push_back(clip);
-                }
-            }
-            if (!activeAudioClips.isEmpty()) {
-                drawAudioPlaceholder(painter, safeRect, activeAudioClips);
-            } else {
-                drawEmptyState(painter, safeRect);
-            }
-            painter->restore();
-            return;
-        }
-
-        const QRect compositeRect = scaledCanvasRect(previewCanvasBaseRect());
-        painter->fillRect(compositeRect, Qt::black);
-        bool drewAnyFrame = false;
-        bool waitingForFrame = false;
-
-        for (const TimelineClip& clip : activeClips) {
-            const int64_t localFrame = sourceFrameForSample(clip, m_currentSample);
-            const FrameHandle frame = m_cache ? m_cache->getBestCachedFrame(clip.id, localFrame) : FrameHandle();
-            if (frame.isNull()) {
-                waitingForFrame = true;
-                continue;
-            }
-            drawFrameLayer(painter, compositeRect, clip, frame);
-            drewAnyFrame = true;
-        }
-
-        if (!drewAnyFrame) {
-            const TimelineClip& primaryClip = activeClips.constFirst();
-            drawFramePlaceholder(painter, compositeRect, primaryClip,
-                                 waitingForFrame
-                                     ? QStringLiteral("Frame loading...")
-                                     : QStringLiteral("No composited frame available"));
-        } else if (waitingForFrame) {
-            painter->save();
-            painter->setPen(Qt::NoPen);
-            painter->setBrush(QColor(9, 12, 16, 170));
-            const QRect badgeRect(compositeRect.left() + 16, compositeRect.top() + 16, 150, 28);
-            painter->drawRoundedRect(badgeRect, 10, 10);
-            painter->setPen(QColor(QStringLiteral("#edf3f8")));
-            painter->drawText(badgeRect.adjusted(12, 0, -12, 0),
-                              Qt::AlignLeft | Qt::AlignVCenter,
-                              QStringLiteral("Overlay loading..."));
-            painter->restore();
-        }
-
-        QList<TimelineClip> activeAudioClips;
-        for (const TimelineClip& clip : m_clips) {
-            if (clipIsAudioOnly(clip) && isSampleWithinClip(clip, m_currentSample)) {
-                activeAudioClips.push_back(clip);
-            }
-        }
-        if (!activeAudioClips.isEmpty()) {
-            drawAudioBadge(painter, compositeRect, activeAudioClips);
-        }
-        for (const TimelineClip& clip : activeClips) {
-            if (clipShowsTranscriptOverlay(clip)) {
-                drawTranscriptOverlay(painter, clip, compositeRect);
-            }
-        }
-        
-        painter->restore();
-    }
-    
-    void drawEmptyState(QPainter* painter, const QRect& safeRect) {
-        painter->setPen(QColor(QStringLiteral("#f5f8fb")));
-        QFont titleFont = painter->font();
-        titleFont.setPointSize(titleFont.pointSize() + 4);
-        titleFont.setBold(true);
-        painter->setFont(titleFont);
-        painter->drawText(safeRect.adjusted(20, 18, -20, -20),
-                          Qt::AlignTop | Qt::AlignLeft,
-                          QStringLiteral("Preview"));
-        
-        QFont bodyFont = painter->font();
-        bodyFont.setBold(false);
-        bodyFont.setPointSize(qMax(10, bodyFont.pointSize() - 2));
-        painter->setFont(bodyFont);
-        painter->setPen(QColor(QStringLiteral("#d2dbe4")));
-        painter->drawText(safeRect.adjusted(20, 58, -20, -20),
-                          Qt::AlignTop | Qt::AlignLeft,
-                          QStringLiteral("No active clips at this frame.\nFrame %1\nQRhi backend: %2\nGrading: %3")
-                              .arg(m_currentFramePosition, 0, 'f', 3)
-                              .arg(backendName())
-                              .arg(m_bypassGrading ? QStringLiteral("bypassed") : QStringLiteral("on")));
-    }
-    
-    void drawFrameLayer(QPainter* painter, const QRect& targetRect,
-                        const TimelineClip& clip, const FrameHandle& frame) {
-        painter->save();
-        painter->setClipRect(targetRect);
-
-        if (!frame.isNull() && frame.hasCpuImage()) {
-            const QImage img = m_bypassGrading ? frame.cpuImage() : applyClipGrade(frame.cpuImage(), clip);
-            const QRect fitted = fitRect(img.size(), targetRect);
-            const TimelineClip::TransformKeyframe transform =
-                evaluateClipTransformAtPosition(clip, m_currentFramePosition);
-            const QPointF previewScale = previewCanvasScale(targetRect);
-            painter->translate(fitted.center().x() + (transform.translationX * previewScale.x()),
-                               fitted.center().y() + (transform.translationY * previewScale.y()));
-            painter->rotate(transform.rotation);
-            painter->scale(transform.scaleX, transform.scaleY);
-            const QRectF drawRect(-fitted.width() / 2.0,
-                                  -fitted.height() / 2.0,
-                                  fitted.width(),
-                                  fitted.height());
-            painter->drawImage(drawRect, img);
-
-            QTransform overlayTransform;
-            overlayTransform.translate(fitted.center().x() + (transform.translationX * previewScale.x()),
-                                       fitted.center().y() + (transform.translationY * previewScale.y()));
-            overlayTransform.rotate(transform.rotation);
-            overlayTransform.scale(transform.scaleX, transform.scaleY);
-            const QRectF bounds = overlayTransform.mapRect(drawRect);
-            PreviewOverlayInfo info;
-            info.kind = PreviewOverlayKind::VisualClip;
-            info.bounds = bounds;
-            constexpr qreal kHandleSize = 12.0;
-            info.rightHandle = QRectF(bounds.right() - kHandleSize,
-                                      bounds.center().y() - kHandleSize,
-                                      kHandleSize,
-                                      kHandleSize * 2.0);
-            info.bottomHandle = QRectF(bounds.center().x() - kHandleSize,
-                                       bounds.bottom() - kHandleSize,
-                                       kHandleSize * 2.0,
-                                       kHandleSize);
-            info.cornerHandle = QRectF(bounds.right() - kHandleSize * 1.5,
-                                       bounds.bottom() - kHandleSize * 1.5,
-                                       kHandleSize * 1.5,
-                                       kHandleSize * 1.5);
-            m_overlayInfo.insert(clip.id, info);
-            m_paintOrder.push_back(clip.id);
-
-            painter->resetTransform();
-            painter->setClipping(false);
-            if (clip.id == m_selectedClipId) {
-                painter->setPen(QPen(QColor(QStringLiteral("#fff4c2")), 2.0));
-                painter->setBrush(Qt::NoBrush);
-                painter->drawRect(bounds);
-                painter->setBrush(QColor(QStringLiteral("#fff4c2")));
-                painter->drawRect(info.rightHandle);
-                painter->drawRect(info.bottomHandle);
-                painter->drawRect(info.cornerHandle);
-            }
-        }
-
-        painter->setPen(QPen(QColor(255, 255, 255, 36), 1.0));
-        painter->setBrush(Qt::NoBrush);
-        painter->drawRoundedRect(targetRect.adjusted(0, 0, -1, -1), 12, 12);
-
-        painter->restore();
-    }
-
-    void drawFramePlaceholder(QPainter* painter, const QRect& targetRect,
-                              const TimelineClip& clip, const QString& message) {
-        painter->save();
-        painter->fillRect(targetRect, clip.color.darker(160));
-        painter->setPen(QColor(255, 255, 255, 48));
-        painter->drawRect(targetRect.adjusted(0, 0, -1, -1));
-        painter->setPen(QColor(QStringLiteral("#f2f6fa")));
-        painter->drawText(targetRect.adjusted(16, 16, -16, -16),
-                          Qt::AlignCenter | Qt::TextWordWrap,
-                          QStringLiteral("Track %1\n%2\n%3")
-                              .arg(clip.trackIndex + 1)
-                              .arg(clip.label)
-                              .arg(message));
-        painter->restore();
-    }
-
-    void drawAudioPlaceholder(QPainter* painter, const QRect& safeRect,
-                              const QList<TimelineClip>& activeAudioClips) {
-        painter->save();
-        painter->setPen(QPen(QColor(255, 255, 255, 40), 1.5));
-        painter->setBrush(QColor(255, 255, 255, 18));
-        painter->drawRoundedRect(safeRect, 18, 18);
-
-        const QRect panel = safeRect.adjusted(12, 12, -12, -12);
-        QLinearGradient gradient(panel.topLeft(), panel.bottomRight());
-        gradient.setColorAt(0.0, QColor(QStringLiteral("#13222d")));
-        gradient.setColorAt(1.0, QColor(QStringLiteral("#0a1218")));
-        painter->fillRect(panel, gradient);
-
-        QFont titleFont = painter->font();
-        titleFont.setBold(true);
-        titleFont.setPointSize(titleFont.pointSize() + 5);
-        painter->setFont(titleFont);
-        painter->setPen(QColor(QStringLiteral("#eef5fb")));
-        painter->drawText(panel.adjusted(20, 22, -20, -20),
-                          Qt::AlignTop | Qt::AlignLeft,
-                          QStringLiteral("Audio Monitor"));
-
-        QFont bodyFont = painter->font();
-        bodyFont.setBold(false);
-        bodyFont.setPointSize(qMax(10, bodyFont.pointSize() - 2));
-        painter->setFont(bodyFont);
-        painter->setPen(QColor(QStringLiteral("#c8d5e0")));
-        painter->drawText(panel.adjusted(20, 60, -20, -20),
-                          Qt::AlignTop | Qt::AlignLeft,
-                          QStringLiteral("Active audio clip: %1\nTransport audio: %2")
-                              .arg(activeAudioClips.constFirst().label)
-                              .arg(m_playing ? QStringLiteral("live") : QStringLiteral("paused")));
-
-        const QRect waveRect = panel.adjusted(24, 120, -24, -36);
-        painter->setPen(Qt::NoPen);
-        for (int x = waveRect.left(); x < waveRect.right(); x += 10) {
-            const int idx = (x - waveRect.left()) / 10;
-            const qreal phase = std::fmod(static_cast<qreal>(idx * 13) + m_currentFramePosition, 100.0) / 99.0;
-            const int barHeight = qMax(12, qRound((0.2 + std::sin(phase * 6.28318) * 0.4 + 0.4) * waveRect.height()));
-            const QRect barRect(x, waveRect.center().y() - barHeight / 2, 6, barHeight);
-            painter->setBrush(QColor(QStringLiteral("#58c4dd")));
-            painter->drawRoundedRect(barRect, 3, 3);
-        }
-        painter->restore();
-    }
-
-    void drawAudioBadge(QPainter* painter, const QRect& targetRect,
-                        const QList<TimelineClip>& activeAudioClips) {
-        painter->save();
-        const QRect badgeRect(targetRect.left() + 16, targetRect.bottom() - 46, 240, 30);
-        painter->setPen(Qt::NoPen);
-        painter->setBrush(QColor(7, 11, 17, 176));
-        painter->drawRoundedRect(badgeRect, 10, 10);
-        painter->setPen(QColor(QStringLiteral("#dff8ff")));
-        painter->drawText(badgeRect.adjusted(12, 0, -12, 0),
-                          Qt::AlignLeft | Qt::AlignVCenter,
-                          QStringLiteral("Audio  %1").arg(activeAudioClips.constFirst().label));
-        painter->restore();
-    }
-    
-    QRect fitRect(const QSize& source, const QRect& bounds) const {
-        if (source.isEmpty() || bounds.isEmpty()) {
-            return bounds;
-        }
-        
-        QSize scaled = source;
-        scaled.scale(bounds.size(), Qt::KeepAspectRatio);
-        const QPoint topLeft(bounds.center().x() - scaled.width() / 2,
-                             bounds.center().y() - scaled.height() / 2);
-        return QRect(topLeft, scaled);
-    }
-    
-    void drawPreviewChrome(QPainter* painter, const QRect& safeRect, int activeClipCount) const {
-        Q_UNUSED(painter)
-        Q_UNUSED(safeRect)
-        Q_UNUSED(activeClipCount)
-    }
-
-    QString clipIdAtPosition(const QPointF& position) const {
-        for (int i = m_paintOrder.size() - 1; i >= 0; --i) {
-            const QString& clipId = m_paintOrder[i];
-            if (m_overlayInfo.value(clipId).bounds.contains(position)) {
-                return clipId;
-            }
-        }
-        return QString();
-    }
-
-    TimelineClip::TransformKeyframe evaluateTransformForSelectedClip() const {
-        for (const TimelineClip& clip : m_clips) {
-            if (clip.id == m_selectedClipId) {
-                return evaluateClipTransformAtPosition(clip, m_currentFramePosition);
-            }
-        }
-        return TimelineClip::TransformKeyframe();
-    }
-
-    void updatePreviewCursor(const QPointF& position) {
-        const PreviewOverlayInfo info = m_overlayInfo.value(m_selectedClipId);
-        if (!m_selectedClipId.isEmpty()) {
-            if (info.cornerHandle.contains(position)) {
-                setCursor(Qt::SizeFDiagCursor);
-                return;
-            }
-            if (info.rightHandle.contains(position)) {
-                setCursor(Qt::SizeHorCursor);
-                return;
-            }
-            if (info.bottomHandle.contains(position)) {
-                setCursor(Qt::SizeVerCursor);
-                return;
-            }
-            if (info.bounds.contains(position)) {
-                setCursor(m_dragMode == PreviewDragMode::Move ? Qt::ClosedHandCursor : Qt::OpenHandCursor);
-                return;
-            }
-        }
-        unsetCursor();
-    }
-
-    std::unique_ptr<AsyncDecoder> m_decoder;
-    std::unique_ptr<TimelineCache> m_cache;
-    std::unique_ptr<QOpenGLShaderProgram> m_shaderProgram;
-    QOpenGLBuffer m_quadBuffer;
-    
-    bool m_playing = false;
-    bool m_audioMuted = false;
-    qreal m_audioVolume = 0.8;
-    bool m_bypassGrading = false;
-    int64_t m_currentFrame = 0;
-    int64_t m_currentSample = 0;
-    qreal m_currentFramePosition = 0.0;
-    int m_clipCount = 0;
-    QVector<TimelineClip> m_clips;
-    QVector<RenderSyncMarker> m_renderSyncMarkers;
-    QSet<QString> m_registeredClips;
-    QTimer m_repaintTimer;
-    qint64 m_lastFrameRequestMs = 0;
-    qint64 m_lastFrameReadyMs = 0;
-    qint64 m_lastPaintMs = 0;
-    qint64 m_lastRepaintScheduleMs = 0;
-    QString m_selectedClipId;
-    QSize m_outputSize = QSize(1080, 1920);
-    qreal m_previewZoom = 1.0;
-    QPointF m_previewPanOffset;
-    QHash<QString, PreviewOverlayInfo> m_overlayInfo;
-    mutable QHash<QString, QVector<TranscriptSection>> m_transcriptSectionsCache;
-    QHash<QString, TextureCacheEntry> m_textureCache;
-    QVector<QString> m_paintOrder;
-    PreviewDragMode m_dragMode = PreviewDragMode::None;
-    QPointF m_dragOriginPos;
-    QRectF m_dragOriginBounds;
-    TimelineClip::TransformKeyframe m_dragOriginTransform;
-
-public:
-    std::function<void(const QString&)> selectionRequested;
-    std::function<void(const QString&, qreal, qreal, bool)> resizeRequested;
-    std::function<void(const QString&, qreal, qreal, bool)> moveRequested;
-};
-
+}
 
 // ============================================================================
 // EditorWindow - Main application window
 // ============================================================================
-class EditorWindow final : public QMainWindow {
+class EditorWindow final : public QMainWindow
+{
     Q_OBJECT
 public:
-    explicit EditorWindow(quint16 controlPort) {
+    explicit EditorWindow(quint16 controlPort)
+    {
         QElapsedTimer ctorTimer;
         ctorTimer.start();
-        
+
         setWindowTitle(QStringLiteral("QRhi Editor - Professional"));
         resize(1500, 900);
 
-        auto* central = new QWidget(this);
-        auto* rootLayout = new QHBoxLayout(central);
+        auto *central = new QWidget(this);
+        auto *rootLayout = new QHBoxLayout(central);
         rootLayout->setContentsMargins(0, 0, 0, 0);
         rootLayout->setSpacing(0);
 
-        auto* splitter = new QSplitter(Qt::Horizontal, central);
+        auto *splitter = new QSplitter(Qt::Horizontal, central);
         splitter->setObjectName(QStringLiteral("layout.main_splitter"));
         splitter->setChildrenCollapsible(false);
         rootLayout->addWidget(splitter);
@@ -1850,14 +194,14 @@ public:
         qDebug() << "[STARTUP] Building explorer pane...";
         splitter->addWidget(buildExplorerPane());
         qDebug() << "[STARTUP] Explorer pane built in" << ctorTimer.elapsed() << "ms";
-        
+
         qDebug() << "[STARTUP] Building editor pane...";
         QElapsedTimer editorPaneTimer;
         editorPaneTimer.start();
         splitter->addWidget(buildEditorPane());
         qDebug() << "[STARTUP] Editor pane built in" << editorPaneTimer.elapsed() << "ms";
         splitter->addWidget(buildInspectorPane());
-        
+
         splitter->setStretchFactor(0, 0);
         splitter->setStretchFactor(1, 1);
         splitter->setStretchFactor(2, 0);
@@ -1868,62 +212,62 @@ public:
         connect(&m_playbackTimer, &QTimer::timeout, this, &EditorWindow::advanceFrame);
         m_playbackTimer.setTimerType(Qt::PreciseTimer);
         m_playbackTimer.setInterval(16);
-        auto* undoShortcut = new QShortcut(QKeySequence::Undo, this);
-        connect(undoShortcut, &QShortcut::activated, this, [this]() { undoHistory(); });
-        auto* splitShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+B")), this);
-        connect(splitShortcut, &QShortcut::activated, this, [this]() {
+        auto *undoShortcut = new QShortcut(QKeySequence::Undo, this);
+        connect(undoShortcut, &QShortcut::activated, this, [this]()
+                { undoHistory(); });
+        auto *splitShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+B")), this);
+        connect(splitShortcut, &QShortcut::activated, this, [this]()
+                {
             if (!m_timeline) {
                 return;
             }
             if (m_timeline->splitSelectedClipAtFrame(m_timeline->currentFrame())) {
                 refreshInspector();
-            }
-        });
-        auto* deleteShortcut = new QShortcut(QKeySequence::Delete, this);
-        connect(deleteShortcut, &QShortcut::activated, this, [this]() {
+            } });
+        auto *deleteShortcut = new QShortcut(QKeySequence::Delete, this);
+        connect(deleteShortcut, &QShortcut::activated, this, [this]()
+                {
             if (!m_timeline) {
                 return;
             }
             if (m_timeline->deleteSelectedClip()) {
                 refreshInspector();
-            }
-        });
-        auto* nudgeLeftShortcut = new QShortcut(QKeySequence(QStringLiteral("Alt+Left")), this);
-        connect(nudgeLeftShortcut, &QShortcut::activated, this, [this]() {
+            } });
+        auto *nudgeLeftShortcut = new QShortcut(QKeySequence(QStringLiteral("Alt+Left")), this);
+        connect(nudgeLeftShortcut, &QShortcut::activated, this, [this]()
+                {
             if (m_timeline) {
                 m_timeline->nudgeSelectedClip(-1);
-            }
-        });
-        auto* nudgeRightShortcut = new QShortcut(QKeySequence(QStringLiteral("Alt+Right")), this);
-        connect(nudgeRightShortcut, &QShortcut::activated, this, [this]() {
+            } });
+        auto *nudgeRightShortcut = new QShortcut(QKeySequence(QStringLiteral("Alt+Right")), this);
+        connect(nudgeRightShortcut, &QShortcut::activated, this, [this]()
+                {
             if (m_timeline) {
                 m_timeline->nudgeSelectedClip(1);
-            }
-        });
-        auto* playbackShortcut = new QShortcut(QKeySequence(Qt::Key_Space), this);
-        connect(playbackShortcut, &QShortcut::activated, this, [this]() {
+            } });
+        auto *playbackShortcut = new QShortcut(QKeySequence(Qt::Key_Space), this);
+        connect(playbackShortcut, &QShortcut::activated, this, [this]()
+                {
             if (m_timeline) {
                 togglePlayback();
-            }
-        });
+            } });
         m_mainThreadHeartbeatTimer.setInterval(100);
-        connect(&m_mainThreadHeartbeatTimer, &QTimer::timeout, this, [this]() {
-            m_lastMainThreadHeartbeatMs.store(nowMs());
-        });
+        connect(&m_mainThreadHeartbeatTimer, &QTimer::timeout, this, [this]()
+                { m_lastMainThreadHeartbeatMs.store(nowMs()); });
         m_lastMainThreadHeartbeatMs.store(nowMs());
         m_mainThreadHeartbeatTimer.start();
         m_stateSaveTimer.setSingleShot(true);
         m_stateSaveTimer.setInterval(250);
-        connect(&m_stateSaveTimer, &QTimer::timeout, this, [this]() {
-            saveStateNow();
-        });
+        connect(&m_stateSaveTimer, &QTimer::timeout, this, [this]()
+                { saveStateNow(); });
 
         m_fastCurrentFrame.store(0);
         m_fastPlaybackActive.store(false);
 
         m_controlServer = std::make_unique<ControlServer>(
             this,
-            [this]() {
+            [this]()
+            {
                 const qint64 now = nowMs();
                 const qint64 heartbeatMs = m_lastMainThreadHeartbeatMs.load();
                 const qint64 playheadMs = m_lastPlayheadAdvanceMs.load();
@@ -1935,10 +279,10 @@ public:
                     {QStringLiteral("main_thread_heartbeat_ms"), heartbeatMs},
                     {QStringLiteral("main_thread_heartbeat_age_ms"), heartbeatMs > 0 ? now - heartbeatMs : -1},
                     {QStringLiteral("last_playhead_advance_ms"), playheadMs},
-                    {QStringLiteral("last_playhead_advance_age_ms"), playheadMs > 0 ? now - playheadMs : -1}
-                };
+                    {QStringLiteral("last_playhead_advance_age_ms"), playheadMs > 0 ? now - playheadMs : -1}};
             },
-            [this]() {
+            [this]()
+            {
                 return this->profilingSnapshot();
             },
             this);
@@ -1946,99 +290,112 @@ public:
         qDebug() << "[STARTUP] ControlServer started in" << ctorTimer.elapsed() << "ms";
         m_audioEngine = std::make_unique<AudioEngine>();
 
-        auto connectGradeLive = [this](QDoubleSpinBox* spin) {
-            connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double) {
-                applySelectedClipGradeFromInspector(false);
-            });
-            connect(spin, &QDoubleSpinBox::editingFinished, this, [this]() {
-                applySelectedClipGradeFromInspector(true);
-            });
+        auto connectGradeLive = [this](QDoubleSpinBox *spin)
+        {
+            connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double)
+                    { applySelectedClipGradeFromInspector(false); });
+            connect(spin, &QDoubleSpinBox::editingFinished, this, [this]()
+                    { applySelectedClipGradeFromInspector(true); });
         };
         connectGradeLive(m_brightnessSpin);
         connectGradeLive(m_contrastSpin);
         connectGradeLive(m_saturationSpin);
         connectGradeLive(m_opacitySpin);
 
-        auto connectVideoKeyframeLive = [this](QDoubleSpinBox* spin) {
-            connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double) {
-                applySelectedVideoKeyframeFromInspector(false);
-            });
-            connect(spin, &QDoubleSpinBox::editingFinished, this, [this]() {
-                applySelectedVideoKeyframeFromInspector(true);
-            });
+        auto connectVideoKeyframeLive = [this](QDoubleSpinBox *spin)
+        {
+            connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double)
+                    { applySelectedVideoKeyframeFromInspector(false); });
+            connect(spin, &QDoubleSpinBox::editingFinished, this, [this]()
+                    { applySelectedVideoKeyframeFromInspector(true); });
         };
         connectVideoKeyframeLive(m_videoTranslationXSpin);
         connectVideoKeyframeLive(m_videoTranslationYSpin);
         connectVideoKeyframeLive(m_videoRotationSpin);
-        connect(m_videoScaleXSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double) {
+        connect(m_videoScaleXSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double)
+                {
             syncScaleSpinPair(m_videoScaleXSpin, m_videoScaleYSpin);
-            applySelectedVideoKeyframeFromInspector(false);
-        });
-        connect(m_videoScaleXSpin, &QDoubleSpinBox::editingFinished, this, [this]() {
-            applySelectedVideoKeyframeFromInspector(true);
-        });
-        connect(m_videoScaleYSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double) {
+            applySelectedVideoKeyframeFromInspector(false); });
+        connect(m_videoScaleXSpin, &QDoubleSpinBox::editingFinished, this, [this]()
+                { applySelectedVideoKeyframeFromInspector(true); });
+        connect(m_videoScaleYSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double)
+                {
             syncScaleSpinPair(m_videoScaleYSpin, m_videoScaleXSpin);
-            applySelectedVideoKeyframeFromInspector(false);
-        });
-        connect(m_videoScaleYSpin, &QDoubleSpinBox::editingFinished, this, [this]() {
-            applySelectedVideoKeyframeFromInspector(true);
-        });
-        connect(m_videoInterpolationCombo, &QComboBox::currentIndexChanged, this, [this](int) {
-            applySelectedVideoKeyframeFromInspector(true);
-        });
-        connect(m_mirrorHorizontalCheckBox, &QCheckBox::toggled, this, [this](bool) {
-            applySelectedVideoKeyframeFromInspector(true);
-        });
-        connect(m_mirrorVerticalCheckBox, &QCheckBox::toggled, this, [this](bool) {
-            applySelectedVideoKeyframeFromInspector(true);
-        });
+            applySelectedVideoKeyframeFromInspector(false); });
+        connect(m_videoScaleYSpin, &QDoubleSpinBox::editingFinished, this, [this]()
+                { applySelectedVideoKeyframeFromInspector(true); });
+        connect(m_videoInterpolationCombo, &QComboBox::currentIndexChanged, this, [this](int)
+                { applySelectedVideoKeyframeFromInspector(true); });
+        connect(m_mirrorHorizontalCheckBox, &QCheckBox::toggled, this, [this](bool)
+                { applySelectedVideoKeyframeFromInspector(true); });
+        connect(m_mirrorVerticalCheckBox, &QCheckBox::toggled, this, [this](bool)
+                { applySelectedVideoKeyframeFromInspector(true); });
 
-        QTimer::singleShot(0, this, [this]() {
+        QTimer::singleShot(0, this, [this]()
+                           {
             loadProjectsFromFolders();
             refreshProjectsList();
             loadState();
-            refreshInspector();
-        });
+            refreshInspector(); });
     }
-    
-    ~EditorWindow() override {
+
+    ~EditorWindow() override
+    {
         saveStateNow();
     }
 
 protected:
-    void closeEvent(QCloseEvent* event) override {
+    void closeEvent(QCloseEvent *event) override
+    {
         saveStateNow();
         QMainWindow::closeEvent(event);
     }
 
-    bool eventFilter(QObject* watched, QEvent* event) override {
-        if (watched == (m_tree ? m_tree->viewport() : nullptr)) {
-            if (event->type() == QEvent::Leave) {
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (watched == (m_tree ? m_tree->viewport() : nullptr))
+        {
+            if (event->type() == QEvent::Leave)
+            {
                 hideExplorerHoverPreview();
-            } else if (event->type() == QEvent::MouseMove && m_tree && m_fsModel) {
-                const auto* mouseEvent = static_cast<QMouseEvent*>(event);
+            }
+            else if (event->type() == QEvent::MouseMove && m_tree && m_fsModel)
+            {
+                const auto *mouseEvent = static_cast<QMouseEvent *>(event);
                 const QModelIndex index = m_tree->indexAt(mouseEvent->pos());
-                if (!index.isValid()) {
+                if (!index.isValid())
+                {
                     hideExplorerHoverPreview();
-                } else {
+                }
+                else
+                {
                     const QFileInfo info = m_fsModel->fileInfo(index);
-                    if (!info.exists() || !info.isFile()) {
+                    if (!info.exists() || !info.isFile())
+                    {
                         hideExplorerHoverPreview();
                     }
                 }
             }
-        } else if (watched == (m_galleryList ? m_galleryList->viewport() : nullptr)) {
-            if (event->type() == QEvent::Leave) {
+        }
+        else if (watched == (m_galleryList ? m_galleryList->viewport() : nullptr))
+        {
+            if (event->type() == QEvent::Leave)
+            {
                 hideExplorerHoverPreview();
-            } else if (event->type() == QEvent::MouseMove && m_galleryList) {
-                const auto* mouseEvent = static_cast<QMouseEvent*>(event);
-                QListWidgetItem* item = m_galleryList->itemAt(mouseEvent->pos());
-                if (!item) {
+            }
+            else if (event->type() == QEvent::MouseMove && m_galleryList)
+            {
+                const auto *mouseEvent = static_cast<QMouseEvent *>(event);
+                QListWidgetItem *item = m_galleryList->itemAt(mouseEvent->pos());
+                if (!item)
+                {
                     hideExplorerHoverPreview();
-                } else {
+                }
+                else
+                {
                     const QFileInfo info(item->data(Qt::UserRole).toString());
-                    if (!info.exists() || !info.isFile()) {
+                    if (!info.exists() || !info.isFile())
+                    {
                         hideExplorerHoverPreview();
                     }
                 }
@@ -2048,36 +405,44 @@ protected:
     }
 
 private slots:
-    void advanceFrame() {
+    void advanceFrame()
+    {
         // Audio is always the master clock when available
-        if (m_audioEngine && m_audioEngine->hasPlayableAudio()) {
+        if (m_audioEngine && m_audioEngine->hasPlayableAudio())
+        {
             int64_t audioSample = qMax<int64_t>(0, m_audioEngine->currentSample());
             qreal audioFramePosition = samplesToFramePosition(audioSample);
             int64_t audioFrame = qBound<int64_t>(0,
-                                                static_cast<int64_t>(std::floor(audioFramePosition)),
-                                                m_timeline->totalFrames());
+                                                 static_cast<int64_t>(std::floor(audioFramePosition)),
+                                                 m_timeline->totalFrames());
 
             // When speech filter is active, check if audio is in a gap and seek it forward
-            if (speechFilterPlaybackEnabled()) {
+            if (speechFilterPlaybackEnabled())
+            {
                 const QVector<ExportRangeSegment> ranges = effectivePlaybackRanges();
-                if (!ranges.isEmpty()) {
+                if (!ranges.isEmpty())
+                {
                     // Check if current audio position is in a gap (between word ranges)
                     bool inGap = true;
                     int64_t nextWordStart = -1;
-                    for (const auto& range : ranges) {
-                        if (audioFrame >= range.startFrame && audioFrame <= range.endFrame) {
+                    for (const auto &range : ranges)
+                    {
+                        if (audioFrame >= range.startFrame && audioFrame <= range.endFrame)
+                        {
                             // Audio is inside a word range - normal playback
                             inGap = false;
                             break;
                         }
-                        if (audioFrame < range.startFrame) {
+                        if (audioFrame < range.startFrame)
+                        {
                             // Audio is before this range - we're in a gap
                             nextWordStart = range.startFrame;
                             break;
                         }
                     }
 
-                    if (inGap && nextWordStart >= 0) {
+                    if (inGap && nextWordStart >= 0)
+                    {
                         // Audio is in a gap - seek it to the next word
                         playbackTrace(QStringLiteral("EditorWindow::advanceFrame.speechFilterSkip"),
                                       QStringLiteral("from=%1 to=%2").arg(audioFrame).arg(nextWordStart));
@@ -2085,29 +450,35 @@ private slots:
                         audioSample = m_audioEngine->currentSample();
                         audioFramePosition = samplesToFramePosition(audioSample);
                         audioFrame = qBound<int64_t>(0,
-                                                    static_cast<int64_t>(std::floor(audioFramePosition)),
-                                                    m_timeline->totalFrames());
-                    } else if (inGap) {
+                                                     static_cast<int64_t>(std::floor(audioFramePosition)),
+                                                     m_timeline->totalFrames());
+                    }
+                    else if (inGap)
+                    {
                         // Past all words - loop back to start
                         m_audioEngine->seek(ranges.constFirst().startFrame);
                         audioSample = m_audioEngine->currentSample();
                         audioFramePosition = samplesToFramePosition(audioSample);
                         audioFrame = qBound<int64_t>(0,
-                                                    static_cast<int64_t>(std::floor(audioFramePosition)),
-                                                    m_timeline->totalFrames());
+                                                     static_cast<int64_t>(std::floor(audioFramePosition)),
+                                                     m_timeline->totalFrames());
                     }
                 }
             }
 
-            if (audioFrame == m_timeline->currentFrame()) {
-                if (m_preview) {
+            if (audioFrame == m_timeline->currentFrame())
+            {
+                if (m_preview)
+                {
                     m_preview->setCurrentPlaybackSample(audioSample);
                 }
                 return;
             }
-            if (m_preview) {
+            if (m_preview)
+            {
                 const bool ready = m_preview->preparePlaybackAdvanceSample(audioSample);
-                if (!ready) {
+                if (!ready)
+                {
                     playbackTrace(QStringLiteral("EditorWindow::advanceFrame.catchup"),
                                   QStringLiteral("audioSample=%1 audioFrame=%2")
                                       .arg(audioSample)
@@ -2123,9 +494,11 @@ private slots:
 
         // No audio engine - video is master (fallback)
         const int64_t nextFrame = nextPlaybackFrame(m_timeline->currentFrame());
-        if (m_preview) {
+        if (m_preview)
+        {
             const bool ready = m_preview->preparePlaybackAdvance(nextFrame);
-            if (!ready) {
+            if (!ready)
+            {
                 playbackTrace(QStringLiteral("EditorWindow::advanceFrame.catchup"),
                               QStringLiteral("next=%1").arg(nextFrame));
             }
@@ -2136,38 +509,48 @@ private slots:
     }
 
 private:
-    bool speechFilterPlaybackEnabled() const {
+    bool speechFilterPlaybackEnabled() const
+    {
         return m_exportOnlyTranscriptWordsCheckBox && m_exportOnlyTranscriptWordsCheckBox->isChecked();
     }
 
-    QVector<ExportRangeSegment> effectivePlaybackRanges() const {
-        if (!m_timeline) {
+    QVector<ExportRangeSegment> effectivePlaybackRanges() const
+    {
+        if (!m_timeline)
+        {
             return {};
         }
         QVector<ExportRangeSegment> ranges = m_timeline->exportRanges();
-        if (!speechFilterPlaybackEnabled()) {
+        if (!speechFilterPlaybackEnabled())
+        {
             return ranges;
         }
         return transcriptWordExportRanges(ranges, m_timeline->clips(), m_timeline->renderSyncMarkers());
     }
 
-    int64_t nextPlaybackFrame(int64_t currentFrame) const {
-        if (!m_timeline) {
+    int64_t nextPlaybackFrame(int64_t currentFrame) const
+    {
+        if (!m_timeline)
+        {
             return 0;
         }
 
         const QVector<ExportRangeSegment> ranges = effectivePlaybackRanges();
-        if (ranges.isEmpty()) {
+        if (ranges.isEmpty())
+        {
             const int64_t nextFrame = currentFrame + 1;
             return nextFrame > m_timeline->totalFrames() ? 0 : nextFrame;
         }
 
-        for (const ExportRangeSegment& range : ranges) {
-            if (currentFrame < range.startFrame) {
+        for (const ExportRangeSegment &range : ranges)
+        {
+            if (currentFrame < range.startFrame)
+            {
                 // Jump to the start of the next word range
                 return range.startFrame;
             }
-            if (currentFrame >= range.startFrame && currentFrame < range.endFrame) {
+            if (currentFrame >= range.startFrame && currentFrame < range.endFrame)
+            {
                 // Inside a word range - advance normally
                 return currentFrame + 1;
             }
@@ -2177,150 +560,186 @@ private:
         return ranges.constFirst().startFrame;
     }
 
-    QString projectsDirPath() const {
+    QString projectsDirPath() const
+    {
         return QDir(QDir::currentPath()).filePath(QStringLiteral("projects"));
     }
 
-    QString currentProjectMarkerPath() const {
+    QString currentProjectMarkerPath() const
+    {
         return QDir(projectsDirPath()).filePath(QStringLiteral(".current_project"));
     }
 
-    QString currentProjectIdOrDefault() const {
+    QString currentProjectIdOrDefault() const
+    {
         return m_currentProjectId.isEmpty() ? QStringLiteral("default") : m_currentProjectId;
     }
 
-    QString projectPath(const QString& projectId) const {
+    QString projectPath(const QString &projectId) const
+    {
         return QDir(projectsDirPath()).filePath(projectId.isEmpty() ? QStringLiteral("default") : projectId);
     }
 
-    QString stateFilePathForProject(const QString& projectId) const {
+    QString stateFilePathForProject(const QString &projectId) const
+    {
         return QDir(projectPath(projectId)).filePath(QStringLiteral("state.json"));
     }
 
-    QString historyFilePathForProject(const QString& projectId) const {
+    QString historyFilePathForProject(const QString &projectId) const
+    {
         return QDir(projectPath(projectId)).filePath(QStringLiteral("history.json"));
     }
 
-    QString stateFilePath() const {
+    QString stateFilePath() const
+    {
         return stateFilePathForProject(currentProjectIdOrDefault());
     }
 
-    QString historyFilePath() const {
+    QString historyFilePath() const
+    {
         return historyFilePathForProject(currentProjectIdOrDefault());
     }
 
-    QString sanitizedProjectId(const QString& name) const {
+    QString sanitizedProjectId(const QString &name) const
+    {
         QString id = name.trimmed().toLower();
-        for (QChar& ch : id) {
-            if (!(ch.isLetterOrNumber() || ch == QLatin1Char('_') || ch == QLatin1Char('-'))) {
+        for (QChar &ch : id)
+        {
+            if (!(ch.isLetterOrNumber() || ch == QLatin1Char('_') || ch == QLatin1Char('-')))
+            {
                 ch = QLatin1Char('-');
             }
         }
-        while (id.contains(QStringLiteral("--"))) {
+        while (id.contains(QStringLiteral("--")))
+        {
             id.replace(QStringLiteral("--"), QStringLiteral("-"));
         }
         id.remove(QRegularExpression(QStringLiteral("^-+|-+$")));
-        if (id.isEmpty()) {
+        if (id.isEmpty())
+        {
             id = QStringLiteral("project");
         }
         QString uniqueId = id;
         int suffix = 2;
-        while (QFileInfo::exists(projectPath(uniqueId))) {
+        while (QFileInfo::exists(projectPath(uniqueId)))
+        {
             uniqueId = QStringLiteral("%1-%2").arg(id).arg(suffix++);
         }
         return uniqueId;
     }
 
-    void ensureProjectsDirectory() const {
+    void ensureProjectsDirectory() const
+    {
         QDir().mkpath(projectsDirPath());
     }
 
-    QStringList availableProjectIds() const {
+    QStringList availableProjectIds() const
+    {
         ensureProjectsDirectory();
-        const QFileInfoList entries = QDir(projectsDirPath()).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot,
-                                                                            QDir::Name | QDir::IgnoreCase);
+        const QFileInfoList entries = QDir(projectsDirPath()).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name | QDir::IgnoreCase);
         QStringList ids;
         ids.reserve(entries.size());
-        for (const QFileInfo& entry : entries) {
+        for (const QFileInfo &entry : entries)
+        {
             ids.push_back(entry.fileName());
         }
         return ids;
     }
 
-    void ensureDefaultProjectExists() const {
+    void ensureDefaultProjectExists() const
+    {
         ensureProjectsDirectory();
         QDir().mkpath(projectPath(QStringLiteral("default")));
     }
 
-    void loadProjectsFromFolders() {
+    void loadProjectsFromFolders()
+    {
         ensureDefaultProjectExists();
         QFile markerFile(currentProjectMarkerPath());
-        if (markerFile.open(QIODevice::ReadOnly)) {
+        if (markerFile.open(QIODevice::ReadOnly))
+        {
             m_currentProjectId = QString::fromUtf8(markerFile.readAll()).trimmed();
         }
         const QStringList projectIds = availableProjectIds();
-        if (projectIds.isEmpty()) {
+        if (projectIds.isEmpty())
+        {
             m_currentProjectId = QStringLiteral("default");
             return;
         }
-        if (m_currentProjectId.isEmpty() || !projectIds.contains(m_currentProjectId)) {
+        if (m_currentProjectId.isEmpty() || !projectIds.contains(m_currentProjectId))
+        {
             m_currentProjectId = projectIds.contains(QStringLiteral("default"))
-                ? QStringLiteral("default")
-                : projectIds.constFirst();
+                                     ? QStringLiteral("default")
+                                     : projectIds.constFirst();
         }
         QSaveFile marker(currentProjectMarkerPath());
-        if (marker.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (marker.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        {
             const QByteArray payload = m_currentProjectId.toUtf8();
-            if (marker.write(payload) == payload.size()) {
+            if (marker.write(payload) == payload.size())
+            {
                 marker.commit();
-            } else {
+            }
+            else
+            {
                 marker.cancelWriting();
             }
         }
     }
 
-    void saveCurrentProjectMarker() {
+    void saveCurrentProjectMarker()
+    {
         ensureProjectsDirectory();
         QSaveFile file(currentProjectMarkerPath());
-        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        {
             return;
         }
         const QByteArray payload = currentProjectIdOrDefault().toUtf8();
-        if (file.write(payload) != payload.size()) {
+        if (file.write(payload) != payload.size())
+        {
             file.cancelWriting();
             return;
         }
         file.commit();
     }
 
-    QString currentProjectName() const {
+    QString currentProjectName() const
+    {
         return currentProjectIdOrDefault();
     }
 
-    void refreshProjectsList() {
-        if (!m_projectsList) {
+    void refreshProjectsList()
+    {
+        if (!m_projectsList)
+        {
             return;
         }
         loadProjectsFromFolders();
         m_updatingProjectsList = true;
         m_projectsList->clear();
         const QStringList projectIds = availableProjectIds();
-        for (const QString& projectId : projectIds) {
-            auto* item = new QListWidgetItem(projectId, m_projectsList);
+        for (const QString &projectId : projectIds)
+        {
+            auto *item = new QListWidgetItem(projectId, m_projectsList);
             item->setData(Qt::UserRole, projectId);
             item->setToolTip(QDir::toNativeSeparators(projectPath(projectId)));
-            if (projectId == currentProjectIdOrDefault()) {
+            if (projectId == currentProjectIdOrDefault())
+            {
                 item->setSelected(true);
             }
         }
-        if (m_projectSectionLabel) {
+        if (m_projectSectionLabel)
+        {
             m_projectSectionLabel->setText(QStringLiteral("PROJECTS  %1").arg(currentProjectName()));
         }
         m_updatingProjectsList = false;
     }
 
-    void switchToProject(const QString& projectId) {
-        if (projectId.isEmpty() || projectId == currentProjectIdOrDefault()) {
+    void switchToProject(const QString &projectId)
+    {
+        if (projectId.isEmpty() || projectId == currentProjectIdOrDefault())
+        {
             refreshProjectsList();
             return;
         }
@@ -2336,15 +755,18 @@ private:
         refreshInspector();
     }
 
-    void createProject() {
+    void createProject()
+    {
         bool accepted = false;
         const QString name = QInputDialog::getText(this,
                                                    QStringLiteral("New Project"),
                                                    QStringLiteral("Project name"),
                                                    QLineEdit::Normal,
                                                    QStringLiteral("Untitled Project"),
-                                                   &accepted).trimmed();
-        if (!accepted || name.isEmpty()) {
+                                                   &accepted)
+                                 .trimmed();
+        if (!accepted || name.isEmpty())
+        {
             return;
         }
         const QString projectId = sanitizedProjectId(name);
@@ -2352,37 +774,45 @@ private:
         switchToProject(projectId);
     }
 
-    bool saveProjectPayload(const QString& projectId,
-                            const QByteArray& statePayload,
-                            const QByteArray& historyPayload) {
+    bool saveProjectPayload(const QString &projectId,
+                            const QByteArray &statePayload,
+                            const QByteArray &historyPayload)
+    {
         ensureProjectsDirectory();
         QDir().mkpath(projectPath(projectId));
 
         QSaveFile stateFile(stateFilePathForProject(projectId));
-        if (!stateFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (!stateFile.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        {
             return false;
         }
-        if (stateFile.write(statePayload) != statePayload.size()) {
+        if (stateFile.write(statePayload) != statePayload.size())
+        {
             stateFile.cancelWriting();
             return false;
         }
-        if (!stateFile.commit()) {
+        if (!stateFile.commit())
+        {
             return false;
         }
 
         QSaveFile historyFile(historyFilePathForProject(projectId));
-        if (!historyFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (!historyFile.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        {
             return false;
         }
-        if (historyFile.write(historyPayload) != historyPayload.size()) {
+        if (historyFile.write(historyPayload) != historyPayload.size())
+        {
             historyFile.cancelWriting();
             return false;
         }
         return historyFile.commit();
     }
 
-    void saveProjectAs() {
-        if (!m_timeline) {
+    void saveProjectAs()
+    {
+        if (!m_timeline)
+        {
             return;
         }
 
@@ -2394,8 +824,10 @@ private:
                                                    currentProjectName() == QStringLiteral("Default Project")
                                                        ? QStringLiteral("Untitled Project")
                                                        : currentProjectName(),
-                                                   &accepted).trimmed();
-        if (!accepted || name.isEmpty()) {
+                                                   &accepted)
+                                 .trimmed();
+        if (!accepted || name.isEmpty())
+        {
             return;
         }
 
@@ -2409,7 +841,8 @@ private:
         historyRoot[QStringLiteral("entries")] = m_historyEntries;
         const QByteArray historyPayload = QJsonDocument(historyRoot).toJson(QJsonDocument::Indented);
 
-        if (!saveProjectPayload(newProjectId, statePayload, historyPayload)) {
+        if (!saveProjectPayload(newProjectId, statePayload, historyPayload))
+        {
             QMessageBox::warning(this,
                                  QStringLiteral("Save Project As Failed"),
                                  QStringLiteral("Could not write the new project files."));
@@ -2419,8 +852,10 @@ private:
         switchToProject(newProjectId);
     }
 
-    void renameProject(const QString& projectId) {
-        if (projectId.isEmpty() || !QFileInfo::exists(projectPath(projectId))) {
+    void renameProject(const QString &projectId)
+    {
+        if (projectId.isEmpty() || !QFileInfo::exists(projectPath(projectId)))
+        {
             return;
         }
         bool accepted = false;
@@ -2429,29 +864,35 @@ private:
                                                    QStringLiteral("Project name"),
                                                    QLineEdit::Normal,
                                                    projectId,
-                                                   &accepted).trimmed();
-        if (!accepted || name.isEmpty()) {
+                                                   &accepted)
+                                 .trimmed();
+        if (!accepted || name.isEmpty())
+        {
             return;
         }
         const QString renamedProjectId = sanitizedProjectId(name);
-        if (renamedProjectId == projectId) {
+        if (renamedProjectId == projectId)
+        {
             return;
         }
         QDir projectsDir(projectsDirPath());
-        if (!projectsDir.rename(projectId, renamedProjectId)) {
+        if (!projectsDir.rename(projectId, renamedProjectId))
+        {
             QMessageBox::warning(this,
                                  QStringLiteral("Rename Project Failed"),
                                  QStringLiteral("Could not rename the project folder."));
             return;
         }
-        if (m_currentProjectId == projectId) {
+        if (m_currentProjectId == projectId)
+        {
             m_currentProjectId = renamedProjectId;
             saveCurrentProjectMarker();
         }
         refreshProjectsList();
     }
 
-    QJsonObject buildStateJson() const {
+    QJsonObject buildStateJson() const
+    {
         QJsonObject root;
         root[QStringLiteral("explorerRoot")] = m_currentRootPath;
         root[QStringLiteral("explorerGalleryPath")] = m_galleryFolderPath;
@@ -2459,7 +900,8 @@ private:
         root[QStringLiteral("playing")] = m_playbackTimer.isActive();
         root[QStringLiteral("selectedClipId")] = m_timeline ? m_timeline->selectedClipId() : QString();
         QJsonArray expandedFolders;
-        for (const QString& path : currentExpandedExplorerPaths()) {
+        for (const QString &path : currentExpandedExplorerPaths())
+        {
             expandedFolders.push_back(path);
         }
         root[QStringLiteral("explorerExpandedFolders")] = expandedFolders;
@@ -2478,8 +920,10 @@ private:
         root[QStringLiteral("exportEndFrame")] =
             m_timeline ? static_cast<qint64>(m_timeline->exportEndFrame()) : 300;
         QJsonArray exportRanges;
-        if (m_timeline) {
-            for (const ExportRangeSegment& range : m_timeline->exportRanges()) {
+        if (m_timeline)
+        {
+            for (const ExportRangeSegment &range : m_timeline->exportRanges())
+            {
                 QJsonObject rangeObj;
                 rangeObj[QStringLiteral("startFrame")] = static_cast<qint64>(range.startFrame);
                 rangeObj[QStringLiteral("endFrame")] = static_cast<qint64>(range.endFrame);
@@ -2489,15 +933,19 @@ private:
         root[QStringLiteral("exportRanges")] = exportRanges;
 
         QJsonArray timeline;
-        if (m_timeline) {
-            for (const TimelineClip& clip : m_timeline->clips()) {
+        if (m_timeline)
+        {
+            for (const TimelineClip &clip : m_timeline->clips())
+            {
                 timeline.push_back(clipToJson(clip));
             }
         }
         root[QStringLiteral("timeline")] = timeline;
         QJsonArray renderSyncMarkers;
-        if (m_timeline) {
-            for (const RenderSyncMarker& marker : m_timeline->renderSyncMarkers()) {
+        if (m_timeline)
+        {
+            for (const RenderSyncMarker &marker : m_timeline->renderSyncMarkers())
+            {
                 QJsonObject markerObj;
                 markerObj[QStringLiteral("clipId")] = marker.clipId;
                 markerObj[QStringLiteral("frame")] = static_cast<qint64>(marker.frame);
@@ -2509,8 +957,10 @@ private:
         root[QStringLiteral("renderSyncMarkers")] = renderSyncMarkers;
 
         QJsonArray tracks;
-        if (m_timeline) {
-            for (const TimelineTrack& track : m_timeline->tracks()) {
+        if (m_timeline)
+        {
+            for (const TimelineTrack &track : m_timeline->tracks())
+            {
                 QJsonObject trackObj;
                 trackObj[QStringLiteral("name")] = track.name;
                 trackObj[QStringLiteral("height")] = track.height;
@@ -2521,18 +971,23 @@ private:
         return root;
     }
 
-    void scheduleSaveState() {
-        if (m_loadingState || !m_timeline) {
+    void scheduleSaveState()
+    {
+        if (m_loadingState || !m_timeline)
+        {
             return;
         }
         m_stateSaveTimer.start();
     }
 
-    void saveStateNow() {
-        if (!m_timeline) {
+    void saveStateNow()
+    {
+        if (!m_timeline)
+        {
             return;
         }
-        if (m_loadingState) {
+        if (m_loadingState)
+        {
             m_pendingSaveAfterLoad = true;
             return;
         }
@@ -2543,28 +998,33 @@ private:
 
         const QByteArray serializedState =
             QJsonDocument(buildStateJson()).toJson(QJsonDocument::Indented);
-        if (serializedState == m_lastSavedState) {
+        if (serializedState == m_lastSavedState)
+        {
             return;
         }
 
         QSaveFile file(stateFilePath());
-        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        {
             return;
         }
 
-        if (file.write(serializedState) != serializedState.size()) {
+        if (file.write(serializedState) != serializedState.size())
+        {
             file.cancelWriting();
             return;
         }
 
-        if (!file.commit()) {
+        if (!file.commit())
+        {
             return;
         }
 
         m_lastSavedState = serializedState;
     }
 
-    void saveHistoryNow() {
+    void saveHistoryNow()
+    {
         ensureProjectsDirectory();
         QDir().mkpath(projectPath(currentProjectIdOrDefault()));
         QJsonObject root;
@@ -2572,41 +1032,49 @@ private:
         root[QStringLiteral("entries")] = m_historyEntries;
 
         QSaveFile file(historyFilePath());
-        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        {
             return;
         }
 
         const QByteArray payload = QJsonDocument(root).toJson(QJsonDocument::Indented);
-        if (file.write(payload) != payload.size()) {
+        if (file.write(payload) != payload.size())
+        {
             file.cancelWriting();
             return;
         }
         file.commit();
     }
 
-    void pushHistorySnapshot() {
-        if (m_loadingState || m_restoringHistory || !m_timeline) {
+    void pushHistorySnapshot()
+    {
+        if (m_loadingState || m_restoringHistory || !m_timeline)
+        {
             return;
         }
 
         const QJsonObject snapshot = buildStateJson();
         if (m_historyIndex >= 0 && m_historyIndex < m_historyEntries.size() &&
-            m_historyEntries.at(m_historyIndex).toObject() == snapshot) {
+            m_historyEntries.at(m_historyIndex).toObject() == snapshot)
+        {
             return;
         }
 
-        while (m_historyEntries.size() > m_historyIndex + 1) {
+        while (m_historyEntries.size() > m_historyIndex + 1)
+        {
             m_historyEntries.removeAt(m_historyEntries.size() - 1);
         }
         m_historyEntries.append(snapshot);
-        if (m_historyEntries.size() > 200) {
+        if (m_historyEntries.size() > 200)
+        {
             m_historyEntries.removeAt(0);
         }
         m_historyIndex = m_historyEntries.size() - 1;
         saveHistoryNow();
     }
 
-    void applyStateJson(const QJsonObject& root) {
+    void applyStateJson(const QJsonObject &root)
+    {
         m_loadingState = true;
 
         QString rootPath = root.value(QStringLiteral("explorerRoot")).toString(QDir::currentPath());
@@ -2624,8 +1092,10 @@ private:
         QVector<ExportRangeSegment> loadedExportRanges;
         const QJsonArray exportRanges = root.value(QStringLiteral("exportRanges")).toArray();
         loadedExportRanges.reserve(exportRanges.size());
-        for (const QJsonValue& value : exportRanges) {
-            if (!value.isObject()) {
+        for (const QJsonValue &value : exportRanges)
+        {
+            if (!value.isObject())
+            {
                 continue;
             }
             const QJsonObject obj = value.toObject();
@@ -2635,9 +1105,11 @@ private:
             loadedExportRanges.push_back(range);
         }
         m_expandedExplorerPaths.clear();
-        for (const QJsonValue& value : root.value(QStringLiteral("explorerExpandedFolders")).toArray()) {
+        for (const QJsonValue &value : root.value(QStringLiteral("explorerExpandedFolders")).toArray())
+        {
             const QString path = value.toString();
-            if (!path.isEmpty()) {
+            if (!path.isEmpty())
+            {
                 m_expandedExplorerPaths.push_back(path);
             }
         }
@@ -2649,20 +1121,25 @@ private:
 
         const QJsonArray clips = root.value(QStringLiteral("timeline")).toArray();
         loadedClips.reserve(clips.size());
-        for (const QJsonValue& value : clips) {
-            if (!value.isObject()) continue;
+        for (const QJsonValue &value : clips)
+        {
+            if (!value.isObject())
+                continue;
             TimelineClip clip = clipFromJson(value.toObject());
-            if (clip.trackIndex < 0) {
+            if (clip.trackIndex < 0)
+            {
                 clip.trackIndex = loadedClips.size();
             }
-            if (!clip.filePath.isEmpty()) {
+            if (!clip.filePath.isEmpty())
+            {
                 loadedClips.push_back(clip);
             }
         }
 
         const QJsonArray tracks = root.value(QStringLiteral("tracks")).toArray();
         loadedTracks.reserve(tracks.size());
-        for (int i = 0; i < tracks.size(); ++i) {
+        for (int i = 0; i < tracks.size(); ++i)
+        {
             const QJsonObject obj = tracks.at(i).toObject();
             TimelineTrack track;
             track.name = obj.value(QStringLiteral("name")).toString(QStringLiteral("Track %1").arg(i + 1));
@@ -2672,8 +1149,10 @@ private:
 
         const QJsonArray renderSyncMarkers = root.value(QStringLiteral("renderSyncMarkers")).toArray();
         loadedRenderSyncMarkers.reserve(renderSyncMarkers.size());
-        for (const QJsonValue& value : renderSyncMarkers) {
-            if (!value.isObject()) {
+        for (const QJsonValue &value : renderSyncMarkers)
+        {
+            if (!value.isObject())
+            {
                 continue;
             }
             const QJsonObject obj = value.toObject();
@@ -2687,33 +1166,41 @@ private:
 
         const QString resolvedRootPath = QDir(rootPath).absolutePath();
         m_currentRootPath = resolvedRootPath;
-        if (m_rootPathLabel) {
+        if (m_rootPathLabel)
+        {
             m_rootPathLabel->setText(resolvedRootPath);
         }
-        if (m_outputWidthSpin) {
+        if (m_outputWidthSpin)
+        {
             QSignalBlocker block(m_outputWidthSpin);
             m_outputWidthSpin->setValue(outputWidth);
         }
-        if (m_outputHeightSpin) {
+        if (m_outputHeightSpin)
+        {
             QSignalBlocker block(m_outputHeightSpin);
             m_outputHeightSpin->setValue(outputHeight);
         }
-        if (m_outputFormatCombo) {
+        if (m_outputFormatCombo)
+        {
             QSignalBlocker block(m_outputFormatCombo);
             const int formatIndex = m_outputFormatCombo->findData(outputFormat);
-            if (formatIndex >= 0) {
+            if (formatIndex >= 0)
+            {
                 m_outputFormatCombo->setCurrentIndex(formatIndex);
             }
         }
-        if (m_exportOnlyTranscriptWordsCheckBox) {
+        if (m_exportOnlyTranscriptWordsCheckBox)
+        {
             QSignalBlocker block(m_exportOnlyTranscriptWordsCheckBox);
             m_exportOnlyTranscriptWordsCheckBox->setChecked(exportOnlyTranscriptWords);
         }
-        if (m_inspectorTabs && m_inspectorTabs->count() > 0) {
+        if (m_inspectorTabs && m_inspectorTabs->count() > 0)
+        {
             QSignalBlocker block(m_inspectorTabs);
             m_inspectorTabs->setCurrentIndex(qBound(0, selectedInspectorTab, m_inspectorTabs->count() - 1));
         }
-        if (m_preview) {
+        if (m_preview)
+        {
             m_preview->setOutputSize(QSize(outputWidth, outputHeight));
         }
 
@@ -2721,9 +1208,12 @@ private:
         m_timeline->setClips(loadedClips);
         m_timeline->setTimelineZoom(timelineZoom);
         m_timeline->setVerticalScrollOffset(timelineVerticalScroll);
-        if (!loadedExportRanges.isEmpty()) {
+        if (!loadedExportRanges.isEmpty())
+        {
             m_timeline->setExportRanges(loadedExportRanges);
-        } else {
+        }
+        else
+        {
             m_timeline->setExportRange(exportStartFrame, exportEndFrame > 0 ? exportEndFrame : m_timeline->totalFrames());
         }
         m_timeline->setRenderSyncMarkers(loadedRenderSyncMarkers);
@@ -2733,7 +1223,8 @@ private:
         m_preview->setTimelineClips(m_timeline->clips());
         m_preview->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
         m_preview->setSelectedClipId(selectedClipId);
-        if (m_audioEngine) {
+        if (m_audioEngine)
+        {
             m_audioEngine->setTimelineClips(m_timeline->clips());
             m_audioEngine->seek(currentFrame);
         }
@@ -2742,20 +1233,23 @@ private:
         m_playbackTimer.stop();
         m_fastPlaybackActive.store(false);
         m_preview->setPlaybackState(false);
-        if (m_audioEngine) {
+        if (m_audioEngine)
+        {
             m_audioEngine->stop();
         }
 
         m_loadingState = false;
-        QTimer::singleShot(0, this, [this, resolvedRootPath]() {
+        QTimer::singleShot(0, this, [this, resolvedRootPath]()
+                           {
             setExplorerRootPath(resolvedRootPath, false);
             refreshProjectsList();
-            refreshInspector();
-        });
+            refreshInspector(); });
     }
 
-    void undoHistory() {
-        if (m_historyIndex <= 0 || m_historyEntries.isEmpty()) {
+    void undoHistory()
+    {
+        if (m_historyIndex <= 0 || m_historyEntries.isEmpty())
+        {
             return;
         }
 
@@ -2766,54 +1260,67 @@ private:
         saveHistoryNow();
         scheduleSaveState();
     }
-    
-    void setExplorerRootPath(const QString& path, bool saveAfterChange = true) {
-        if (!m_fsModel || !m_tree) {
+
+    void setExplorerRootPath(const QString &path, bool saveAfterChange = true)
+    {
+        if (!m_fsModel || !m_tree)
+        {
             return;
         }
-        
+
         QString resolvedPath = path;
-        if (resolvedPath.isEmpty() || !QFileInfo::exists(resolvedPath) || !QFileInfo(resolvedPath).isDir()) {
+        if (resolvedPath.isEmpty() || !QFileInfo::exists(resolvedPath) || !QFileInfo(resolvedPath).isDir())
+        {
             resolvedPath = QDir::currentPath();
         }
-        
+
         m_currentRootPath = QDir(resolvedPath).absolutePath();
         const QModelIndex rootIndex = m_fsModel->setRootPath(m_currentRootPath);
         m_tree->setRootIndex(rootIndex);
         hideExplorerHoverPreview();
         restoreExpandedExplorerPaths();
-        if (!m_galleryFolderPath.isEmpty()) {
+        if (!m_galleryFolderPath.isEmpty())
+        {
             setExplorerGalleryPath(m_galleryFolderPath, false);
         }
-        
-        if (m_rootPathLabel) {
+
+        if (m_rootPathLabel)
+        {
             m_rootPathLabel->setText(m_currentRootPath);
         }
-        
-        if (saveAfterChange) {
+
+        if (saveAfterChange)
+        {
             scheduleSaveState();
             pushHistorySnapshot();
         }
     }
 
-    QStringList currentExpandedExplorerPaths() const {
+    QStringList currentExpandedExplorerPaths() const
+    {
         QStringList expanded;
-        if (!m_tree || !m_fsModel) {
+        if (!m_tree || !m_fsModel)
+        {
             return expanded;
         }
         const QModelIndex rootIndex = m_tree->rootIndex();
-        std::function<void(const QModelIndex&)> collect = [&](const QModelIndex& parent) {
+        std::function<void(const QModelIndex &)> collect = [&](const QModelIndex &parent)
+        {
             const int rowCount = m_fsModel->rowCount(parent);
-            for (int row = 0; row < rowCount; ++row) {
+            for (int row = 0; row < rowCount; ++row)
+            {
                 const QModelIndex child = m_fsModel->index(row, 0, parent);
-                if (!child.isValid()) {
+                if (!child.isValid())
+                {
                     continue;
                 }
                 const QFileInfo info = m_fsModel->fileInfo(child);
-                if (!info.isDir()) {
+                if (!info.isDir())
+                {
                     continue;
                 }
-                if (m_tree->isExpanded(child)) {
+                if (m_tree->isExpanded(child))
+                {
                     expanded.push_back(info.absoluteFilePath());
                     collect(child);
                 }
@@ -2823,20 +1330,26 @@ private:
         return expanded;
     }
 
-    void restoreExpandedExplorerPaths() {
-        if (!m_tree || !m_fsModel) {
+    void restoreExpandedExplorerPaths()
+    {
+        if (!m_tree || !m_fsModel)
+        {
             return;
         }
-        for (const QString& path : m_expandedExplorerPaths) {
+        for (const QString &path : m_expandedExplorerPaths)
+        {
             const QModelIndex index = m_fsModel->index(path);
-            if (index.isValid()) {
+            if (index.isValid())
+            {
                 m_tree->expand(index);
             }
         }
     }
 
-    void populateExplorerGallery(const QString& folderPath) {
-        if (!m_galleryList) {
+    void populateExplorerGallery(const QString &folderPath)
+    {
+        if (!m_galleryList)
+        {
             return;
         }
         m_galleryList->clear();
@@ -2844,28 +1357,35 @@ private:
         QDir dir(folderPath);
         const QFileInfoList entries = dir.entryInfoList(QDir::NoDotAndDotDot | QDir::AllEntries,
                                                         QDir::DirsFirst | QDir::Name | QDir::IgnoreCase);
-        for (const QFileInfo& info : entries) {
-            auto* item = new QListWidgetItem(iconProvider.icon(info), info.fileName(), m_galleryList);
+        for (const QFileInfo &info : entries)
+        {
+            auto *item = new QListWidgetItem(iconProvider.icon(info), info.fileName(), m_galleryList);
             item->setData(Qt::UserRole, info.absoluteFilePath());
             item->setToolTip(QDir::toNativeSeparators(info.absoluteFilePath()));
-            if (info.isDir()) {
+            if (info.isDir())
+            {
                 item->setText(QStringLiteral("[%1]").arg(info.fileName()));
             }
         }
-        if (m_galleryTitleLabel) {
+        if (m_galleryTitleLabel)
+        {
             m_galleryTitleLabel->setText(QDir::toNativeSeparators(folderPath));
         }
     }
 
-    void setExplorerGalleryPath(const QString& folderPath, bool saveAfterChange = true) {
-        if (!m_explorerStack || !m_galleryList) {
+    void setExplorerGalleryPath(const QString &folderPath, bool saveAfterChange = true)
+    {
+        if (!m_explorerStack || !m_galleryList)
+        {
             return;
         }
-        if (folderPath.isEmpty() || !QFileInfo(folderPath).isDir()) {
+        if (folderPath.isEmpty() || !QFileInfo(folderPath).isDir())
+        {
             m_galleryFolderPath.clear();
             m_explorerStack->setCurrentIndex(0);
             hideExplorerHoverPreview();
-            if (saveAfterChange) {
+            if (saveAfterChange)
+            {
                 scheduleSaveState();
             }
             return;
@@ -2873,76 +1393,91 @@ private:
         m_galleryFolderPath = QDir(folderPath).absolutePath();
         populateExplorerGallery(m_galleryFolderPath);
         m_explorerStack->setCurrentIndex(1);
-        if (saveAfterChange) {
+        if (saveAfterChange)
+        {
             scheduleSaveState();
             pushHistorySnapshot();
         }
     }
 
-    QPixmap previewPixmapForFile(const QString& filePath) const {
+    QPixmap previewPixmapForFile(const QString &filePath) const
+    {
         const QFileInfo info(filePath);
-        if (!info.exists() || !info.isFile()) {
+        if (!info.exists() || !info.isFile())
+        {
             return QPixmap();
         }
 
         const MediaProbeResult probe = probeMediaFile(filePath);
-        if (probe.mediaType == ClipMediaType::Image) {
+        if (probe.mediaType == ClipMediaType::Image)
+        {
             QImage image(filePath);
             return image.isNull() ? QPixmap() : QPixmap::fromImage(image);
         }
-        if (probe.mediaType != ClipMediaType::Video) {
+        if (probe.mediaType != ClipMediaType::Video)
+        {
             return QPixmap();
         }
 
-        AVFormatContext* formatCtx = nullptr;
-        if (avformat_open_input(&formatCtx, QFile::encodeName(filePath).constData(), nullptr, nullptr) < 0) {
+        AVFormatContext *formatCtx = nullptr;
+        if (avformat_open_input(&formatCtx, QFile::encodeName(filePath).constData(), nullptr, nullptr) < 0)
+        {
             return QPixmap();
         }
-        if (avformat_find_stream_info(formatCtx, nullptr) < 0) {
+        if (avformat_find_stream_info(formatCtx, nullptr) < 0)
+        {
             avformat_close_input(&formatCtx);
             return QPixmap();
         }
 
         int videoStreamIndex = -1;
-        for (unsigned i = 0; i < formatCtx->nb_streams; ++i) {
+        for (unsigned i = 0; i < formatCtx->nb_streams; ++i)
+        {
             if (formatCtx->streams[i] && formatCtx->streams[i]->codecpar &&
-                formatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                formatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+            {
                 videoStreamIndex = static_cast<int>(i);
                 break;
             }
         }
-        if (videoStreamIndex < 0) {
+        if (videoStreamIndex < 0)
+        {
             avformat_close_input(&formatCtx);
             return QPixmap();
         }
 
-        AVStream* stream = formatCtx->streams[videoStreamIndex];
-        const AVCodec* decoder = avcodec_find_decoder(stream->codecpar->codec_id);
-        if (!decoder) {
+        AVStream *stream = formatCtx->streams[videoStreamIndex];
+        const AVCodec *decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+        if (!decoder)
+        {
             avformat_close_input(&formatCtx);
             return QPixmap();
         }
 
-        AVCodecContext* codecCtx = avcodec_alloc_context3(decoder);
-        if (!codecCtx) {
+        AVCodecContext *codecCtx = avcodec_alloc_context3(decoder);
+        if (!codecCtx)
+        {
             avformat_close_input(&formatCtx);
             return QPixmap();
         }
         if (avcodec_parameters_to_context(codecCtx, stream->codecpar) < 0 ||
-            avcodec_open2(codecCtx, decoder, nullptr) < 0) {
+            avcodec_open2(codecCtx, decoder, nullptr) < 0)
+        {
             avcodec_free_context(&codecCtx);
             avformat_close_input(&formatCtx);
             return QPixmap();
         }
 
-        AVPacket* packet = av_packet_alloc();
-        AVFrame* frame = av_frame_alloc();
+        AVPacket *packet = av_packet_alloc();
+        AVFrame *frame = av_frame_alloc();
         QPixmap pixmap;
-        auto decodeFrame = [&](AVFrame* decodedFrame) {
-            if (decodedFrame->width <= 0 || decodedFrame->height <= 0) {
+        auto decodeFrame = [&](AVFrame *decodedFrame)
+        {
+            if (decodedFrame->width <= 0 || decodedFrame->height <= 0)
+            {
                 return;
             }
-            SwsContext* sws = sws_getContext(decodedFrame->width,
+            SwsContext *sws = sws_getContext(decodedFrame->width,
                                              decodedFrame->height,
                                              static_cast<AVPixelFormat>(decodedFrame->format),
                                              decodedFrame->width,
@@ -2952,12 +1487,13 @@ private:
                                              nullptr,
                                              nullptr,
                                              nullptr);
-            if (!sws) {
+            if (!sws)
+            {
                 return;
             }
             QImage image(decodedFrame->width, decodedFrame->height, QImage::Format_RGBA8888);
-            uint8_t* destData[4] = { image.bits(), nullptr, nullptr, nullptr };
-            int destLinesize[4] = { static_cast<int>(image.bytesPerLine()), 0, 0, 0 };
+            uint8_t *destData[4] = {image.bits(), nullptr, nullptr, nullptr};
+            int destLinesize[4] = {static_cast<int>(image.bytesPerLine()), 0, 0, 0};
             sws_scale(sws,
                       decodedFrame->data,
                       decodedFrame->linesize,
@@ -2969,12 +1505,16 @@ private:
             pixmap = QPixmap::fromImage(image.copy());
         };
 
-        while (av_read_frame(formatCtx, packet) >= 0 && pixmap.isNull()) {
-            if (packet->stream_index == videoStreamIndex && avcodec_send_packet(codecCtx, packet) >= 0) {
-                while (avcodec_receive_frame(codecCtx, frame) >= 0) {
+        while (av_read_frame(formatCtx, packet) >= 0 && pixmap.isNull())
+        {
+            if (packet->stream_index == videoStreamIndex && avcodec_send_packet(codecCtx, packet) >= 0)
+            {
+                while (avcodec_receive_frame(codecCtx, frame) >= 0)
+                {
                     decodeFrame(frame);
                     av_frame_unref(frame);
-                    if (!pixmap.isNull()) {
+                    if (!pixmap.isNull())
+                    {
                         break;
                     }
                 }
@@ -2989,19 +1529,24 @@ private:
         return pixmap;
     }
 
-    void hideExplorerHoverPreview() {
-        if (m_explorerHoverPreview) {
+    void hideExplorerHoverPreview()
+    {
+        if (m_explorerHoverPreview)
+        {
             m_explorerHoverPreview->hide();
         }
     }
 
-    void showExplorerHoverPreview(const QString& filePath) {
+    void showExplorerHoverPreview(const QString &filePath)
+    {
         const QPixmap source = previewPixmapForFile(filePath);
-        if (source.isNull()) {
+        if (source.isNull())
+        {
             hideExplorerHoverPreview();
             return;
         }
-        if (!m_explorerHoverPreview) {
+        if (!m_explorerHoverPreview)
+        {
             m_explorerHoverPreview = new QLabel(nullptr, Qt::ToolTip);
             m_explorerHoverPreview->setObjectName(QStringLiteral("explorerHoverPreview"));
             m_explorerHoverPreview->setAlignment(Qt::AlignCenter);
@@ -3009,9 +1554,11 @@ private:
                 QStringLiteral("QLabel#explorerHoverPreview { background: #05080c; color: #edf2f7; border: 1px solid #24303c; border-radius: 10px; padding: 8px; }"));
         }
         QSize targetSize(280, 180);
-        if (m_preview) {
+        if (m_preview)
+        {
             const QSize previewSize = m_preview->size() - QSize(32, 32);
-            if (previewSize.width() > 0 && previewSize.height() > 0) {
+            if (previewSize.width() > 0 && previewSize.height() > 0)
+            {
                 targetSize = previewSize;
             }
         }
@@ -3019,7 +1566,8 @@ private:
         m_explorerHoverPreview->setPixmap(scaled);
         m_explorerHoverPreview->resize(scaled.size() + QSize(16, 16));
         QPoint previewAnchor(80, 80);
-        if (m_preview) {
+        if (m_preview)
+        {
             const QRect previewRect = m_preview->rect();
             previewAnchor = m_preview->mapToGlobal(
                 QPoint(qMax(24, (previewRect.width() - m_explorerHoverPreview->width()) / 2),
@@ -3030,9 +1578,11 @@ private:
         m_explorerHoverPreview->raise();
     }
 
-    void openTranscriptionWindow(const QString& filePath, const QString& label) {
+    void openTranscriptionWindow(const QString &filePath, const QString &label)
+    {
         const QFileInfo inputInfo(filePath);
-        if (!inputInfo.exists() || !inputInfo.isFile()) {
+        if (!inputInfo.exists() || !inputInfo.isFile())
+        {
             QMessageBox::warning(this,
                                  QStringLiteral("Transcribe Failed"),
                                  QStringLiteral("The selected file does not exist:\n%1")
@@ -3041,7 +1591,8 @@ private:
         }
 
         const QString scriptPath = QDir(QDir::currentPath()).absoluteFilePath(QStringLiteral("whisperx.sh"));
-        if (!QFileInfo::exists(scriptPath)) {
+        if (!QFileInfo::exists(scriptPath))
+        {
             QMessageBox::warning(this,
                                  QStringLiteral("Transcribe Failed"),
                                  QStringLiteral("whisperx.sh was not found at:\n%1")
@@ -3049,20 +1600,20 @@ private:
             return;
         }
 
-        auto* dialog = new QDialog(this);
+        auto *dialog = new QDialog(this);
         dialog->setAttribute(Qt::WA_DeleteOnClose);
         dialog->setWindowTitle(QStringLiteral("Transcribe  %1").arg(label));
         dialog->resize(920, 560);
 
-        auto* layout = new QVBoxLayout(dialog);
+        auto *layout = new QVBoxLayout(dialog);
         layout->setContentsMargins(12, 12, 12, 12);
         layout->setSpacing(8);
 
-        auto* title = new QLabel(QStringLiteral("whisperx.sh %1").arg(QDir::toNativeSeparators(filePath)), dialog);
+        auto *title = new QLabel(QStringLiteral("whisperx.sh %1").arg(QDir::toNativeSeparators(filePath)), dialog);
         title->setWordWrap(true);
         layout->addWidget(title);
 
-        auto* output = new QPlainTextEdit(dialog);
+        auto *output = new QPlainTextEdit(dialog);
         output->setReadOnly(true);
         output->setLineWrapMode(QPlainTextEdit::NoWrap);
         output->setStyleSheet(QStringLiteral(
@@ -3070,26 +1621,28 @@ private:
             "border-radius: 8px; font-family: monospace; font-size: 12px; }"));
         layout->addWidget(output, 1);
 
-        auto* inputRow = new QHBoxLayout;
+        auto *inputRow = new QHBoxLayout;
         inputRow->setContentsMargins(0, 0, 0, 0);
         inputRow->setSpacing(8);
-        auto* inputLabel = new QLabel(QStringLiteral("stdin"), dialog);
-        auto* inputLine = new QLineEdit(dialog);
+        auto *inputLabel = new QLabel(QStringLiteral("stdin"), dialog);
+        auto *inputLine = new QLineEdit(dialog);
         inputLine->setPlaceholderText(QStringLiteral("Type input for whisperx.sh prompts, then press Send"));
-        auto* sendButton = new QPushButton(QStringLiteral("Send"), dialog);
-        auto* closeButton = new QPushButton(QStringLiteral("Close"), dialog);
+        auto *sendButton = new QPushButton(QStringLiteral("Send"), dialog);
+        auto *closeButton = new QPushButton(QStringLiteral("Close"), dialog);
         inputRow->addWidget(inputLabel);
         inputRow->addWidget(inputLine, 1);
         inputRow->addWidget(sendButton);
         inputRow->addWidget(closeButton);
         layout->addLayout(inputRow);
 
-        auto* process = new QProcess(dialog);
+        auto *process = new QProcess(dialog);
         process->setProcessChannelMode(QProcess::MergedChannels);
         process->setWorkingDirectory(QDir::currentPath());
 
-        const auto appendOutput = [output](const QString& text) {
-            if (text.isEmpty()) {
+        const auto appendOutput = [output](const QString &text)
+        {
+            if (text.isEmpty())
+            {
                 return;
             }
             output->moveCursor(QTextCursor::End);
@@ -3097,23 +1650,22 @@ private:
             output->moveCursor(QTextCursor::End);
         };
 
-        connect(process, &QProcess::readyReadStandardOutput, dialog, [process, appendOutput]() {
-            appendOutput(QString::fromLocal8Bit(process->readAllStandardOutput()));
-        });
-        connect(process, &QProcess::started, dialog, [appendOutput, filePath]() {
-            appendOutput(QStringLiteral("$ ./whisperx.sh \"%1\"\n").arg(QDir::toNativeSeparators(filePath)));
-        });
-        connect(process, &QProcess::errorOccurred, dialog, [appendOutput](QProcess::ProcessError error) {
-            appendOutput(QStringLiteral("\n[process error] %1\n").arg(static_cast<int>(error)));
-        });
+        connect(process, &QProcess::readyReadStandardOutput, dialog, [process, appendOutput]()
+                { appendOutput(QString::fromLocal8Bit(process->readAllStandardOutput())); });
+        connect(process, &QProcess::started, dialog, [appendOutput, filePath]()
+                { appendOutput(QStringLiteral("$ ./whisperx.sh \"%1\"\n").arg(QDir::toNativeSeparators(filePath))); });
+        connect(process, &QProcess::errorOccurred, dialog, [appendOutput](QProcess::ProcessError error)
+                { appendOutput(QStringLiteral("\n[process error] %1\n").arg(static_cast<int>(error))); });
         connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), dialog,
-                [appendOutput](int exitCode, QProcess::ExitStatus exitStatus) {
+                [appendOutput](int exitCode, QProcess::ExitStatus exitStatus)
+                {
                     appendOutput(QStringLiteral("\n[process finished] exitCode=%1 status=%2\n")
                                      .arg(exitCode)
                                      .arg(exitStatus == QProcess::NormalExit ? QStringLiteral("normal")
                                                                              : QStringLiteral("crashed")));
                 });
-        connect(sendButton, &QPushButton::clicked, dialog, [process, inputLine, appendOutput]() {
+        connect(sendButton, &QPushButton::clicked, dialog, [process, inputLine, appendOutput]()
+                {
             const QString text = inputLine->text();
             if (text.isEmpty()) {
                 return;
@@ -3121,38 +1673,41 @@ private:
             process->write(text.toUtf8());
             process->write("\n");
             appendOutput(QStringLiteral("> %1\n").arg(text));
-            inputLine->clear();
-        });
+            inputLine->clear(); });
         connect(inputLine, &QLineEdit::returnPressed, sendButton, &QPushButton::click);
         connect(closeButton, &QPushButton::clicked, dialog, &QDialog::close);
-        connect(dialog, &QDialog::finished, dialog, [process](int) {
+        connect(dialog, &QDialog::finished, dialog, [process](int)
+                {
             if (process->state() != QProcess::NotRunning) {
                 process->kill();
                 process->waitForFinished(1000);
-            }
-        });
+            } });
 
         process->start(QStringLiteral("/bin/bash"),
                        {scriptPath, QFileInfo(filePath).absoluteFilePath()});
         dialog->show();
     }
-    
-    void chooseExplorerRoot() {
+
+    void chooseExplorerRoot()
+    {
         const QString startPath = m_currentRootPath.isEmpty() ? QDir::currentPath() : m_currentRootPath;
         const QString selected = QFileDialog::getExistingDirectory(this,
-            QStringLiteral("Select Media Folder"), startPath,
-            QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
+                                                                   QStringLiteral("Select Media Folder"), startPath,
+                                                                   QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
 
-        if (!selected.isEmpty()) {
+        if (!selected.isEmpty())
+        {
             setExplorerRootPath(selected, true);
         }
     }
 
-    QString transcriptPathForClip(const TimelineClip& clip) const {
+    QString transcriptPathForClip(const TimelineClip &clip) const
+    {
         return transcriptPathForClipFile(clip.filePath);
     }
 
-    QString secondsToTranscriptTime(double seconds) const {
+    QString secondsToTranscriptTime(double seconds) const
+    {
         const qint64 millis = qMax<qint64>(0, qRound64(seconds * 1000.0));
         const qint64 totalSeconds = millis / 1000;
         const qint64 minutes = totalSeconds / 60;
@@ -3164,74 +1719,92 @@ private:
             .arg(ms, 3, 10, QLatin1Char('0'));
     }
 
-    bool parseTranscriptTime(const QString& text, double* secondsOut) const {
+    bool parseTranscriptTime(const QString &text, double *secondsOut) const
+    {
         bool ok = false;
         const double numericValue = text.toDouble(&ok);
-        if (ok) {
+        if (ok)
+        {
             *secondsOut = qMax(0.0, numericValue);
             return true;
         }
 
         const QString trimmed = text.trimmed();
         const QStringList minuteParts = trimmed.split(QLatin1Char(':'));
-        if (minuteParts.size() != 2) {
+        if (minuteParts.size() != 2)
+        {
             return false;
         }
         const int minutes = minuteParts[0].toInt(&ok);
-        if (!ok) {
+        if (!ok)
+        {
             return false;
         }
         const double secValue = minuteParts[1].toDouble(&ok);
-        if (!ok) {
+        if (!ok)
+        {
             return false;
         }
         *secondsOut = qMax(0.0, minutes * 60.0 + secValue);
         return true;
     }
 
-    bool saveTranscriptJson(const QString& path, const QJsonDocument& doc) const {
+    bool saveTranscriptJson(const QString &path, const QJsonDocument &doc) const
+    {
         QSaveFile file(path);
-        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        {
             return false;
         }
         const QByteArray payload = doc.toJson(QJsonDocument::Indented);
-        if (file.write(payload) != payload.size()) {
+        if (file.write(payload) != payload.size())
+        {
             file.cancelWriting();
             return false;
         }
         return file.commit();
     }
 
-    int64_t adjustedLocalFrameForClip(const TimelineClip& clip,
+    int64_t adjustedLocalFrameForClip(const TimelineClip &clip,
                                       int64_t localTimelineFrame,
-                                      const QVector<RenderSyncMarker>& markers) const {
+                                      const QVector<RenderSyncMarker> &markers) const
+    {
         int64_t adjustedLocalFrame = qMax<int64_t>(0, localTimelineFrame);
         int duplicateCarry = 0;
-        for (const RenderSyncMarker& marker : markers) {
-            if (marker.clipId != clip.id) {
+        for (const RenderSyncMarker &marker : markers)
+        {
+            if (marker.clipId != clip.id)
+            {
                 continue;
             }
             const int64_t markerLocalFrame = marker.frame - clip.startFrame;
-            if (markerLocalFrame < 0 || markerLocalFrame >= localTimelineFrame) {
+            if (markerLocalFrame < 0 || markerLocalFrame >= localTimelineFrame)
+            {
                 continue;
             }
-            if (duplicateCarry > 0) {
+            if (duplicateCarry > 0)
+            {
                 adjustedLocalFrame -= 1;
                 duplicateCarry -= 1;
                 continue;
             }
-            if (marker.action == RenderSyncAction::DuplicateFrame) {
+            if (marker.action == RenderSyncAction::DuplicateFrame)
+            {
                 adjustedLocalFrame -= 1;
                 duplicateCarry = qMax(0, marker.count - 1);
-            } else if (marker.action == RenderSyncAction::SkipFrame) {
+            }
+            else if (marker.action == RenderSyncAction::SkipFrame)
+            {
                 adjustedLocalFrame += marker.count;
             }
         }
         return adjustedLocalFrame;
     }
 
-    void appendMergedExportFrame(QVector<ExportRangeSegment>& ranges, int64_t frame) const {
-        if (ranges.isEmpty() || frame > ranges.constLast().endFrame + 1) {
+    void appendMergedExportFrame(QVector<ExportRangeSegment> &ranges, int64_t frame) const
+    {
+        if (ranges.isEmpty() || frame > ranges.constLast().endFrame + 1)
+        {
             ranges.push_back(ExportRangeSegment{frame, frame});
             return;
         }
@@ -3242,27 +1815,35 @@ private:
     mutable QHash<QString, QVector<ExportRangeSegment>> m_transcriptWordRangesCache;
     mutable qint64 m_transcriptWordRangesCacheVersion = -1;
 
-    QVector<ExportRangeSegment> transcriptWordExportRanges(const QVector<ExportRangeSegment>& baseRanges,
-                                                           const QVector<TimelineClip>& clips,
-                                                           const QVector<RenderSyncMarker>& markers) const {
+    QVector<ExportRangeSegment> transcriptWordExportRanges(const QVector<ExportRangeSegment> &baseRanges,
+                                                           const QVector<TimelineClip> &clips,
+                                                           const QVector<RenderSyncMarker> &markers) const
+    {
         // Check if cache is still valid (based on timeline clip count and version)
         const qint64 currentVersion = m_timeline ? m_timeline->clips().size() : 0;
-        if (m_transcriptWordRangesCacheVersion == currentVersion && !m_transcriptWordRangesCache.isEmpty()) {
+        if (m_transcriptWordRangesCacheVersion == currentVersion && !m_transcriptWordRangesCache.isEmpty())
+        {
             // Return cached ranges (they're already mapped to timeline frames)
             QVector<ExportRangeSegment> result;
-            for (auto it = m_transcriptWordRangesCache.constBegin(); it != m_transcriptWordRangesCache.constEnd(); ++it) {
+            for (auto it = m_transcriptWordRangesCache.constBegin(); it != m_transcriptWordRangesCache.constEnd(); ++it)
+            {
                 result.append(it.value());
             }
             // Merge overlapping ranges from different clips
             std::sort(result.begin(), result.end(),
-                      [](const ExportRangeSegment& a, const ExportRangeSegment& b) {
+                      [](const ExportRangeSegment &a, const ExportRangeSegment &b)
+                      {
                           return a.startFrame < b.startFrame;
                       });
             QVector<ExportRangeSegment> merged;
-            for (const auto& range : result) {
-                if (merged.isEmpty() || range.startFrame > merged.last().endFrame + 1) {
+            for (const auto &range : result)
+            {
+                if (merged.isEmpty() || range.startFrame > merged.last().endFrame + 1)
+                {
                     merged.append(range);
-                } else {
+                }
+                else
+                {
                     merged.last().endFrame = qMax(merged.last().endFrame, range.endFrame);
                 }
             }
@@ -3273,9 +1854,11 @@ private:
         m_transcriptWordRangesCacheVersion = currentVersion;
 
         QVector<ExportRangeSegment> resolvedBaseRanges = baseRanges;
-        if (resolvedBaseRanges.isEmpty()) {
+        if (resolvedBaseRanges.isEmpty())
+        {
             int64_t endFrame = 0;
-            for (const TimelineClip& clip : clips) {
+            for (const TimelineClip &clip : clips)
+            {
                 endFrame = qMax(endFrame, clip.startFrame + clip.durationFrames);
             }
             resolvedBaseRanges.push_back(ExportRangeSegment{0, endFrame});
@@ -3283,71 +1866,88 @@ private:
 
         QVector<ExportRangeSegment> allTranscriptRanges;
 
-        for (const TimelineClip& clip : clips) {
-            if (clip.durationFrames <= 0) {
+        for (const TimelineClip &clip : clips)
+        {
+            if (clip.durationFrames <= 0)
+            {
                 continue;
             }
 
             QFile transcriptFile(transcriptPathForClip(clip));
-            if (!transcriptFile.open(QIODevice::ReadOnly)) {
+            if (!transcriptFile.open(QIODevice::ReadOnly))
+            {
                 continue;
             }
 
             QJsonParseError parseError;
             const QJsonDocument transcriptDoc =
                 QJsonDocument::fromJson(transcriptFile.readAll(), &parseError);
-            if (parseError.error != QJsonParseError::NoError || !transcriptDoc.isObject()) {
+            if (parseError.error != QJsonParseError::NoError || !transcriptDoc.isObject())
+            {
                 continue;
             }
 
             // Build source word ranges from transcript
             QVector<ExportRangeSegment> sourceWordRanges;
             const QJsonArray segments = transcriptDoc.object().value(QStringLiteral("segments")).toArray();
-            for (const QJsonValue& segmentValue : segments) {
+            for (const QJsonValue &segmentValue : segments)
+            {
                 const QJsonArray words = segmentValue.toObject().value(QStringLiteral("words")).toArray();
-                for (const QJsonValue& wordValue : words) {
+                for (const QJsonValue &wordValue : words)
+                {
                     const QJsonObject wordObj = wordValue.toObject();
-                    if (wordObj.value(QStringLiteral("word")).toString().trimmed().isEmpty()) {
+                    if (wordObj.value(QStringLiteral("word")).toString().trimmed().isEmpty())
+                    {
                         continue;
                     }
 
                     double startSeconds = wordObj.value(QStringLiteral("start")).toDouble(-1.0);
                     const double endSeconds = wordObj.value(QStringLiteral("end")).toDouble(-1.0);
-                    if (startSeconds < 0.0 || endSeconds < startSeconds) {
+                    if (startSeconds < 0.0 || endSeconds < startSeconds)
+                    {
                         continue;
                     }
 
                     // Apply runtime prepend offset (in seconds)
                     const double prependSeconds = m_transcriptPrependMs / 1000.0;
+                    const double postpendSeconds = m_transcriptPostpendMs / 1000.0;
                     startSeconds = qMax(0.0, startSeconds + prependSeconds);
+                    const double adjustedEndSeconds = qMax(startSeconds, endSeconds + postpendSeconds);
                     // Clamp to not overlap with previous word (handled by sorting/merging later)
 
                     const int64_t startFrame =
                         qMax<int64_t>(0, static_cast<int64_t>(std::floor(startSeconds * kTimelineFps)));
                     const int64_t endFrame =
-                        qMax<int64_t>(startFrame, static_cast<int64_t>(std::ceil(endSeconds * kTimelineFps)) - 1);
+                        qMax<int64_t>(startFrame, static_cast<int64_t>(std::ceil(adjustedEndSeconds * kTimelineFps)) - 1);
                     sourceWordRanges.push_back(ExportRangeSegment{startFrame, endFrame});
                 }
             }
 
-            if (sourceWordRanges.isEmpty()) {
+            if (sourceWordRanges.isEmpty())
+            {
                 continue;
             }
 
             // Sort and merge overlapping word ranges at source level
             std::sort(sourceWordRanges.begin(), sourceWordRanges.end(),
-                      [](const ExportRangeSegment& a, const ExportRangeSegment& b) {
-                          if (a.startFrame == b.startFrame) {
+                      [](const ExportRangeSegment &a, const ExportRangeSegment &b)
+                      {
+                          if (a.startFrame == b.startFrame)
+                          {
                               return a.endFrame < b.endFrame;
                           }
                           return a.startFrame < b.startFrame;
                       });
             QVector<ExportRangeSegment> mergedSourceWordRanges;
-            for (const ExportRangeSegment& wordRange : std::as_const(sourceWordRanges)) {
+            for (const ExportRangeSegment &wordRange : std::as_const(sourceWordRanges))
+            {
                 if (mergedSourceWordRanges.isEmpty() ||
-                    wordRange.startFrame > mergedSourceWordRanges.constLast().endFrame + 1) {
+                    wordRange.startFrame > mergedSourceWordRanges.constLast().endFrame + 1)
+                {
                     mergedSourceWordRanges.push_back(wordRange);
-                } else {
+                }
+                else
+                {
                     mergedSourceWordRanges.last().endFrame =
                         qMax(mergedSourceWordRanges.last().endFrame, wordRange.endFrame);
                 }
@@ -3356,16 +1956,19 @@ private:
             // Map source word ranges to timeline ranges efficiently (O(n) instead of O(n*m))
             QVector<ExportRangeSegment> clipTimelineRanges;
 
-            for (const ExportRangeSegment& baseRange : resolvedBaseRanges) {
+            for (const ExportRangeSegment &baseRange : resolvedBaseRanges)
+            {
                 const int64_t clipStart = qMax<int64_t>(clip.startFrame, baseRange.startFrame);
                 const int64_t clipEnd =
                     qMin<int64_t>(clip.startFrame + clip.durationFrames - 1, baseRange.endFrame);
-                if (clipEnd < clipStart) {
+                if (clipEnd < clipStart)
+                {
                     continue;
                 }
 
                 // For each source word range, map it to timeline frames
-                for (const ExportRangeSegment& wordRange : std::as_const(mergedSourceWordRanges)) {
+                for (const ExportRangeSegment &wordRange : std::as_const(mergedSourceWordRanges))
+                {
                     // Map source word range to timeline
                     // sourceFrame = clip.sourceInFrame + adjustedLocalFrameForClip(clip, localTimelineFrame, markers)
                     // So we need to find timeline frames where sourceFrame is within wordRange
@@ -3383,7 +1986,8 @@ private:
                     localStart = qMax<int64_t>(0, localStart);
                     localEnd = qMin<int64_t>(clip.durationFrames - 1, localEnd);
 
-                    if (localEnd < localStart) {
+                    if (localEnd < localStart)
+                    {
                         continue;
                     }
 
@@ -3395,14 +1999,16 @@ private:
                     timelineStart = qMax(timelineStart, clipStart);
                     timelineEnd = qMin(timelineEnd, clipEnd);
 
-                    if (timelineEnd >= timelineStart) {
+                    if (timelineEnd >= timelineStart)
+                    {
                         clipTimelineRanges.push_back(ExportRangeSegment{timelineStart, timelineEnd});
                     }
                 }
             }
 
             // Cache ranges for this clip
-            if (!clipTimelineRanges.isEmpty()) {
+            if (!clipTimelineRanges.isEmpty())
+            {
                 m_transcriptWordRangesCache[clip.id] = clipTimelineRanges;
                 allTranscriptRanges.append(clipTimelineRanges);
             }
@@ -3410,63 +2016,81 @@ private:
 
         // Sort and merge all ranges from all clips
         std::sort(allTranscriptRanges.begin(), allTranscriptRanges.end(),
-                  [](const ExportRangeSegment& a, const ExportRangeSegment& b) {
+                  [](const ExportRangeSegment &a, const ExportRangeSegment &b)
+                  {
                       return a.startFrame < b.startFrame;
                   });
         QVector<ExportRangeSegment> merged;
-        for (const auto& range : allTranscriptRanges) {
-            if (merged.isEmpty() || range.startFrame > merged.last().endFrame + 1) {
+        for (const auto &range : allTranscriptRanges)
+        {
+            if (merged.isEmpty() || range.startFrame > merged.last().endFrame + 1)
+            {
                 merged.append(range);
-            } else {
+            }
+            else
+            {
                 merged.last().endFrame = qMax(merged.last().endFrame, range.endFrame);
             }
         }
         return merged;
     }
 
-    QString clipLabelForId(const QString& clipId) const {
-        if (!m_timeline) {
+    QString clipLabelForId(const QString &clipId) const
+    {
+        if (!m_timeline)
+        {
             return clipId;
         }
-        for (const TimelineClip& clip : m_timeline->clips()) {
-            if (clip.id == clipId) {
+        for (const TimelineClip &clip : m_timeline->clips())
+        {
+            if (clip.id == clipId)
+            {
                 return clip.label;
             }
         }
         return clipId;
     }
 
-    QColor clipColorForId(const QString& clipId) const {
-        if (!m_timeline) {
+    QColor clipColorForId(const QString &clipId) const
+    {
+        if (!m_timeline)
+        {
             return QColor(QStringLiteral("#24303c"));
         }
-        for (const TimelineClip& clip : m_timeline->clips()) {
-            if (clip.id == clipId) {
+        for (const TimelineClip &clip : m_timeline->clips())
+        {
+            if (clip.id == clipId)
+            {
                 return clip.color;
             }
         }
         return QColor(QStringLiteral("#24303c"));
     }
 
-    bool parseSyncActionText(const QString& text, RenderSyncAction* actionOut) const {
+    bool parseSyncActionText(const QString &text, RenderSyncAction *actionOut) const
+    {
         const QString normalized = text.trimmed().toLower();
-        if (normalized == QStringLiteral("duplicate") || normalized == QStringLiteral("dup")) {
+        if (normalized == QStringLiteral("duplicate") || normalized == QStringLiteral("dup"))
+        {
             *actionOut = RenderSyncAction::DuplicateFrame;
             return true;
         }
-        if (normalized == QStringLiteral("skip")) {
+        if (normalized == QStringLiteral("skip"))
+        {
             *actionOut = RenderSyncAction::SkipFrame;
             return true;
         }
         return false;
     }
 
-    void refreshSyncInspector() {
+    void refreshSyncInspector()
+    {
         m_syncInspectorClipLabel->setText(QStringLiteral("Sync"));
         m_updatingSyncInspector = true;
         m_syncTable->clearContents();
         m_syncTable->setRowCount(0);
-        if (!m_timeline || m_timeline->renderSyncMarkers().isEmpty()) {
+        if (!m_timeline || m_timeline->renderSyncMarkers().isEmpty())
+        {
             m_syncInspectorDetailsLabel->setText(QStringLiteral("No render sync markers in the timeline."));
             m_updatingSyncInspector = false;
             return;
@@ -3477,23 +2101,25 @@ private:
             QStringLiteral("%1 sync markers across the timeline. Edit Frame, Count, or Action directly.")
                 .arg(markers.size()));
         m_syncTable->setRowCount(markers.size());
-        for (int i = 0; i < markers.size(); ++i) {
-            const RenderSyncMarker& marker = markers[i];
+        for (int i = 0; i < markers.size(); ++i)
+        {
+            const RenderSyncMarker &marker = markers[i];
             const QColor clipColor = clipColorForId(marker.clipId);
             const QColor rowBackground = QColor(clipColor.red(), clipColor.green(), clipColor.blue(), 72);
             const QColor rowForeground = QColor(QStringLiteral("#f4f7fb"));
             const QString clipLabel = clipLabelForId(marker.clipId);
-            auto* clipItem = new QTableWidgetItem(QString());
+            auto *clipItem = new QTableWidgetItem(QString());
             clipItem->setData(Qt::UserRole, marker.clipId);
             clipItem->setData(Qt::UserRole + 1, QVariant::fromValue(static_cast<qint64>(marker.frame)));
             clipItem->setFlags(clipItem->flags() & ~Qt::ItemIsEditable);
             clipItem->setToolTip(clipLabel);
-            auto* frameItem = new QTableWidgetItem(QString::number(marker.frame));
-            auto* countItem = new QTableWidgetItem(QString::number(marker.count));
-            auto* actionItem = new QTableWidgetItem(
+            auto *frameItem = new QTableWidgetItem(QString::number(marker.frame));
+            auto *countItem = new QTableWidgetItem(QString::number(marker.count));
+            auto *actionItem = new QTableWidgetItem(
                 marker.action == RenderSyncAction::DuplicateFrame ? QStringLiteral("Duplicate")
                                                                   : QStringLiteral("Skip"));
-            for (QTableWidgetItem* item : {clipItem, frameItem, countItem, actionItem}) {
+            for (QTableWidgetItem *item : {clipItem, frameItem, countItem, actionItem})
+            {
                 item->setBackground(rowBackground);
                 item->setForeground(rowForeground);
             }
@@ -3504,8 +2130,9 @@ private:
         }
         m_updatingSyncInspector = false;
     }
-    
-    QJsonObject clipToJson(const TimelineClip& clip) const {
+
+    QJsonObject clipToJson(const TimelineClip &clip) const
+    {
         QJsonObject obj;
         obj[QStringLiteral("id")] = clip.id;
         obj[QStringLiteral("filePath")] = clip.filePath;
@@ -3530,7 +2157,8 @@ private:
         obj[QStringLiteral("baseScaleX")] = clip.baseScaleX;
         obj[QStringLiteral("baseScaleY")] = clip.baseScaleY;
         QJsonArray keyframes;
-        for (const TimelineClip::TransformKeyframe& keyframe : clip.transformKeyframes) {
+        for (const TimelineClip::TransformKeyframe &keyframe : clip.transformKeyframes)
+        {
             QJsonObject keyframeObj;
             keyframeObj[QStringLiteral("frame")] = static_cast<qint64>(keyframe.frame);
             keyframeObj[QStringLiteral("translationX")] = keyframe.translationX;
@@ -3561,8 +2189,9 @@ private:
         obj[QStringLiteral("fadeSamples")] = clip.fadeSamples;
         return obj;
     }
-    
-    TimelineClip clipFromJson(const QJsonObject& obj) const {
+
+    TimelineClip clipFromJson(const QJsonObject &obj) const
+    {
         TimelineClip clip;
         clip.id = obj.value(QStringLiteral("id")).toString();
         clip.filePath = obj.value(QStringLiteral("filePath")).toString();
@@ -3576,23 +2205,28 @@ private:
         clip.startSubframeSamples = obj.value(QStringLiteral("startSubframeSamples")).toVariant().toLongLong();
         clip.durationFrames = obj.value(QStringLiteral("durationFrames")).toVariant().toLongLong();
         clip.trackIndex = obj.value(QStringLiteral("trackIndex")).toInt(-1);
-        if (clip.durationFrames == 0) clip.durationFrames = 120;
-        if (clip.mediaType == ClipMediaType::Unknown && !clip.filePath.isEmpty()) {
+        if (clip.durationFrames == 0)
+            clip.durationFrames = 120;
+        if (clip.mediaType == ClipMediaType::Unknown && !clip.filePath.isEmpty())
+        {
             const MediaProbeResult probe = probeMediaFile(clip.filePath, clip.durationFrames);
             clip.mediaType = probe.mediaType;
             clip.hasAudio = probe.hasAudio;
             clip.durationFrames = probe.durationFrames;
             clip.sourceDurationFrames = probe.durationFrames;
         }
-        if (clip.sourceDurationFrames <= 0) {
+        if (clip.sourceDurationFrames <= 0)
+        {
             clip.sourceDurationFrames = clip.sourceInFrame + clip.durationFrames;
         }
         normalizeClipTiming(clip);
         clip.color = QColor(obj.value(QStringLiteral("color")).toString());
-        if (!clip.color.isValid()) {
+        if (!clip.color.isValid())
+        {
             clip.color = QColor::fromHsv(static_cast<int>(qHash(clip.filePath) % 360), 160, 220, 220);
         }
-        if (clip.mediaType == ClipMediaType::Audio) {
+        if (clip.mediaType == ClipMediaType::Audio)
+        {
             clip.color = QColor(QStringLiteral("#2f7f93"));
         }
         clip.brightness = obj.value(QStringLiteral("brightness")).toDouble(0.0);
@@ -3605,8 +2239,10 @@ private:
         clip.baseScaleX = obj.value(QStringLiteral("baseScaleX")).toDouble(1.0);
         clip.baseScaleY = obj.value(QStringLiteral("baseScaleY")).toDouble(1.0);
         const QJsonArray keyframes = obj.value(QStringLiteral("transformKeyframes")).toArray();
-        for (const QJsonValue& value : keyframes) {
-            if (!value.isObject()) {
+        for (const QJsonValue &value : keyframes)
+        {
+            if (!value.isObject())
+            {
                 continue;
             }
             const QJsonObject keyframeObj = value.toObject();
@@ -3642,70 +2278,80 @@ private:
         normalizeClipTransformKeyframes(clip);
         return clip;
     }
-    
-    void loadState() {
+
+    void loadState()
+    {
         loadProjectsFromFolders();
         m_historyEntries = QJsonArray();
         m_historyIndex = -1;
         m_lastSavedState.clear();
         QJsonObject root;
         QFile historyFile(historyFilePath());
-        if (historyFile.open(QIODevice::ReadOnly)) {
+        if (historyFile.open(QIODevice::ReadOnly))
+        {
             const QJsonObject historyRoot = QJsonDocument::fromJson(historyFile.readAll()).object();
             m_historyEntries = historyRoot.value(QStringLiteral("entries")).toArray();
             m_historyIndex = historyRoot.value(QStringLiteral("index")).toInt(m_historyEntries.size() - 1);
-            if (!m_historyEntries.isEmpty()) {
+            if (!m_historyEntries.isEmpty())
+            {
                 m_historyIndex = qBound(0, m_historyIndex, m_historyEntries.size() - 1);
                 root = m_historyEntries.at(m_historyIndex).toObject();
             }
         }
 
-        if (root.isEmpty()) {
+        if (root.isEmpty())
+        {
             QFile file(stateFilePath());
-            if (file.open(QIODevice::ReadOnly)) {
+            if (file.open(QIODevice::ReadOnly))
+            {
                 root = QJsonDocument::fromJson(file.readAll()).object();
             }
         }
 
         applyStateJson(root);
-        if (m_historyEntries.isEmpty()) {
+        if (m_historyEntries.isEmpty())
+        {
             pushHistorySnapshot();
         }
 
-        if (m_pendingSaveAfterLoad) {
+        if (m_pendingSaveAfterLoad)
+        {
             m_pendingSaveAfterLoad = false;
             scheduleSaveState();
-        } else {
+        }
+        else
+        {
             scheduleSaveState();
         }
     }
-    
-    QWidget* buildExplorerPane() {
-        auto* pane = new QFrame;
+
+    QWidget *buildExplorerPane()
+    {
+        auto *pane = new QFrame;
         pane->setFrameShape(QFrame::NoFrame);
         pane->setMinimumWidth(260);
         pane->setStyleSheet(
             QStringLiteral("QFrame { background: #11161c; color: #e8edf2; }"
-                          "QLabel { color: #dce5ee; font-weight: 600; letter-spacing: 0.08em; }"
-                          "QPushButton#folderPicker { background: transparent; border: none; color: #dce5ee; font-weight: 700; letter-spacing: 0.08em; padding: 0; text-align: left; }"
-                          "QPushButton#folderPicker:hover { color: #ffffff; }"
-                          "QToolButton#explorerRefresh { background: transparent; border: 1px solid #24303c; border-radius: 8px; color: #dce5ee; padding: 4px 8px; }"
-                          "QToolButton#explorerRefresh:hover { background: #1a2330; color: #ffffff; }"
-                          "QToolButton#projectAction { background: transparent; border: 1px solid #24303c; border-radius: 8px; color: #dce5ee; padding: 4px 8px; }"
-                          "QToolButton#projectAction:hover { background: #1a2330; color: #ffffff; }"
-                          "QLabel#rootPath { color: #8ea0b2; font-size: 11px; letter-spacing: 0; }"
-                          "QTreeView { background: transparent; border: none; color: #dbe2ea; }"
-                          "QTreeView::item { padding: 4px 0; }"
-                          "QTreeView::item:selected { background: #213042; color: #f7fbff; }"
-                          "QListWidget#projectsList { background: transparent; border: 1px solid #24303c; border-radius: 8px; color: #dbe2ea; }"
-                          "QListWidget#projectsList::item { padding: 6px 8px; }"
-                          "QListWidget#projectsList::item:selected { background: #213042; color: #f7fbff; }"));
-        
-        auto* layout = new QVBoxLayout(pane);
+                           "QLabel { color: #dce5ee; font-weight: 600; letter-spacing: 0.08em; }"
+                           "QPushButton#folderPicker { background: transparent; border: none; color: #dce5ee; font-weight: 700; letter-spacing: 0.08em; padding: 0; text-align: left; }"
+                           "QPushButton#folderPicker:hover { color: #ffffff; }"
+                           "QToolButton#explorerRefresh { background: transparent; border: 1px solid #24303c; border-radius: 8px; color: #dce5ee; padding: 4px 8px; }"
+                           "QToolButton#explorerRefresh:hover { background: #1a2330; color: #ffffff; }"
+                           "QToolButton#projectAction { background: transparent; border: 1px solid #24303c; border-radius: 8px; color: #dce5ee; padding: 4px 8px; }"
+                           "QToolButton#projectAction:hover { background: #1a2330; color: #ffffff; }"
+                           "QLabel#rootPath { color: #8ea0b2; font-size: 11px; letter-spacing: 0; }"
+                           "QTreeView { background: transparent; border: none; color: #dbe2ea; }"
+                           "QTreeView::item { padding: 4px 0; }"
+                           "QTreeView::item:selected { background: #213042; color: #f7fbff; }"
+                           "QListWidget#projectsList { background: transparent; border: 1px solid #24303c; border-radius: 8px; color: #dbe2ea; }"
+                           "QListWidget#projectsList::item { padding: 6px 8px; }"
+                           "QListWidget#projectsList::item:selected { background: #213042; color: #f7fbff; }"));
+
+        auto *layout = new QVBoxLayout(pane);
         layout->setContentsMargins(14, 14, 14, 14);
         layout->setSpacing(10);
 
-        auto* headerRow = new QHBoxLayout;
+        auto *headerRow = new QHBoxLayout;
         headerRow->setContentsMargins(0, 0, 0, 0);
         headerRow->setSpacing(8);
         m_folderPickerButton = new QPushButton(QStringLiteral("FILES"));
@@ -3719,15 +2365,15 @@ private:
         m_refreshExplorerButton->setCursor(Qt::PointingHandCursor);
         headerRow->addWidget(m_refreshExplorerButton);
         layout->addLayout(headerRow);
-        
+
         m_rootPathLabel = new QLabel;
         m_rootPathLabel->setObjectName(QStringLiteral("rootPath"));
         m_rootPathLabel->setWordWrap(true);
         layout->addWidget(m_rootPathLabel);
-        
+
         m_fsModel = new QFileSystemModel(this);
         m_fsModel->setFilter(QDir::AllDirs | QDir::Files | QDir::NoDotAndDotDot);
-        
+
         m_tree = new QTreeView;
         m_tree->setObjectName(QStringLiteral("explorer.tree"));
         m_tree->setModel(m_fsModel);
@@ -3750,11 +2396,11 @@ private:
         m_explorerStack = new QStackedWidget(pane);
         m_explorerStack->addWidget(m_tree);
 
-        auto* galleryPage = new QWidget(m_explorerStack);
-        auto* galleryLayout = new QVBoxLayout(galleryPage);
+        auto *galleryPage = new QWidget(m_explorerStack);
+        auto *galleryLayout = new QVBoxLayout(galleryPage);
         galleryLayout->setContentsMargins(0, 0, 0, 0);
         galleryLayout->setSpacing(8);
-        auto* galleryHeader = new QHBoxLayout;
+        auto *galleryHeader = new QHBoxLayout;
         galleryHeader->setContentsMargins(0, 0, 0, 0);
         galleryHeader->setSpacing(8);
         m_galleryBackButton = new QToolButton(galleryPage);
@@ -3780,7 +2426,7 @@ private:
         m_explorerStack->addWidget(galleryPage);
         layout->addWidget(m_explorerStack, 1);
 
-        auto* projectsHeader = new QHBoxLayout;
+        auto *projectsHeader = new QHBoxLayout;
         projectsHeader->setContentsMargins(0, 0, 0, 0);
         projectsHeader->setSpacing(8);
         m_projectSectionLabel = new QLabel(QStringLiteral("PROJECTS"), pane);
@@ -3804,15 +2450,16 @@ private:
         m_projectsList->setContextMenuPolicy(Qt::CustomContextMenu);
         m_projectsList->setMaximumHeight(160);
         layout->addWidget(m_projectsList, 0);
-        
-        connect(m_tree, &QTreeView::doubleClicked, this, [this](const QModelIndex& index) {
+
+        connect(m_tree, &QTreeView::doubleClicked, this, [this](const QModelIndex &index)
+                {
             if (!m_fsModel) return;
             const QFileInfo info = m_fsModel->fileInfo(index);
             if (info.exists() && info.isFile()) {
                 addFileToTimeline(info.absoluteFilePath());
-            }
-        });
-        connect(m_tree, &QTreeView::entered, this, [this](const QModelIndex& index) {
+            } });
+        connect(m_tree, &QTreeView::entered, this, [this](const QModelIndex &index)
+                {
             if (!m_fsModel || !m_tree) {
                 return;
             }
@@ -3826,18 +2473,15 @@ private:
                 hideExplorerHoverPreview();
                 return;
             }
-            showExplorerHoverPreview(info.absoluteFilePath());
-        });
-        connect(m_tree, &QAbstractItemView::viewportEntered, this, [this]() {
-            hideExplorerHoverPreview();
-        });
-        connect(m_newProjectButton, &QToolButton::clicked, this, [this]() {
-            createProject();
-        });
-        connect(m_saveProjectAsButton, &QToolButton::clicked, this, [this]() {
-            saveProjectAs();
-        });
-        connect(m_projectsList, &QListWidget::itemSelectionChanged, this, [this]() {
+            showExplorerHoverPreview(info.absoluteFilePath()); });
+        connect(m_tree, &QAbstractItemView::viewportEntered, this, [this]()
+                { hideExplorerHoverPreview(); });
+        connect(m_newProjectButton, &QToolButton::clicked, this, [this]()
+                { createProject(); });
+        connect(m_saveProjectAsButton, &QToolButton::clicked, this, [this]()
+                { saveProjectAs(); });
+        connect(m_projectsList, &QListWidget::itemSelectionChanged, this, [this]()
+                {
             if (m_updatingProjectsList || !m_projectsList) {
                 return;
             }
@@ -3845,15 +2489,15 @@ private:
             if (!item) {
                 return;
             }
-            switchToProject(item->data(Qt::UserRole).toString());
-        });
-        connect(m_projectsList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* item) {
+            switchToProject(item->data(Qt::UserRole).toString()); });
+        connect(m_projectsList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *item)
+                {
             if (!item) {
                 return;
             }
-            renameProject(item->data(Qt::UserRole).toString());
-        });
-        connect(m_projectsList, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+            renameProject(item->data(Qt::UserRole).toString()); });
+        connect(m_projectsList, &QWidget::customContextMenuRequested, this, [this](const QPoint &pos)
+                {
             if (!m_projectsList) {
                 return;
             }
@@ -3869,10 +2513,10 @@ private:
                 saveProjectAs();
             } else if (chosen == renameAction) {
                 renameProject(item->data(Qt::UserRole).toString());
-            }
-        });
+            } });
         m_tree->setContextMenuPolicy(Qt::CustomContextMenu);
-        connect(m_tree, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+        connect(m_tree, &QWidget::customContextMenuRequested, this, [this](const QPoint &pos)
+                {
             if (!m_fsModel || !m_tree) {
                 return;
             }
@@ -3889,29 +2533,29 @@ private:
             QAction* selected = menu.exec(m_tree->viewport()->mapToGlobal(pos));
             if (selected == galleryAction) {
                 setExplorerGalleryPath(info.absoluteFilePath(), true);
-            }
-        });
-        connect(m_tree, &QTreeView::expanded, this, [this](const QModelIndex&) {
+            } });
+        connect(m_tree, &QTreeView::expanded, this, [this](const QModelIndex &)
+                {
             m_expandedExplorerPaths = currentExpandedExplorerPaths();
-            scheduleSaveState();
-        });
-        connect(m_tree, &QTreeView::collapsed, this, [this](const QModelIndex&) {
+            scheduleSaveState(); });
+        connect(m_tree, &QTreeView::collapsed, this, [this](const QModelIndex &)
+                {
             m_expandedExplorerPaths = currentExpandedExplorerPaths();
-            scheduleSaveState();
-        });
-        connect(m_folderPickerButton, &QPushButton::clicked, this, [this]() { chooseExplorerRoot(); });
-        connect(m_refreshExplorerButton, &QToolButton::clicked, this, [this]() {
+            scheduleSaveState(); });
+        connect(m_folderPickerButton, &QPushButton::clicked, this, [this]()
+                { chooseExplorerRoot(); });
+        connect(m_refreshExplorerButton, &QToolButton::clicked, this, [this]()
+                {
             m_expandedExplorerPaths = currentExpandedExplorerPaths();
             if (m_currentRootPath.isEmpty()) {
                 setExplorerRootPath(QDir::currentPath(), false);
             } else {
                 setExplorerRootPath(m_currentRootPath, false);
-            }
-        });
-        connect(m_galleryBackButton, &QToolButton::clicked, this, [this]() {
-            setExplorerGalleryPath(QString(), true);
-        });
-        connect(m_galleryList, &QListWidget::itemEntered, this, [this](QListWidgetItem* item) {
+            } });
+        connect(m_galleryBackButton, &QToolButton::clicked, this, [this]()
+                { setExplorerGalleryPath(QString(), true); });
+        connect(m_galleryList, &QListWidget::itemEntered, this, [this](QListWidgetItem *item)
+                {
             if (!item || !m_galleryList) {
                 hideExplorerHoverPreview();
                 return;
@@ -3927,9 +2571,9 @@ private:
                 hideExplorerHoverPreview();
                 return;
             }
-            showExplorerHoverPreview(path);
-        });
-        connect(m_galleryList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* item) {
+            showExplorerHoverPreview(path); });
+        connect(m_galleryList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *item)
+                {
             if (!item) {
                 return;
             }
@@ -3939,60 +2583,59 @@ private:
                 setExplorerGalleryPath(path, true);
             } else if (info.exists() && info.isFile()) {
                 addFileToTimeline(path);
-            }
-        });
-        connect(m_galleryList, &QListWidget::itemSelectionChanged, this, [this]() {
+            } });
+        connect(m_galleryList, &QListWidget::itemSelectionChanged, this, [this]()
+                {
             if (m_galleryList && m_galleryList->selectedItems().isEmpty()) {
                 hideExplorerHoverPreview();
-            }
-        });
-        connect(m_galleryList, &QAbstractItemView::viewportEntered, this, [this]() {
-            hideExplorerHoverPreview();
-        });
-        
+            } });
+        connect(m_galleryList, &QAbstractItemView::viewportEntered, this, [this]()
+                { hideExplorerHoverPreview(); });
+
         return pane;
     }
-    
-    QWidget* buildEditorPane() {
-        auto* pane = new QWidget;
+
+    QWidget *buildEditorPane()
+    {
+        auto *pane = new QWidget;
         pane->setStyleSheet(
             QStringLiteral("QWidget { background: #0c1015; color: #edf2f7; }"
-                          "QPushButton, QToolButton { background: #1b2430; border: 1px solid #2e3b4a; border-radius: 7px; padding: 8px 12px; }"
-                          "QPushButton:hover, QToolButton:hover { background: #233142; }"
-                          "QSlider::groove:horizontal { background: #24303c; height: 6px; border-radius: 3px; }"
-                          "QSlider::handle:horizontal { background: #ff6f61; width: 14px; margin: -5px 0; border-radius: 7px; }"));
-        
-        auto* layout = new QVBoxLayout(pane);
+                           "QPushButton, QToolButton { background: #1b2430; border: 1px solid #2e3b4a; border-radius: 7px; padding: 8px 12px; }"
+                           "QPushButton:hover, QToolButton:hover { background: #233142; }"
+                           "QSlider::groove:horizontal { background: #24303c; height: 6px; border-radius: 3px; }"
+                           "QSlider::handle:horizontal { background: #ff6f61; width: 14px; margin: -5px 0; border-radius: 7px; }"));
+
+        auto *layout = new QVBoxLayout(pane);
         layout->setContentsMargins(18, 18, 18, 18);
         layout->setSpacing(0);
 
-        auto* verticalSplitter = new QSplitter(Qt::Vertical, pane);
+        auto *verticalSplitter = new QSplitter(Qt::Vertical, pane);
         verticalSplitter->setObjectName(QStringLiteral("layout.editor_splitter"));
         verticalSplitter->setChildrenCollapsible(false);
         layout->addWidget(verticalSplitter, 1);
-        
-        auto* previewFrame = new QFrame;
+
+        auto *previewFrame = new QFrame;
         previewFrame->setMinimumHeight(240);
         previewFrame->setFrameShape(QFrame::NoFrame);
         previewFrame->setStyleSheet(QStringLiteral("QFrame { background: #05080c; border: 1px solid #202934; border-radius: 14px; }"));
-        auto* previewLayout = new QVBoxLayout(previewFrame);
+        auto *previewLayout = new QVBoxLayout(previewFrame);
         previewLayout->setContentsMargins(0, 0, 0, 0);
         previewLayout->setSpacing(0);
-        
+
         m_preview = new PreviewWindow;
         m_preview->setObjectName(QStringLiteral("preview.window"));
         m_preview->setFocusPolicy(Qt::StrongFocus);
         m_preview->setMinimumSize(640, 360);
         m_preview->setOutputSize(QSize(1080, 1920));
-        
-        auto* overlay = new QWidget;
+
+        auto *overlay = new QWidget;
         overlay->setAttribute(Qt::WA_TransparentForMouseEvents, true);
         overlay->setStyleSheet(QStringLiteral("background: transparent;"));
-        auto* overlayLayout = new QVBoxLayout(overlay);
+        auto *overlayLayout = new QVBoxLayout(overlay);
         overlayLayout->setContentsMargins(18, 14, 18, 14);
         overlayLayout->setSpacing(6);
-        
-        auto* badgeRow = new QHBoxLayout;
+
+        auto *badgeRow = new QHBoxLayout;
         badgeRow->setContentsMargins(0, 0, 0, 0);
         m_statusBadge = new QLabel;
         m_statusBadge->setObjectName(QStringLiteral("overlay.status_badge"));
@@ -4000,46 +2643,46 @@ private:
         badgeRow->addWidget(m_statusBadge, 0, Qt::AlignLeft);
         badgeRow->addStretch(1);
         overlayLayout->addLayout(badgeRow);
-        
+
         overlayLayout->addStretch(1);
-        
+
         m_previewInfo = new QLabel;
         m_previewInfo->setObjectName(QStringLiteral("overlay.preview_info"));
         m_previewInfo->setStyleSheet(QStringLiteral("QLabel { background: rgba(7, 11, 17, 0.72); color: #dce6ef; border-radius: 10px; padding: 10px 12px; }"));
         m_previewInfo->setWordWrap(true);
         overlayLayout->addWidget(m_previewInfo, 0, Qt::AlignLeft | Qt::AlignBottom);
-        
-        auto* stack = new QStackedLayout;
+
+        auto *stack = new QStackedLayout;
         stack->setStackingMode(QStackedLayout::StackAll);
         stack->addWidget(m_preview);
         stack->addWidget(overlay);
         previewLayout->addLayout(stack);
         verticalSplitter->addWidget(previewFrame);
 
-        auto* timelinePane = new QWidget;
+        auto *timelinePane = new QWidget;
         timelinePane->setMinimumHeight(220);
-        auto* timelineLayout = new QVBoxLayout(timelinePane);
+        auto *timelineLayout = new QVBoxLayout(timelinePane);
         timelineLayout->setContentsMargins(0, 14, 0, 0);
         timelineLayout->setSpacing(14);
-        
-        auto* transport = new QWidget;
-        auto* transportLayout = new QHBoxLayout(transport);
+
+        auto *transport = new QWidget;
+        auto *transportLayout = new QHBoxLayout(transport);
         transportLayout->setContentsMargins(0, 0, 0, 0);
         transportLayout->setSpacing(10);
-        
+
         m_playButton = new QPushButton(style()->standardIcon(QStyle::SP_MediaPlay), QStringLiteral("Play"));
         m_playButton->setObjectName(QStringLiteral("transport.play"));
-        auto* startButton = new QToolButton;
-        auto* endButton = new QToolButton;
+        auto *startButton = new QToolButton;
+        auto *endButton = new QToolButton;
         startButton->setObjectName(QStringLiteral("transport.start"));
         endButton->setObjectName(QStringLiteral("transport.end"));
         startButton->setIcon(style()->standardIcon(QStyle::SP_MediaSkipBackward));
         endButton->setIcon(style()->standardIcon(QStyle::SP_MediaSkipForward));
-        
+
         m_seekSlider = new QSlider(Qt::Horizontal);
         m_seekSlider->setObjectName(QStringLiteral("transport.seek"));
         m_seekSlider->setRange(0, 300);
-        
+
         m_timecodeLabel = new QLabel;
         m_timecodeLabel->setObjectName(QStringLiteral("transport.timecode"));
         m_timecodeLabel->setMinimumWidth(96);
@@ -4055,7 +2698,7 @@ private:
         m_audioNowPlayingLabel = new QLabel(QStringLiteral("Audio idle"));
         m_audioNowPlayingLabel->setObjectName(QStringLiteral("transport.audio_status"));
         m_audioNowPlayingLabel->setMinimumWidth(180);
-        
+
         fprintf(stderr, "[DEBUG] Adding transport widgets...\n");
         fflush(stderr);
         transportLayout->addWidget(startButton);
@@ -4069,7 +2712,7 @@ private:
         timelineLayout->addWidget(transport, 0);
         fprintf(stderr, "[DEBUG] Transport widgets added\n");
         fflush(stderr);
-        
+
         fprintf(stderr, "[DEBUG] Creating TimelineWidget...\n");
         fflush(stderr);
         m_timeline = new TimelineWidget;
@@ -4081,85 +2724,97 @@ private:
         verticalSplitter->setStretchFactor(0, 3);
         verticalSplitter->setStretchFactor(1, 2);
         verticalSplitter->setSizes({540, 320});
-        
-        connect(m_playButton, &QPushButton::clicked, this, [this]() { togglePlayback(); });
-        connect(startButton, &QToolButton::clicked, this, [this]() {
-            setCurrentFrame(0);
-        });
-        connect(endButton, &QToolButton::clicked, this, [this]() {
-            setCurrentFrame(m_timeline->totalFrames());
-        });
-        connect(m_seekSlider, &QSlider::valueChanged, this, [this](int value) {
+
+        connect(m_playButton, &QPushButton::clicked, this, [this]()
+                { togglePlayback(); });
+        connect(startButton, &QToolButton::clicked, this, [this]()
+                { setCurrentFrame(0); });
+        connect(endButton, &QToolButton::clicked, this, [this]()
+                { setCurrentFrame(m_timeline->totalFrames()); });
+        connect(m_seekSlider, &QSlider::valueChanged, this, [this](int value)
+                {
             if (m_ignoreSeekSignal) return;
-            setCurrentFrame(value);
-        });
-        connect(m_audioMuteButton, &QToolButton::clicked, this, [this]() {
+            setCurrentFrame(value); });
+        connect(m_audioMuteButton, &QToolButton::clicked, this, [this]()
+                {
             const bool nextMuted = !m_preview->audioMuted();
             m_preview->setAudioMuted(nextMuted);
             if (m_audioEngine) {
                 m_audioEngine->setMuted(nextMuted);
             }
             refreshInspector();
-            scheduleSaveState();
-        });
-        connect(m_audioVolumeSlider, &QSlider::valueChanged, this, [this](int value) {
+            scheduleSaveState(); });
+        connect(m_audioVolumeSlider, &QSlider::valueChanged, this, [this](int value)
+                {
             m_preview->setAudioVolume(value / 100.0);
             if (m_audioEngine) {
                 m_audioEngine->setVolume(value / 100.0);
             }
-            refreshInspector();
-        });
-        
-        m_timeline->seekRequested = [this](int64_t frame) {
+            refreshInspector(); });
+
+        m_timeline->seekRequested = [this](int64_t frame)
+        {
             setCurrentFrame(frame);
         };
-        m_timeline->clipsChanged = [this]() {
+        m_timeline->clipsChanged = [this]()
+        {
             syncSliderRange();
             m_preview->setClipCount(m_timeline->clips().size());
             m_preview->setTimelineClips(m_timeline->clips());
             m_preview->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
             m_preview->setSelectedClipId(m_timeline->selectedClipId());
-            if (m_audioEngine) {
+            if (m_audioEngine)
+            {
                 m_audioEngine->setTimelineClips(m_timeline->clips());
             }
             refreshInspector();
             scheduleSaveState();
             pushHistorySnapshot();
         };
-        m_timeline->selectionChanged = [this]() {
+        m_timeline->selectionChanged = [this]()
+        {
             m_preview->setSelectedClipId(m_timeline->selectedClipId());
             refreshInspector();
         };
-        m_timeline->renderSyncMarkersChanged = [this]() {
+        m_timeline->renderSyncMarkersChanged = [this]()
+        {
             m_preview->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
             refreshInspector();
             scheduleSaveState();
             pushHistorySnapshot();
         };
-        m_timeline->exportRangeChanged = [this]() {
+        m_timeline->exportRangeChanged = [this]()
+        {
             refreshInspector();
             scheduleSaveState();
             pushHistorySnapshot();
         };
-        m_timeline->gradingRequested = [this]() {
+        m_timeline->gradingRequested = [this]()
+        {
             focusGradingTab();
             refreshInspector();
         };
-        m_timeline->transcribeRequested = [this](const QString& filePath, const QString& label) {
+        m_timeline->transcribeRequested = [this](const QString &filePath, const QString &label)
+        {
             openTranscriptionWindow(filePath, label);
         };
-        m_preview->selectionRequested = [this](const QString& clipId) {
-            if (!m_timeline) {
+        m_preview->selectionRequested = [this](const QString &clipId)
+        {
+            if (!m_timeline)
+            {
                 return;
             }
             m_timeline->setSelectedClipId(clipId);
         };
-        m_preview->resizeRequested = [this](const QString& clipId, qreal scaleX, qreal scaleY, bool finalize) {
-            if (!m_timeline) {
+        m_preview->resizeRequested = [this](const QString &clipId, qreal scaleX, qreal scaleY, bool finalize)
+        {
+            if (!m_timeline)
+            {
                 return;
             }
             const int64_t currentFrame = m_timeline->currentFrame();
-            const bool updated = m_timeline->updateClipById(clipId, [this, currentFrame, scaleX, scaleY](TimelineClip& clip) {
+            const bool updated = m_timeline->updateClipById(clipId, [this, currentFrame, scaleX, scaleY](TimelineClip &clip)
+                                                            {
                 if (clip.mediaType == ClipMediaType::Audio && clip.transcriptOverlay.enabled) {
                     clip.transcriptOverlay.boxWidth = qMax<qreal>(80.0, scaleX);
                     clip.transcriptOverlay.boxHeight = qMax<qreal>(40.0, scaleY);
@@ -4186,25 +2841,29 @@ private:
                 if (!replaced) {
                     clip.transformKeyframes.push_back(keyframe);
                 }
-                normalizeClipTransformKeyframes(clip);
-            });
-            if (!updated) {
+                normalizeClipTransformKeyframes(clip); });
+            if (!updated)
+            {
                 return;
             }
             m_preview->setTimelineClips(m_timeline->clips());
             m_preview->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
             refreshInspector();
             scheduleSaveState();
-            if (finalize) {
+            if (finalize)
+            {
                 pushHistorySnapshot();
             }
         };
-        m_preview->moveRequested = [this](const QString& clipId, qreal translationX, qreal translationY, bool finalize) {
-            if (!m_timeline) {
+        m_preview->moveRequested = [this](const QString &clipId, qreal translationX, qreal translationY, bool finalize)
+        {
+            if (!m_timeline)
+            {
                 return;
             }
             const int64_t currentFrame = m_timeline->currentFrame();
-            const bool updated = m_timeline->updateClipById(clipId, [this, currentFrame, translationX, translationY](TimelineClip& clip) {
+            const bool updated = m_timeline->updateClipById(clipId, [this, currentFrame, translationX, translationY](TimelineClip &clip)
+                                                            {
                 if (clip.mediaType == ClipMediaType::Audio && clip.transcriptOverlay.enabled) {
                     clip.transcriptOverlay.translationX = translationX;
                     clip.transcriptOverlay.translationY = translationY;
@@ -4231,16 +2890,17 @@ private:
                 if (!replaced) {
                     clip.transformKeyframes.push_back(keyframe);
                 }
-                normalizeClipTransformKeyframes(clip);
-            });
-            if (!updated) {
+                normalizeClipTransformKeyframes(clip); });
+            if (!updated)
+            {
                 return;
             }
             m_preview->setTimelineClips(m_timeline->clips());
             m_preview->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
             refreshInspector();
             scheduleSaveState();
-            if (finalize) {
+            if (finalize)
+            {
                 pushHistorySnapshot();
             }
         };
@@ -4249,8 +2909,9 @@ private:
         return pane;
     }
 
-    QWidget* buildInspectorPane() {
-        auto* pane = new QFrame;
+    QWidget *buildInspectorPane()
+    {
+        auto *pane = new QFrame;
         pane->setFrameShape(QFrame::NoFrame);
         pane->setMinimumWidth(300);
         pane->setStyleSheet(
@@ -4266,15 +2927,15 @@ private:
                            "QTabBar::tab { background: #17202a; color: #f4f7fb; padding: 8px 12px; margin-right: 2px; }"
                            "QTabBar::tab:selected { background: #24303c; color: #ffffff; }"));
 
-        auto* layout = new QVBoxLayout(pane);
+        auto *layout = new QVBoxLayout(pane);
         layout->setContentsMargins(14, 14, 14, 14);
         layout->setSpacing(10);
 
         m_inspectorTabs = new QTabWidget(pane);
         m_inspectorTabs->setObjectName(QStringLiteral("inspector.tabs"));
 
-        auto* gradingTab = new QWidget(m_inspectorTabs);
-        auto* gradingLayout = new QVBoxLayout(gradingTab);
+        auto *gradingTab = new QWidget(m_inspectorTabs);
+        auto *gradingLayout = new QVBoxLayout(gradingTab);
         gradingLayout->setContentsMargins(12, 12, 12, 12);
         gradingLayout->setSpacing(10);
 
@@ -4286,7 +2947,7 @@ private:
         gradingLayout->addWidget(m_gradingClipLabel);
         gradingLayout->addWidget(m_gradingPathLabel);
 
-        auto* form = new QFormLayout;
+        auto *form = new QFormLayout;
         m_brightnessSpin = new QDoubleSpinBox(gradingTab);
         m_brightnessSpin->setRange(-1.0, 1.0);
         m_brightnessSpin->setSingleStep(0.05);
@@ -4317,8 +2978,8 @@ private:
 
         m_inspectorTabs->addTab(gradingTab, QStringLiteral("Grading"));
 
-        auto* videoTab = new QWidget(m_inspectorTabs);
-        auto* videoLayout = new QVBoxLayout(videoTab);
+        auto *videoTab = new QWidget(m_inspectorTabs);
+        auto *videoLayout = new QVBoxLayout(videoTab);
         videoLayout->setContentsMargins(12, 12, 12, 12);
         videoLayout->setSpacing(10);
         m_videoInspectorClipLabel = new QLabel(QStringLiteral("Output"), videoTab);
@@ -4329,7 +2990,7 @@ private:
         videoLayout->addWidget(m_videoInspectorClipLabel);
         videoLayout->addWidget(m_videoInspectorDetailsLabel);
 
-        auto* videoForm = new QFormLayout;
+        auto *videoForm = new QFormLayout;
         m_outputWidthSpin = new QSpinBox(videoTab);
         m_outputWidthSpin->setRange(16, 7680);
         m_outputWidthSpin->setSingleStep(16);
@@ -4366,8 +3027,8 @@ private:
         videoLayout->addStretch(1);
         m_inspectorTabs->addTab(videoTab, QStringLiteral("Output"));
 
-        auto* keyframesTab = new QWidget(m_inspectorTabs);
-        auto* keyframesLayout = new QVBoxLayout(keyframesTab);
+        auto *keyframesTab = new QWidget(m_inspectorTabs);
+        auto *keyframesLayout = new QVBoxLayout(keyframesTab);
         keyframesLayout->setContentsMargins(12, 12, 12, 12);
         keyframesLayout->setSpacing(10);
         m_keyframesInspectorClipLabel = new QLabel(QStringLiteral("No visual clip selected"), keyframesTab);
@@ -4380,7 +3041,7 @@ private:
         m_keyframeSpaceCheckBox = new QCheckBox(QStringLiteral("Show Clip-Relative Values"), keyframesTab);
         m_keyframeSpaceCheckBox->setChecked(true);
         keyframesLayout->addWidget(m_keyframeSpaceCheckBox);
-        auto* keyframeForm = new QFormLayout;
+        auto *keyframeForm = new QFormLayout;
         m_videoTranslationXSpin = new QDoubleSpinBox(keyframesTab);
         m_videoTranslationXSpin->setRange(-4000.0, 4000.0);
         m_videoTranslationXSpin->setDecimals(1);
@@ -4447,8 +3108,8 @@ private:
         keyframesLayout->addWidget(m_removeVideoKeyframeButton, 0, Qt::AlignLeft);
         m_inspectorTabs->addTab(keyframesTab, QStringLiteral("Keyframes"));
 
-        auto* audioTab = new QWidget(m_inspectorTabs);
-        auto* audioLayout = new QVBoxLayout(audioTab);
+        auto *audioTab = new QWidget(m_inspectorTabs);
+        auto *audioLayout = new QVBoxLayout(audioTab);
         audioLayout->setContentsMargins(12, 12, 12, 12);
         audioLayout->setSpacing(10);
         m_audioInspectorClipLabel = new QLabel(QStringLiteral("No audio clip selected"), audioTab);
@@ -4458,9 +3119,9 @@ private:
         m_audioInspectorDetailsLabel->setWordWrap(true);
         audioLayout->addWidget(m_audioInspectorClipLabel);
         audioLayout->addWidget(m_audioInspectorDetailsLabel);
-        
+
         // Fade samples control for crossfade with previous clip
-        auto* fadeLayout = new QHBoxLayout();
+        auto *fadeLayout = new QHBoxLayout();
         fadeLayout->addWidget(new QLabel(QStringLiteral("Fade (samples):"), audioTab));
         m_audioFadeSamplesSpin = new QSpinBox(audioTab);
         m_audioFadeSamplesSpin->setRange(0, 10000);
@@ -4470,8 +3131,9 @@ private:
         fadeLayout->addWidget(m_audioFadeSamplesSpin);
         fadeLayout->addStretch();
         audioLayout->addLayout(fadeLayout);
-        
-        connect(m_audioFadeSamplesSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+
+        connect(m_audioFadeSamplesSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value)
+                {
             if (!m_timeline || m_updatingAudioInspector) {
                 return;
             }
@@ -4483,14 +3145,13 @@ private:
                 c.fadeSamples = value;
             });
             scheduleSaveState();
-            pushHistorySnapshot();
-        });
-        
+            pushHistorySnapshot(); });
+
         audioLayout->addStretch(1);
         m_inspectorTabs->addTab(audioTab, QStringLiteral("Audio"));
 
-        auto* transcriptTab = new QWidget(m_inspectorTabs);
-        auto* transcriptLayout = new QVBoxLayout(transcriptTab);
+        auto *transcriptTab = new QWidget(m_inspectorTabs);
+        auto *transcriptLayout = new QVBoxLayout(transcriptTab);
         transcriptLayout->setContentsMargins(12, 12, 12, 12);
         transcriptLayout->setSpacing(10);
         m_transcriptInspectorClipLabel = new QLabel(QStringLiteral("No transcript selected"), transcriptTab);
@@ -4500,7 +3161,7 @@ private:
         m_transcriptInspectorDetailsLabel->setWordWrap(true);
         transcriptLayout->addWidget(m_transcriptInspectorClipLabel);
         transcriptLayout->addWidget(m_transcriptInspectorDetailsLabel);
-        auto* transcriptOverlayForm = new QFormLayout;
+        auto *transcriptOverlayForm = new QFormLayout;
         m_transcriptOverlayEnabledCheckBox = new QCheckBox(QStringLiteral("Show Transcript Overlay"), transcriptTab);
         transcriptOverlayForm->addRow(QStringLiteral("Overlay"), m_transcriptOverlayEnabledCheckBox);
         m_transcriptMaxLinesSpin = new QSpinBox(transcriptTab);
@@ -4544,10 +3205,11 @@ private:
         m_transcriptTable->setEditTriggers(QAbstractItemView::DoubleClicked |
                                            QAbstractItemView::EditKeyPressed |
                                            QAbstractItemView::SelectedClicked);
-        
+
         // Delete key handler for transcript words
-        auto* transcriptDeleteShortcut = new QShortcut(QKeySequence::Delete, m_transcriptTable);
-        connect(transcriptDeleteShortcut, &QShortcut::activated, this, [this]() {
+        auto *transcriptDeleteShortcut = new QShortcut(QKeySequence::Delete, m_transcriptTable);
+        connect(transcriptDeleteShortcut, &QShortcut::activated, this, [this]()
+                {
             if (!m_transcriptTable || m_updatingTranscriptInspector || 
                 m_loadedTranscriptPath.isEmpty() || m_loadedTranscriptDoc.isNull()) {
                 return;
@@ -4621,8 +3283,7 @@ private:
             }
             
             // Refresh the table
-            refreshInspector();
-        });
+            refreshInspector(); });
         m_transcriptTable->setTextElideMode(Qt::ElideNone);
         m_transcriptTable->setWordWrap(true);
         m_transcriptTable->verticalHeader()->setVisible(false);
@@ -4633,9 +3294,9 @@ private:
         m_transcriptFollowCurrentWordCheckBox = new QCheckBox(QStringLiteral("Follow current word in table"), transcriptTab);
         m_transcriptFollowCurrentWordCheckBox->setChecked(true);
         transcriptLayout->addWidget(m_transcriptFollowCurrentWordCheckBox);
-        
+
         // Runtime prepend offset (not saved to ground truth)
-        auto* prependLayout = new QHBoxLayout();
+        auto *prependLayout = new QHBoxLayout();
         prependLayout->addWidget(new QLabel(QStringLiteral("Prepend (ms):"), transcriptTab));
         m_transcriptPrependMsSpin = new QSpinBox(transcriptTab);
         m_transcriptPrependMsSpin->setRange(-1000, 1000);
@@ -4645,19 +3306,38 @@ private:
         prependLayout->addWidget(m_transcriptPrependMsSpin);
         prependLayout->addStretch();
         transcriptLayout->addLayout(prependLayout);
-        
-        connect(m_transcriptPrependMsSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this]() {
+
+        connect(m_transcriptPrependMsSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this]()
+                {
             // Just update the cached value - applied at runtime
             m_transcriptPrependMs = m_transcriptPrependMsSpin->value();
             // Rebuild ranges with new offset
-            m_transcriptWordRangesCache.clear();
-        });
-        
+            m_transcriptWordRangesCache.clear(); });
+
+        // Runtime postpend offset (not saved to ground truth)
+        auto *postpendLayout = new QHBoxLayout();
+        postpendLayout->addWidget(new QLabel(QStringLiteral("Postpend (ms):"), transcriptTab));
+        m_transcriptPostpendMsSpin = new QSpinBox(transcriptTab);
+        m_transcriptPostpendMsSpin->setRange(-1000, 1000);
+        m_transcriptPostpendMsSpin->setValue(0);
+        m_transcriptPostpendMsSpin->setSingleStep(10);
+        m_transcriptPostpendMsSpin->setToolTip(QStringLiteral("Runtime offset applied to word end times (not saved to file)"));
+        postpendLayout->addWidget(m_transcriptPostpendMsSpin);
+        postpendLayout->addStretch();
+        transcriptLayout->addLayout(postpendLayout);
+
+        connect(m_transcriptPostpendMsSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this]()
+                {
+            // Just update the cached value - applied at runtime
+            m_transcriptPostpendMs = m_transcriptPostpendMsSpin->value();
+            // Rebuild ranges with new offset
+            m_transcriptWordRangesCache.clear(); });
+
         transcriptLayout->addWidget(m_transcriptTable, 1);
         m_inspectorTabs->addTab(transcriptTab, QStringLiteral("Transcript"));
 
-        auto* syncTab = new QWidget(m_inspectorTabs);
-        auto* syncLayout = new QVBoxLayout(syncTab);
+        auto *syncTab = new QWidget(m_inspectorTabs);
+        auto *syncLayout = new QVBoxLayout(syncTab);
         syncLayout->setContentsMargins(12, 12, 12, 12);
         syncLayout->setSpacing(10);
         m_syncInspectorClipLabel = new QLabel(QStringLiteral("Sync"), syncTab);
@@ -4684,60 +3364,60 @@ private:
         syncLayout->addWidget(m_syncTable, 1);
         m_inspectorTabs->addTab(syncTab, QStringLiteral("Sync"));
         layout->addWidget(m_inspectorTabs, 1);
-        connect(m_inspectorTabs, &QTabWidget::currentChanged, this, [this](int) {
-            scheduleSaveState();
-        });
+        connect(m_inspectorTabs, &QTabWidget::currentChanged, this, [this](int)
+                { scheduleSaveState(); });
 
-        connect(m_outputWidthSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) {
+        connect(m_outputWidthSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int)
+                {
             if (m_preview) {
                 m_preview->setOutputSize(QSize(m_outputWidthSpin->value(),
                                                m_outputHeightSpin ? m_outputHeightSpin->value() : 1920));
             }
             scheduleSaveState();
-            refreshInspector();
-        });
-        connect(m_outputHeightSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) {
+            refreshInspector(); });
+        connect(m_outputHeightSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int)
+                {
             if (m_preview) {
                 m_preview->setOutputSize(QSize(m_outputWidthSpin ? m_outputWidthSpin->value() : 1080,
                                                m_outputHeightSpin->value()));
             }
             scheduleSaveState();
-            refreshInspector();
-        });
-        connect(m_outputFormatCombo, &QComboBox::currentIndexChanged, this, [this](int) {
+            refreshInspector(); });
+        connect(m_outputFormatCombo, &QComboBox::currentIndexChanged, this, [this](int)
+                {
             scheduleSaveState();
-            refreshInspector();
-        });
-        connect(m_exportOnlyTranscriptWordsCheckBox, &QCheckBox::toggled, this, [this](bool) {
+            refreshInspector(); });
+        connect(m_exportOnlyTranscriptWordsCheckBox, &QCheckBox::toggled, this, [this](bool)
+                {
             if (m_playbackTimer.isActive()) {
                 setPlaybackActive(false);
                 setPlaybackActive(true);
             }
             scheduleSaveState();
-            refreshInspector();
-        });
-        connect(m_exportStartSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+            refreshInspector(); });
+        connect(m_exportStartSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value)
+                {
             if (!m_timeline || m_loadingState) {
                 return;
             }
             m_timeline->setExportRange(value, m_timeline->exportEndFrame());
-            refreshInspector();
-        });
-        connect(m_exportEndSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+            refreshInspector(); });
+        connect(m_exportEndSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value)
+                {
             if (!m_timeline || m_loadingState) {
                 return;
             }
             m_timeline->setExportRange(m_timeline->exportStartFrame(), value);
-            refreshInspector();
-        });
-        connect(m_bypassGradingCheckBox, &QCheckBox::toggled, this, [this](bool checked) {
+            refreshInspector(); });
+        connect(m_bypassGradingCheckBox, &QCheckBox::toggled, this, [this](bool checked)
+                {
             if (m_preview) {
                 m_preview->setBypassGrading(checked);
             }
-            refreshInspector();
-        });
+            refreshInspector(); });
         // Single click on a row to seek to that word's start time
-        connect(m_transcriptTable, &QTableWidget::cellClicked, this, [this](int row, int column) {
+        connect(m_transcriptTable, &QTableWidget::cellClicked, this, [this](int row, int column)
+                {
             Q_UNUSED(column)
             if (!m_transcriptTable || row < 0 || !m_timeline) {
                 return;
@@ -4760,9 +3440,9 @@ private:
                     const int64_t timelineFrame = clip->startFrame + localFrame;
                     setCurrentFrame(timelineFrame);
                 }
-            }
-        });
-        connect(m_transcriptTable, &QTableWidget::cellChanged, this, [this](int row, int column) {
+            } });
+        connect(m_transcriptTable, &QTableWidget::cellChanged, this, [this](int row, int column)
+                {
             if (m_updatingTranscriptInspector || !m_transcriptTable || row < 0 || column < 0 ||
                 m_loadedTranscriptPath.isEmpty() || m_loadedTranscriptDoc.isNull()) {
                 return;
@@ -4818,36 +3498,31 @@ private:
             if (m_preview && m_timeline) {
                 m_preview->setTimelineClips(m_timeline->clips());
             }
-            refreshInspector();
-        });
-        auto connectTranscriptOverlayLive = [this](auto* widget, auto signal) {
-            connect(widget, signal, this, [this](auto) {
-                applySelectedTranscriptOverlayFromInspector(false);
-            });
+            refreshInspector(); });
+        auto connectTranscriptOverlayLive = [this](auto *widget, auto signal)
+        {
+            connect(widget, signal, this, [this](auto)
+                    { applySelectedTranscriptOverlayFromInspector(false); });
         };
-        connect(m_transcriptOverlayEnabledCheckBox, &QCheckBox::toggled, this, [this](bool) {
-            applySelectedTranscriptOverlayFromInspector(true);
-        });
+        connect(m_transcriptOverlayEnabledCheckBox, &QCheckBox::toggled, this, [this](bool)
+                { applySelectedTranscriptOverlayFromInspector(true); });
         connectTranscriptOverlayLive(m_transcriptMaxLinesSpin, qOverload<int>(&QSpinBox::valueChanged));
         connectTranscriptOverlayLive(m_transcriptMaxCharsSpin, qOverload<int>(&QSpinBox::valueChanged));
-        connect(m_transcriptAutoScrollCheckBox, &QCheckBox::toggled, this, [this](bool) {
-            applySelectedTranscriptOverlayFromInspector(false);
-        });
+        connect(m_transcriptAutoScrollCheckBox, &QCheckBox::toggled, this, [this](bool)
+                { applySelectedTranscriptOverlayFromInspector(false); });
         connectTranscriptOverlayLive(m_transcriptOverlayXSpin, qOverload<double>(&QDoubleSpinBox::valueChanged));
         connectTranscriptOverlayLive(m_transcriptOverlayYSpin, qOverload<double>(&QDoubleSpinBox::valueChanged));
         connectTranscriptOverlayLive(m_transcriptOverlayWidthSpin, qOverload<int>(&QSpinBox::valueChanged));
         connectTranscriptOverlayLive(m_transcriptOverlayHeightSpin, qOverload<int>(&QSpinBox::valueChanged));
-        connect(m_transcriptFontFamilyCombo, &QFontComboBox::currentFontChanged, this, [this](const QFont&) {
-            applySelectedTranscriptOverlayFromInspector(false);
-        });
+        connect(m_transcriptFontFamilyCombo, &QFontComboBox::currentFontChanged, this, [this](const QFont &)
+                { applySelectedTranscriptOverlayFromInspector(false); });
         connectTranscriptOverlayLive(m_transcriptFontSizeSpin, qOverload<int>(&QSpinBox::valueChanged));
-        connect(m_transcriptBoldCheckBox, &QCheckBox::toggled, this, [this](bool) {
-            applySelectedTranscriptOverlayFromInspector(false);
-        });
-        connect(m_transcriptItalicCheckBox, &QCheckBox::toggled, this, [this](bool) {
-            applySelectedTranscriptOverlayFromInspector(false);
-        });
-        connect(m_syncTable, &QTableWidget::cellChanged, this, [this](int row, int column) {
+        connect(m_transcriptBoldCheckBox, &QCheckBox::toggled, this, [this](bool)
+                { applySelectedTranscriptOverlayFromInspector(false); });
+        connect(m_transcriptItalicCheckBox, &QCheckBox::toggled, this, [this](bool)
+                { applySelectedTranscriptOverlayFromInspector(false); });
+        connect(m_syncTable, &QTableWidget::cellChanged, this, [this](int row, int column)
+                {
             if (m_updatingSyncInspector || !m_timeline || !m_syncTable || row < 0 || column < 0) {
                 return;
             }
@@ -4888,9 +3563,9 @@ private:
                 return;
             }
 
-            m_timeline->setRenderSyncMarkers(markers);
-        });
-        connect(m_videoKeyframeTable, &QTableWidget::itemSelectionChanged, this, [this]() {
+            m_timeline->setRenderSyncMarkers(markers); });
+        connect(m_videoKeyframeTable, &QTableWidget::itemSelectionChanged, this, [this]()
+                {
             if (m_updatingVideoInspector) {
                 return;
             }
@@ -4920,9 +3595,9 @@ private:
                 setCurrentFrame(clip->startFrame + m_selectedVideoKeyframeFrame);
                 return;
             }
-            refreshInspector();
-        });
-        connect(m_videoKeyframeTable, &QTableWidget::currentItemChanged, this, [this](QTableWidgetItem* current, QTableWidgetItem*) {
+            refreshInspector(); });
+        connect(m_videoKeyframeTable, &QTableWidget::currentItemChanged, this, [this](QTableWidgetItem *current, QTableWidgetItem *)
+                {
             if (m_updatingVideoInspector) {
                 return;
             }
@@ -4937,9 +3612,9 @@ private:
             if (!m_selectedVideoKeyframeFrames.contains(frame)) {
                 return;
             }
-            m_selectedVideoKeyframeFrame = frame;
-        });
-        connect(m_videoKeyframeTable, &QTableWidget::cellChanged, this, [this](int row, int) {
+            m_selectedVideoKeyframeFrame = frame; });
+        connect(m_videoKeyframeTable, &QTableWidget::cellChanged, this, [this](int row, int)
+                {
             if (m_updatingVideoInspector || !m_timeline || row < 0) {
                 return;
             }
@@ -5003,9 +3678,9 @@ private:
             m_preview->setTimelineClips(m_timeline->clips());
             refreshInspector();
             scheduleSaveState();
-            pushHistorySnapshot();
-        });
-        connect(m_videoKeyframeTable, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+            pushHistorySnapshot(); });
+        connect(m_videoKeyframeTable, &QWidget::customContextMenuRequested, this, [this](const QPoint &pos)
+                {
             if (!m_videoKeyframeTable || !m_timeline) {
                 return;
             }
@@ -5034,18 +3709,15 @@ private:
                 duplicateSelectedClipVideoKeyframes(1);
             } else if (chosen == deleteAction) {
                 removeSelectedClipVideoKeyframe();
-            }
-        });
-        connect(m_keyframeSpaceCheckBox, &QCheckBox::toggled, this, [this](bool) {
-            refreshInspector();
-        });
-        connect(m_addVideoKeyframeButton, &QPushButton::clicked, this, [this]() {
-            upsertSelectedClipVideoKeyframe();
-        });
-        connect(m_removeVideoKeyframeButton, &QPushButton::clicked, this, [this]() {
-            removeSelectedClipVideoKeyframe();
-        });
-        connect(m_renderButton, &QPushButton::clicked, this, [this]() {
+            } });
+        connect(m_keyframeSpaceCheckBox, &QCheckBox::toggled, this, [this](bool)
+                { refreshInspector(); });
+        connect(m_addVideoKeyframeButton, &QPushButton::clicked, this, [this]()
+                { upsertSelectedClipVideoKeyframe(); });
+        connect(m_removeVideoKeyframeButton, &QPushButton::clicked, this, [this]()
+                { removeSelectedClipVideoKeyframe(); });
+        connect(m_renderButton, &QPushButton::clicked, this, [this]()
+                {
             const QString extension =
                 m_outputFormatCombo ? m_outputFormatCombo->currentData().toString() : QStringLiteral("mp4");
             const QString selectedPath = QFileDialog::getSaveFileName(
@@ -5193,49 +3865,59 @@ private:
                                          QStringLiteral("\nPipeline: %1\n\nAudio included when timeline clips provide it.")
                                              .arg(renderResult.usedGpu
                                                       ? QStringLiteral("GPU Offscreen OpenGL")
-                                                      : QStringLiteral("CPU Fallback")));
-        });
+                                                      : QStringLiteral("CPU Fallback"))); });
         return pane;
     }
-    
-    void addFileToTimeline(const QString& filePath) {
-        if (m_timeline) {
+
+    void addFileToTimeline(const QString &filePath)
+    {
+        if (m_timeline)
+        {
             m_timeline->addClipFromFile(filePath);
             m_preview->setTimelineClips(m_timeline->clips());
         }
     }
-    
-    void syncSliderRange() {
+
+    void syncSliderRange()
+    {
         const int64_t maxFrame = m_timeline->totalFrames();
         m_seekSlider->setRange(0, static_cast<int>(qMin<int64_t>(maxFrame, INT_MAX)));
     }
 
-    void focusGradingTab() {
-        if (m_inspectorTabs) {
+    void focusGradingTab()
+    {
+        if (m_inspectorTabs)
+        {
             m_inspectorTabs->setCurrentIndex(0);
         }
     }
 
-    bool showClipRelativeKeyframes() const {
+    bool showClipRelativeKeyframes() const
+    {
         return !m_keyframeSpaceCheckBox || m_keyframeSpaceCheckBox->isChecked();
     }
 
-    int64_t keyframeFrameForInspectorDisplay(const TimelineClip& clip, int64_t storedFrame) const {
+    int64_t keyframeFrameForInspectorDisplay(const TimelineClip &clip, int64_t storedFrame) const
+    {
         return showClipRelativeKeyframes() ? storedFrame : (clip.startFrame + storedFrame);
     }
 
-    int64_t keyframeFrameFromInspectorDisplay(const TimelineClip& clip, int64_t displayedFrame) const {
+    int64_t keyframeFrameFromInspectorDisplay(const TimelineClip &clip, int64_t displayedFrame) const
+    {
         return showClipRelativeKeyframes() ? displayedFrame : (displayedFrame - clip.startFrame);
     }
 
-    qreal inspectorScaleWithMirror(qreal magnitude, bool mirrored) const {
+    qreal inspectorScaleWithMirror(qreal magnitude, bool mirrored) const
+    {
         const qreal sanitized = sanitizeScaleValue(std::abs(magnitude));
         return mirrored ? -sanitized : sanitized;
     }
 
-    void syncScaleSpinPair(QDoubleSpinBox* changedSpin, QDoubleSpinBox* otherSpin) {
+    void syncScaleSpinPair(QDoubleSpinBox *changedSpin, QDoubleSpinBox *otherSpin)
+    {
         if (m_syncingScaleControls || !m_lockVideoScaleCheckBox || !m_lockVideoScaleCheckBox->isChecked() ||
-            !changedSpin || !otherSpin) {
+            !changedSpin || !otherSpin)
+        {
             return;
         }
         m_syncingScaleControls = true;
@@ -5243,9 +3925,11 @@ private:
         m_syncingScaleControls = false;
     }
 
-    TimelineClip::TransformKeyframe keyframeForInspectorDisplay(const TimelineClip& clip,
-                                                                const TimelineClip::TransformKeyframe& keyframe) const {
-        if (showClipRelativeKeyframes()) {
+    TimelineClip::TransformKeyframe keyframeForInspectorDisplay(const TimelineClip &clip,
+                                                                const TimelineClip::TransformKeyframe &keyframe) const
+    {
+        if (showClipRelativeKeyframes())
+        {
             return keyframe;
         }
         TimelineClip::TransformKeyframe displayed = keyframe;
@@ -5257,9 +3941,11 @@ private:
         return displayed;
     }
 
-    TimelineClip::TransformKeyframe keyframeFromInspectorDisplay(const TimelineClip& clip,
-                                                                 const TimelineClip::TransformKeyframe& displayed) const {
-        if (showClipRelativeKeyframes()) {
+    TimelineClip::TransformKeyframe keyframeFromInspectorDisplay(const TimelineClip &clip,
+                                                                 const TimelineClip::TransformKeyframe &displayed) const
+    {
+        if (showClipRelativeKeyframes())
+        {
             return displayed;
         }
         TimelineClip::TransformKeyframe stored = displayed;
@@ -5271,45 +3957,58 @@ private:
         return stored;
     }
 
-    int selectedVideoKeyframeIndex(const TimelineClip& clip) const {
-        for (int i = 0; i < clip.transformKeyframes.size(); ++i) {
-            if (clip.transformKeyframes[i].frame == m_selectedVideoKeyframeFrame) {
+    int selectedVideoKeyframeIndex(const TimelineClip &clip) const
+    {
+        for (int i = 0; i < clip.transformKeyframes.size(); ++i)
+        {
+            if (clip.transformKeyframes[i].frame == m_selectedVideoKeyframeFrame)
+            {
                 return i;
             }
         }
         return -1;
     }
 
-    QList<int64_t> selectedVideoKeyframeFrames(const TimelineClip& clip) const {
+    QList<int64_t> selectedVideoKeyframeFrames(const TimelineClip &clip) const
+    {
         QList<int64_t> frames;
-        for (const TimelineClip::TransformKeyframe& keyframe : clip.transformKeyframes) {
-            if (m_selectedVideoKeyframeFrames.contains(keyframe.frame)) {
+        for (const TimelineClip::TransformKeyframe &keyframe : clip.transformKeyframes)
+        {
+            if (m_selectedVideoKeyframeFrames.contains(keyframe.frame))
+            {
                 frames.push_back(keyframe.frame);
             }
         }
         return frames;
     }
 
-    bool hasRemovableVideoKeyframeSelection(const TimelineClip& clip) const {
-        for (const int64_t frame : selectedVideoKeyframeFrames(clip)) {
-            if (frame > 0) {
+    bool hasRemovableVideoKeyframeSelection(const TimelineClip &clip) const
+    {
+        for (const int64_t frame : selectedVideoKeyframeFrames(clip))
+        {
+            if (frame > 0)
+            {
                 return true;
             }
         }
         return false;
     }
 
-    int nearestVideoKeyframeIndex(const TimelineClip& clip) const {
-        if (!m_timeline || clip.transformKeyframes.isEmpty()) {
+    int nearestVideoKeyframeIndex(const TimelineClip &clip) const
+    {
+        if (!m_timeline || clip.transformKeyframes.isEmpty())
+        {
             return -1;
         }
         const int64_t localFrame =
             qBound<int64_t>(0, m_timeline->currentFrame() - clip.startFrame, qMax<int64_t>(0, clip.durationFrames - 1));
         int nearestIndex = 0;
         int64_t nearestDistance = std::numeric_limits<int64_t>::max();
-        for (int i = 0; i < clip.transformKeyframes.size(); ++i) {
+        for (int i = 0; i < clip.transformKeyframes.size(); ++i)
+        {
             const int64_t distance = std::abs(clip.transformKeyframes[i].frame - localFrame);
-            if (distance < nearestDistance) {
+            if (distance < nearestDistance)
+            {
                 nearestDistance = distance;
                 nearestIndex = i;
             }
@@ -5317,17 +4016,21 @@ private:
         return nearestIndex;
     }
 
-    void applySelectedVideoKeyframeFromInspector(bool pushHistoryAfterChange = false) {
-        if (m_updatingVideoInspector || !m_timeline) {
+    void applySelectedVideoKeyframeFromInspector(bool pushHistoryAfterChange = false)
+    {
+        if (m_updatingVideoInspector || !m_timeline)
+        {
             return;
         }
 
         const QString clipId = m_timeline->selectedClipId();
-        if (clipId.isEmpty() || m_selectedVideoKeyframeFrame < 0) {
+        if (clipId.isEmpty() || m_selectedVideoKeyframeFrame < 0)
+        {
             return;
         }
 
-        const bool updated = m_timeline->updateClipById(clipId, [this](TimelineClip& clip) {
+        const bool updated = m_timeline->updateClipById(clipId, [this](TimelineClip &clip)
+                                                        {
             const int index = selectedVideoKeyframeIndex(clip);
             if (index < 0) {
                 return;
@@ -5348,27 +4051,31 @@ private:
             keyframe.scaleX = stored.scaleX;
             keyframe.scaleY = stored.scaleY;
             keyframe.interpolated = m_videoInterpolationCombo->currentIndex() == 0;
-            normalizeClipTransformKeyframes(clip);
-        });
+            normalizeClipTransformKeyframes(clip); });
 
-        if (!updated) {
+        if (!updated)
+        {
             return;
         }
 
         m_preview->setTimelineClips(m_timeline->clips());
         refreshInspector();
         scheduleSaveState();
-        if (pushHistoryAfterChange) {
+        if (pushHistoryAfterChange)
+        {
             pushHistorySnapshot();
         }
     }
 
-    void upsertSelectedClipVideoKeyframe() {
-        if (!m_timeline) {
+    void upsertSelectedClipVideoKeyframe()
+    {
+        if (!m_timeline)
+        {
             return;
         }
-        const TimelineClip* clip = m_timeline->selectedClip();
-        if (!clip || !clipHasVisuals(*clip)) {
+        const TimelineClip *clip = m_timeline->selectedClip();
+        if (!clip || !clipHasVisuals(*clip))
+        {
             return;
         }
 
@@ -5377,7 +4084,8 @@ private:
         m_selectedVideoKeyframeFrame = keyframeFrame;
         m_selectedVideoKeyframeFrames = {keyframeFrame};
 
-        const bool updated = m_timeline->updateClipById(clip->id, [this, keyframeFrame](TimelineClip& editableClip) {
+        const bool updated = m_timeline->updateClipById(clip->id, [this, keyframeFrame](TimelineClip &editableClip)
+                                                        {
             TimelineClip::TransformKeyframe keyframe;
             keyframe.frame = keyframeFrame;
             keyframe.translationX = m_videoTranslationXSpin->value();
@@ -5402,10 +4110,10 @@ private:
             if (!replaced) {
                 editableClip.transformKeyframes.push_back(keyframe);
             }
-            normalizeClipTransformKeyframes(editableClip);
-        });
+            normalizeClipTransformKeyframes(editableClip); });
 
-        if (!updated) {
+        if (!updated)
+        {
             return;
         }
 
@@ -5415,27 +4123,33 @@ private:
         pushHistorySnapshot();
     }
 
-    void duplicateSelectedClipVideoKeyframes(int frameDelta) {
-        if (!m_timeline || frameDelta == 0) {
+    void duplicateSelectedClipVideoKeyframes(int frameDelta)
+    {
+        if (!m_timeline || frameDelta == 0)
+        {
             return;
         }
-        const TimelineClip* selectedClip = m_timeline->selectedClip();
-        if (!selectedClip || !clipHasVisuals(*selectedClip)) {
+        const TimelineClip *selectedClip = m_timeline->selectedClip();
+        if (!selectedClip || !clipHasVisuals(*selectedClip))
+        {
             return;
         }
 
         const QList<int64_t> selectedFrames = selectedVideoKeyframeFrames(*selectedClip);
-        if (selectedFrames.isEmpty()) {
+        if (selectedFrames.isEmpty())
+        {
             return;
         }
 
         QSet<int64_t> sourceFrames;
-        for (int64_t frame : selectedFrames) {
+        for (int64_t frame : selectedFrames)
+        {
             sourceFrames.insert(frame);
         }
         const int64_t maxFrame = qMax<int64_t>(0, selectedClip->durationFrames - 1);
         QSet<int64_t> newFrames;
-        const bool updated = m_timeline->updateClipById(selectedClip->id, [frameDelta, maxFrame, sourceFrames, &newFrames](TimelineClip& clip) {
+        const bool updated = m_timeline->updateClipById(selectedClip->id, [frameDelta, maxFrame, sourceFrames, &newFrames](TimelineClip &clip)
+                                                        {
             bool changed = false;
             const QVector<TimelineClip::TransformKeyframe> originalKeyframes = clip.transformKeyframes;
             for (const TimelineClip::TransformKeyframe& keyframe : originalKeyframes) {
@@ -5462,10 +4176,10 @@ private:
             }
             if (changed) {
                 normalizeClipTransformKeyframes(clip);
-            }
-        });
+            } });
 
-        if (!updated || newFrames.isEmpty()) {
+        if (!updated || newFrames.isEmpty())
+        {
             return;
         }
 
@@ -5477,30 +4191,37 @@ private:
         pushHistorySnapshot();
     }
 
-    void removeSelectedClipVideoKeyframe() {
-        if (!m_timeline || m_selectedVideoKeyframeFrames.isEmpty()) {
+    void removeSelectedClipVideoKeyframe()
+    {
+        if (!m_timeline || m_selectedVideoKeyframeFrames.isEmpty())
+        {
             return;
         }
         const QString clipId = m_timeline->selectedClipId();
-        if (clipId.isEmpty()) {
+        if (clipId.isEmpty())
+        {
             return;
         }
 
-        const TimelineClip* selectedClip = m_timeline->selectedClip();
-        if (!selectedClip) {
+        const TimelineClip *selectedClip = m_timeline->selectedClip();
+        if (!selectedClip)
+        {
             return;
         }
         QList<int64_t> selectedFrames = selectedVideoKeyframeFrames(*selectedClip);
         selectedFrames.erase(std::remove_if(selectedFrames.begin(),
                                             selectedFrames.end(),
-                                            [](int64_t frame) { return frame <= 0; }),
+                                            [](int64_t frame)
+                                            { return frame <= 0; }),
                              selectedFrames.end());
-        if (selectedFrames.isEmpty()) {
+        if (selectedFrames.isEmpty())
+        {
             refreshInspector();
             return;
         }
 
-        const bool updated = m_timeline->updateClipById(clipId, [selectedFrames](TimelineClip& clip) {
+        const bool updated = m_timeline->updateClipById(clipId, [selectedFrames](TimelineClip &clip)
+                                                        {
             clip.transformKeyframes.erase(
                 std::remove_if(clip.transformKeyframes.begin(),
                                clip.transformKeyframes.end(),
@@ -5508,10 +4229,10 @@ private:
                                    return selectedFrames.contains(keyframe.frame);
                                }),
                 clip.transformKeyframes.end());
-            normalizeClipTransformKeyframes(clip);
-        });
+            normalizeClipTransformKeyframes(clip); });
 
-        if (!updated) {
+        if (!updated)
+        {
             return;
         }
 
@@ -5523,44 +4244,53 @@ private:
         pushHistorySnapshot();
     }
 
-    void applySelectedClipGradeFromInspector(bool pushHistoryAfterChange = false) {
-        if (!m_timeline) {
+    void applySelectedClipGradeFromInspector(bool pushHistoryAfterChange = false)
+    {
+        if (!m_timeline)
+        {
             return;
         }
         const QString clipId = m_timeline->selectedClipId();
-        if (clipId.isEmpty()) {
+        if (clipId.isEmpty())
+        {
             return;
         }
 
-        const bool updated = m_timeline->updateClipById(clipId, [this](TimelineClip& clip) {
+        const bool updated = m_timeline->updateClipById(clipId, [this](TimelineClip &clip)
+                                                        {
             clip.brightness = m_brightnessSpin->value();
             clip.contrast = m_contrastSpin->value();
             clip.saturation = m_saturationSpin->value();
-            clip.opacity = m_opacitySpin->value();
-        });
+            clip.opacity = m_opacitySpin->value(); });
 
-        if (!updated) {
+        if (!updated)
+        {
             return;
         }
 
         m_preview->setTimelineClips(m_timeline->clips());
         refreshInspector();
         scheduleSaveState();
-        if (pushHistoryAfterChange) {
+        if (pushHistoryAfterChange)
+        {
             pushHistorySnapshot();
         }
     }
 
-    void applySelectedTranscriptOverlayFromInspector(bool pushHistoryAfterChange = false) {
-        if (!m_timeline || m_updatingTranscriptInspector) {
+    void applySelectedTranscriptOverlayFromInspector(bool pushHistoryAfterChange = false)
+    {
+        if (!m_timeline || m_updatingTranscriptInspector)
+        {
             return;
         }
         const QString clipId = m_timeline->selectedClipId();
-        if (clipId.isEmpty()) {
+        if (clipId.isEmpty())
+        {
             return;
         }
 
-        const bool updated = m_timeline->updateClipById(clipId, [this](TimelineClip& clip) {
+        const bool updated = m_timeline->updateClipById(clipId, [this](TimelineClip &clip)
+                                                        {
             clip.transcriptOverlay.enabled =
                 m_transcriptOverlayEnabledCheckBox && m_transcriptOverlayEnabledCheckBox->isChecked();
             clip.transcriptOverlay.maxLines = m_transcriptMaxLinesSpin ? m_transcriptMaxLinesSpin->value() : 2;
@@ -5583,37 +4313,46 @@ private:
                 m_transcriptFontSizeSpin ? m_transcriptFontSizeSpin->value() : 42;
             clip.transcriptOverlay.bold = m_transcriptBoldCheckBox && m_transcriptBoldCheckBox->isChecked();
             clip.transcriptOverlay.italic =
-                m_transcriptItalicCheckBox && m_transcriptItalicCheckBox->isChecked();
-        });
-        if (!updated) {
+                m_transcriptItalicCheckBox && m_transcriptItalicCheckBox->isChecked(); });
+        if (!updated)
+        {
             return;
         }
 
-        if (m_preview) {
+        if (m_preview)
+        {
             m_preview->setTimelineClips(m_timeline->clips());
         }
         refreshInspector();
         scheduleSaveState();
-        if (pushHistoryAfterChange) {
+        if (pushHistoryAfterChange)
+        {
             pushHistorySnapshot();
         }
     }
-    
-    void setCurrentFrame(int64_t frame, bool syncAudio = true) {
+
+    void setCurrentFrame(int64_t frame, bool syncAudio = true)
+    {
         setCurrentPlaybackSample(frameToSamples(frame), syncAudio);
     }
 
-    void setPlaybackActive(bool playing) {
-        if (playing) {
-            if (m_audioEngine && m_audioEngine->hasPlayableAudio()) {
+    void setPlaybackActive(bool playing)
+    {
+        if (playing)
+        {
+            if (m_audioEngine && m_audioEngine->hasPlayableAudio())
+            {
                 m_audioEngine->start(m_timeline->currentFrame());
             }
             advanceFrame();
             m_playbackTimer.start();
             m_fastPlaybackActive.store(true);
             m_preview->setPlaybackState(true);
-        } else {
-            if (m_audioEngine) {
+        }
+        else
+        {
+            if (m_audioEngine)
+            {
                 m_audioEngine->stop();
             }
             m_playbackTimer.stop();
@@ -5624,61 +4363,72 @@ private:
         scheduleSaveState();
     }
 
-    void togglePlayback() {
+    void togglePlayback()
+    {
         setPlaybackActive(!m_playbackTimer.isActive());
     }
 
-    void setCurrentPlaybackSample(int64_t samplePosition, bool syncAudio = true, bool duringPlayback = false) {
+    void setCurrentPlaybackSample(int64_t samplePosition, bool syncAudio = true, bool duringPlayback = false)
+    {
         const int64_t boundedSample = qBound<int64_t>(0, samplePosition, frameToSamples(m_timeline->totalFrames()));
         const qreal framePosition = samplesToFramePosition(boundedSample);
         const int64_t bounded = qBound<int64_t>(0,
-                                               static_cast<int64_t>(std::floor(framePosition)),
-                                               m_timeline->totalFrames());
+                                                static_cast<int64_t>(std::floor(framePosition)),
+                                                m_timeline->totalFrames());
         playbackTrace(QStringLiteral("EditorWindow::setCurrentFrame"),
                       QStringLiteral("requestedSample=%1 boundedSample=%2 frame=%3")
                           .arg(samplePosition)
                           .arg(boundedSample)
                           .arg(framePosition, 0, 'f', 3));
-        if (!m_timeline || bounded != m_timeline->currentFrame()) {
+        if (!m_timeline || bounded != m_timeline->currentFrame())
+        {
             m_lastPlayheadAdvanceMs.store(nowMs());
         }
         m_currentPlaybackSample = boundedSample;
         m_fastCurrentFrame.store(bounded);
-        if (syncAudio && m_audioEngine && m_audioEngine->hasPlayableAudio()) {
+        if (syncAudio && m_audioEngine && m_audioEngine->hasPlayableAudio())
+        {
             m_audioEngine->seek(bounded);
         }
         m_timeline->setCurrentFrame(bounded);
         m_preview->setCurrentPlaybackSample(boundedSample);
-        
+
         m_ignoreSeekSignal = true;
         m_seekSlider->setValue(static_cast<int>(qMin<int64_t>(bounded, INT_MAX)));
         m_ignoreSeekSignal = false;
-        
+
         m_timecodeLabel->setText(frameToTimecode(bounded));
-        
+
         // During playback, only update cheap transport labels and sync transcript table
         // instead of doing a full refreshInspector() which rebuilds all tables
-        if (duringPlayback) {
+        if (duringPlayback)
+        {
             updateTransportLabels();
             syncTranscriptTableToPlayhead();
-        } else {
+        }
+        else
+        {
             refreshInspector();
         }
         scheduleSaveState();
     }
 
-    void syncTranscriptTableToPlayhead() {
-        if (!m_timeline || !m_transcriptTable || m_updatingTranscriptInspector) {
+    void syncTranscriptTableToPlayhead()
+    {
+        if (!m_timeline || !m_transcriptTable || m_updatingTranscriptInspector)
+        {
             return;
         }
 
         // Skip all table updates when "Follow current word" is disabled
-        if (!m_transcriptFollowCurrentWordCheckBox || !m_transcriptFollowCurrentWordCheckBox->isChecked()) {
+        if (!m_transcriptFollowCurrentWordCheckBox || !m_transcriptFollowCurrentWordCheckBox->isChecked())
+        {
             return;
         }
 
-        const TimelineClip* clip = m_timeline->selectedClip();
-        if (!clip || clip->mediaType != ClipMediaType::Audio || m_loadedTranscriptPath.isEmpty()) {
+        const TimelineClip *clip = m_timeline->selectedClip();
+        if (!clip || clip->mediaType != ClipMediaType::Audio || m_loadedTranscriptPath.isEmpty())
+        {
             m_transcriptTable->clearSelection();
             return;
         }
@@ -5688,56 +4438,65 @@ private:
                                                  samplesToFramePosition(m_currentPlaybackSample),
                                                  {});
         int matchingRow = -1;
-        for (int row = 0; row < m_transcriptTable->rowCount(); ++row) {
-            QTableWidgetItem* startItem = m_transcriptTable->item(row, 0);
-            if (!startItem) {
+        for (int row = 0; row < m_transcriptTable->rowCount(); ++row)
+        {
+            QTableWidgetItem *startItem = m_transcriptTable->item(row, 0);
+            if (!startItem)
+            {
                 continue;
             }
             const int64_t startFrame = startItem->data(Qt::UserRole + 2).toLongLong();
             const int64_t endFrame = startItem->data(Qt::UserRole + 3).toLongLong();
-            if (sourceFrame >= startFrame && sourceFrame <= endFrame) {
+            if (sourceFrame >= startFrame && sourceFrame <= endFrame)
+            {
                 matchingRow = row;
                 break;
             }
         }
 
-        if (matchingRow < 0) {
+        if (matchingRow < 0)
+        {
             m_transcriptTable->clearSelection();
             return;
         }
 
-        if (!m_transcriptTable->selectionModel()->isRowSelected(matchingRow, QModelIndex())) {
+        if (!m_transcriptTable->selectionModel()->isRowSelected(matchingRow, QModelIndex()))
+        {
             m_transcriptTable->setCurrentCell(matchingRow, 0);
             m_transcriptTable->selectRow(matchingRow);
         }
         // Scroll to the matching word
-        if (QTableWidgetItem* item = m_transcriptTable->item(matchingRow, 0)) {
+        if (QTableWidgetItem *item = m_transcriptTable->item(matchingRow, 0))
+        {
             m_transcriptTable->scrollToItem(item, QAbstractItemView::PositionAtCenter);
         }
     }
-    
-    QString frameToTimecode(int64_t frame) const {
+
+    QString frameToTimecode(int64_t frame) const
+    {
         const int fps = 30;
         const int64_t totalSeconds = frame / fps;
         const int64_t minutes = totalSeconds / 60;
         const int64_t seconds = totalSeconds % 60;
         const int64_t frames = frame % fps;
-        
+
         return QStringLiteral("%1:%2:%3")
             .arg(minutes, 2, 10, QLatin1Char('0'))
             .arg(seconds, 2, 10, QLatin1Char('0'))
             .arg(frames, 2, 10, QLatin1Char('0'));
     }
-    
+
     // Lightweight update for transport labels - safe to call during playback
-    void updateTransportLabels() {
+    void updateTransportLabels()
+    {
         const bool playing = m_playbackTimer.isActive();
         const QString state = playing ? QStringLiteral("PLAYING") : QStringLiteral("PAUSED");
         const int clipCount = m_timeline ? m_timeline->clips().size() : 0;
         const QString activeAudio = m_preview ? m_preview->activeAudioClipLabel() : QString();
-        
+
         m_statusBadge->setText(QStringLiteral("%1  |  %2 clips").arg(state).arg(clipCount));
-        if (m_preview && m_timeline) {
+        if (m_preview && m_timeline)
+        {
             m_preview->setSelectedClipId(m_timeline->selectedClipId());
         }
         m_previewInfo->setText(QStringLiteral("Professional pipeline with libavcodec\nBackend: %1\nSeek: %2\nAudio: %3\nGrading: %4")
@@ -5756,16 +4515,19 @@ private:
                                             : QStringLiteral("Audio  %1").arg(activeAudio));
     }
 
-    void refreshInspector() {
+    void refreshInspector()
+    {
         const bool playing = m_playbackTimer.isActive();
-        
+
         // Update cheap transport labels
         updateTransportLabels();
-        if (m_bypassGradingCheckBox) {
+        if (m_bypassGradingCheckBox)
+        {
             QSignalBlocker block(m_bypassGradingCheckBox);
             m_bypassGradingCheckBox->setChecked(m_preview && m_preview->bypassGrading());
         }
-        if (m_timeline && m_exportStartSpin && m_exportEndSpin) {
+        if (m_timeline && m_exportStartSpin && m_exportEndSpin)
+        {
             const int totalFrames = static_cast<int>(qMin<int64_t>(m_timeline->totalFrames(), INT_MAX));
             QSignalBlocker block1(m_exportStartSpin);
             QSignalBlocker block2(m_exportEndSpin);
@@ -5775,7 +4537,7 @@ private:
             m_exportEndSpin->setValue(static_cast<int>(qMin<int64_t>(m_timeline->exportEndFrame(), totalFrames)));
         }
 
-        const TimelineClip* clip = m_timeline ? m_timeline->selectedClip() : nullptr;
+        const TimelineClip *clip = m_timeline ? m_timeline->selectedClip() : nullptr;
         const bool enabled = clip != nullptr && clipHasVisuals(*clip);
         m_brightnessSpin->setEnabled(enabled);
         m_contrastSpin->setEnabled(enabled);
@@ -5797,7 +4559,8 @@ private:
         m_syncTable->setEnabled(m_timeline != nullptr);
         refreshSyncInspector();
 
-        if (!clip) {
+        if (!clip)
+        {
             m_gradingClipLabel->setText(QStringLiteral("No clip selected"));
             m_gradingPathLabel->setText(QStringLiteral("Select a clip in the timeline to grade it live."));
             m_videoInspectorClipLabel->setText(QStringLiteral("Output"));
@@ -5819,7 +4582,8 @@ private:
             m_audioInspectorDetailsLabel->setText(QStringLiteral("Select an audio clip to inspect playback details."));
             m_transcriptInspectorClipLabel->setText(QStringLiteral("No transcript selected"));
             m_transcriptInspectorDetailsLabel->setText(QStringLiteral("Select a clip with a WhisperX JSON transcript."));
-            if (m_transcriptOverlayEnabledCheckBox) {
+            if (m_transcriptOverlayEnabledCheckBox)
+            {
                 QSignalBlocker block1(m_transcriptOverlayEnabledCheckBox);
                 QSignalBlocker block2(m_transcriptMaxLinesSpin);
                 QSignalBlocker block3(m_transcriptMaxCharsSpin);
@@ -5844,19 +4608,21 @@ private:
                 m_transcriptFontSizeSpin->setValue(42);
                 m_transcriptBoldCheckBox->setChecked(true);
                 m_transcriptItalicCheckBox->setChecked(false);
-                for (QWidget* widget : {static_cast<QWidget*>(m_transcriptOverlayEnabledCheckBox),
-                                        static_cast<QWidget*>(m_transcriptMaxLinesSpin),
-                                        static_cast<QWidget*>(m_transcriptMaxCharsSpin),
-                                        static_cast<QWidget*>(m_transcriptAutoScrollCheckBox),
-                                        static_cast<QWidget*>(m_transcriptOverlayXSpin),
-                                        static_cast<QWidget*>(m_transcriptOverlayYSpin),
-                                        static_cast<QWidget*>(m_transcriptOverlayWidthSpin),
-                                        static_cast<QWidget*>(m_transcriptOverlayHeightSpin),
-                                        static_cast<QWidget*>(m_transcriptFontFamilyCombo),
-                                        static_cast<QWidget*>(m_transcriptFontSizeSpin),
-                                        static_cast<QWidget*>(m_transcriptBoldCheckBox),
-                                        static_cast<QWidget*>(m_transcriptItalicCheckBox)}) {
-                    if (widget) {
+                for (QWidget *widget : {static_cast<QWidget *>(m_transcriptOverlayEnabledCheckBox),
+                                        static_cast<QWidget *>(m_transcriptMaxLinesSpin),
+                                        static_cast<QWidget *>(m_transcriptMaxCharsSpin),
+                                        static_cast<QWidget *>(m_transcriptAutoScrollCheckBox),
+                                        static_cast<QWidget *>(m_transcriptOverlayXSpin),
+                                        static_cast<QWidget *>(m_transcriptOverlayYSpin),
+                                        static_cast<QWidget *>(m_transcriptOverlayWidthSpin),
+                                        static_cast<QWidget *>(m_transcriptOverlayHeightSpin),
+                                        static_cast<QWidget *>(m_transcriptFontFamilyCombo),
+                                        static_cast<QWidget *>(m_transcriptFontSizeSpin),
+                                        static_cast<QWidget *>(m_transcriptBoldCheckBox),
+                                        static_cast<QWidget *>(m_transcriptItalicCheckBox)})
+                {
+                    if (widget)
+                    {
                         widget->setEnabled(false);
                     }
                 }
@@ -5924,7 +4690,8 @@ private:
         m_updatingVideoInspector = true;
         m_videoKeyframeTable->clearContents();
         m_videoKeyframeTable->setRowCount(0);
-        if (clip->transformKeyframes.isEmpty()) {
+        if (clip->transformKeyframes.isEmpty())
+        {
             m_keyframesInspectorDetailsLabel->setText(
                 QStringLiteral("Values: %1\nNo keyframes available for this clip.\nBase scale: %2 x %3")
                     .arg(showClipRelativeKeyframes() ? QStringLiteral("Clip-relative") : QStringLiteral("Project-relative"))
@@ -5932,19 +4699,25 @@ private:
                     .arg(clip->baseScaleY, 0, 'f', 3));
             m_selectedVideoKeyframeFrame = -1;
             m_selectedVideoKeyframeFrames.clear();
-        } else {
+        }
+        else
+        {
             const int nearestIndex = nearestVideoKeyframeIndex(*clip);
             QSet<int64_t> validSelectedFrames;
-            for (const TimelineClip::TransformKeyframe& keyframe : clip->transformKeyframes) {
-                if (m_selectedVideoKeyframeFrames.contains(keyframe.frame)) {
+            for (const TimelineClip::TransformKeyframe &keyframe : clip->transformKeyframes)
+            {
+                if (m_selectedVideoKeyframeFrames.contains(keyframe.frame))
+                {
                     validSelectedFrames.insert(keyframe.frame);
                 }
             }
             m_selectedVideoKeyframeFrames = validSelectedFrames;
-            if (selectedVideoKeyframeIndex(*clip) < 0 && nearestIndex >= 0) {
+            if (selectedVideoKeyframeIndex(*clip) < 0 && nearestIndex >= 0)
+            {
                 m_selectedVideoKeyframeFrame = clip->transformKeyframes[nearestIndex].frame;
             }
-            if (m_selectedVideoKeyframeFrame >= 0 && m_selectedVideoKeyframeFrames.isEmpty()) {
+            if (m_selectedVideoKeyframeFrame >= 0 && m_selectedVideoKeyframeFrames.isEmpty())
+            {
                 m_selectedVideoKeyframeFrames.insert(m_selectedVideoKeyframeFrame);
             }
             const int64_t localFrame =
@@ -5957,26 +4730,33 @@ private:
             QSet<int64_t> boundaryFrames;
             int lowerBoundaryIndex = -1;
             int upperBoundaryIndex = -1;
-            for (int i = 0; i < clip->transformKeyframes.size(); ++i) {
+            for (int i = 0; i < clip->transformKeyframes.size(); ++i)
+            {
                 const int64_t frame = clip->transformKeyframes[i].frame;
-                if (frame <= localFrame) {
+                if (frame <= localFrame)
+                {
                     lowerBoundaryIndex = i;
                 }
-                if (frame >= localFrame) {
+                if (frame >= localFrame)
+                {
                     upperBoundaryIndex = i;
                     break;
                 }
             }
-            if (lowerBoundaryIndex < 0 && !clip->transformKeyframes.isEmpty()) {
+            if (lowerBoundaryIndex < 0 && !clip->transformKeyframes.isEmpty())
+            {
                 lowerBoundaryIndex = 0;
             }
-            if (upperBoundaryIndex < 0 && !clip->transformKeyframes.isEmpty()) {
+            if (upperBoundaryIndex < 0 && !clip->transformKeyframes.isEmpty())
+            {
                 upperBoundaryIndex = clip->transformKeyframes.size() - 1;
             }
-            if (lowerBoundaryIndex >= 0) {
+            if (lowerBoundaryIndex >= 0)
+            {
                 boundaryFrames.insert(clip->transformKeyframes[lowerBoundaryIndex].frame);
             }
-            if (upperBoundaryIndex >= 0) {
+            if (upperBoundaryIndex >= 0)
+            {
                 boundaryFrames.insert(clip->transformKeyframes[upperBoundaryIndex].frame);
             }
             m_keyframesInspectorDetailsLabel->setText(
@@ -5988,7 +4768,8 @@ private:
                     .arg(clip->baseScaleX, 0, 'f', 3)
                     .arg(clip->baseScaleY, 0, 'f', 3));
             m_videoKeyframeTable->setRowCount(clip->transformKeyframes.size());
-            for (int i = 0; i < clip->transformKeyframes.size(); ++i) {
+            for (int i = 0; i < clip->transformKeyframes.size(); ++i)
+            {
                 const TimelineClip::TransformKeyframe displayedKeyframe =
                     keyframeForInspectorDisplay(*clip, clip->transformKeyframes[i]);
                 const int64_t displayedFrame =
@@ -6001,34 +4782,45 @@ private:
                     QString::number(displayedKeyframe.rotation, 'f', 1),
                     QString::number(displayedKeyframe.scaleX, 'f', 3),
                     QString::number(displayedKeyframe.scaleY, 'f', 3),
-                    displayedKeyframe.interpolated ? QStringLiteral("Interpolated") : QStringLiteral("Sudden")
-                };
-                for (int column = 0; column < values.size(); ++column) {
-                    auto* item = new QTableWidgetItem(values[column]);
+                    displayedKeyframe.interpolated ? QStringLiteral("Interpolated") : QStringLiteral("Sudden")};
+                for (int column = 0; column < values.size(); ++column)
+                {
+                    auto *item = new QTableWidgetItem(values[column]);
                     item->setData(Qt::UserRole, QVariant::fromValue(static_cast<qint64>(clip->transformKeyframes[i].frame)));
-                    if (column == 0 && clip->transformKeyframes[i].frame == 0) {
+                    if (column == 0 && clip->transformKeyframes[i].frame == 0)
+                    {
                         item->setFlags(item->flags() & ~Qt::ItemIsEditable);
                         item->setToolTip(QStringLiteral("The first keyframe is fixed at frame 0."));
                     }
-                    if (column == 6) {
+                    if (column == 6)
+                    {
                         item->setToolTip(QStringLiteral("Use Interpolated or Sudden"));
                     }
-                    if (boundaryFrames.contains(clip->transformKeyframes[i].frame)) {
+                    if (boundaryFrames.contains(clip->transformKeyframes[i].frame))
+                    {
                         item->setBackground(QColor(QStringLiteral("#d97a1f")));
                         item->setForeground(QColor(QStringLiteral("#ffffff")));
-                    } else if (nearest) {
+                    }
+                    else if (nearest)
+                    {
                         item->setBackground(QColor(QStringLiteral("#2a3948")));
                         item->setForeground(QColor(QStringLiteral("#ffffff")));
                     }
                     m_videoKeyframeTable->setItem(i, column, item);
                 }
-                if (boundaryFrames.contains(clip->transformKeyframes[i].frame) || nearest) {
-                    for (int column = 0; column < m_videoKeyframeTable->columnCount(); ++column) {
-                        if (QTableWidgetItem* item = m_videoKeyframeTable->item(i, column)) {
-                            if (boundaryFrames.contains(clip->transformKeyframes[i].frame)) {
+                if (boundaryFrames.contains(clip->transformKeyframes[i].frame) || nearest)
+                {
+                    for (int column = 0; column < m_videoKeyframeTable->columnCount(); ++column)
+                    {
+                        if (QTableWidgetItem *item = m_videoKeyframeTable->item(i, column))
+                        {
+                            if (boundaryFrames.contains(clip->transformKeyframes[i].frame))
+                            {
                                 item->setBackground(QColor(QStringLiteral("#d97a1f")));
                                 item->setForeground(QColor(QStringLiteral("#ffffff")));
-                            } else {
+                            }
+                            else
+                            {
                                 item->setBackground(QColor(QStringLiteral("#2a3948")));
                                 item->setForeground(QColor(QStringLiteral("#ffffff")));
                             }
@@ -6038,16 +4830,20 @@ private:
             }
         }
         int selectedRow = -1;
-        for (int i = 0; i < m_videoKeyframeTable->rowCount(); ++i) {
-            QTableWidgetItem* item = m_videoKeyframeTable->item(i, 0);
-            if (item && item->data(Qt::UserRole).toLongLong() == m_selectedVideoKeyframeFrame) {
+        for (int i = 0; i < m_videoKeyframeTable->rowCount(); ++i)
+        {
+            QTableWidgetItem *item = m_videoKeyframeTable->item(i, 0);
+            if (item && item->data(Qt::UserRole).toLongLong() == m_selectedVideoKeyframeFrame)
+            {
                 selectedRow = i;
             }
-            if (item && m_selectedVideoKeyframeFrames.contains(item->data(Qt::UserRole).toLongLong())) {
+            if (item && m_selectedVideoKeyframeFrames.contains(item->data(Qt::UserRole).toLongLong()))
+            {
                 m_videoKeyframeTable->selectRow(i);
             }
         }
-        if (selectedRow >= 0) {
+        if (selectedRow >= 0)
+        {
             m_videoKeyframeTable->setCurrentCell(selectedRow, 0);
         }
         const int keyframeIndex = selectedVideoKeyframeIndex(*clip);
@@ -6061,7 +4857,8 @@ private:
             QSignalBlocker videoBlock6(m_videoInterpolationCombo);
             QSignalBlocker videoBlock7(m_mirrorHorizontalCheckBox);
             QSignalBlocker videoBlock8(m_mirrorVerticalCheckBox);
-            if (keyframeIndex >= 0) {
+            if (keyframeIndex >= 0)
+            {
                 const TimelineClip::TransformKeyframe displayedKeyframe =
                     keyframeForInspectorDisplay(*clip, clip->transformKeyframes[keyframeIndex]);
                 m_videoTranslationXSpin->setValue(displayedKeyframe.translationX);
@@ -6072,7 +4869,9 @@ private:
                 m_mirrorHorizontalCheckBox->setChecked(displayedKeyframe.scaleX < 0.0);
                 m_mirrorVerticalCheckBox->setChecked(displayedKeyframe.scaleY < 0.0);
                 m_videoInterpolationCombo->setCurrentIndex(displayedKeyframe.interpolated ? 0 : 1);
-            } else {
+            }
+            else
+            {
                 m_videoTranslationXSpin->setValue(0.0);
                 m_videoTranslationYSpin->setValue(0.0);
                 m_videoRotationSpin->setValue(0.0);
@@ -6093,34 +4892,45 @@ private:
         m_transcriptTable->setRowCount(0);
         m_loadedTranscriptDoc = QJsonDocument();
         m_loadedTranscriptPath.clear();
-        if (!transcriptInfo.exists() || !transcriptInfo.isFile()) {
+        if (!transcriptInfo.exists() || !transcriptInfo.isFile())
+        {
             m_transcriptInspectorDetailsLabel->setText(
                 QStringLiteral("No transcript JSON found.\nExpected: %1")
                     .arg(QDir::toNativeSeparators(transcriptPath)));
-        } else {
+        }
+        else
+        {
             QFile transcriptFile(transcriptPath);
-            if (!transcriptFile.open(QIODevice::ReadOnly)) {
+            if (!transcriptFile.open(QIODevice::ReadOnly))
+            {
                 m_transcriptInspectorDetailsLabel->setText(
                     QStringLiteral("Could not open transcript JSON:\n%1")
                         .arg(QDir::toNativeSeparators(transcriptPath)));
-            } else {
+            }
+            else
+            {
                 QJsonParseError parseError;
                 const QJsonDocument transcriptDoc =
                     QJsonDocument::fromJson(transcriptFile.readAll(), &parseError);
-                if (parseError.error != QJsonParseError::NoError || !transcriptDoc.isObject()) {
+                if (parseError.error != QJsonParseError::NoError || !transcriptDoc.isObject())
+                {
                     m_transcriptInspectorDetailsLabel->setText(
                         QStringLiteral("Invalid transcript JSON:\n%1")
                             .arg(parseError.errorString()));
-                } else {
+                }
+                else
+                {
                     m_loadedTranscriptDoc = transcriptDoc;
                     m_loadedTranscriptPath = transcriptPath;
                     const QJsonArray segments = transcriptDoc.object().value(QStringLiteral("segments")).toArray();
                     int row = 0;
                     const double prependSeconds = m_transcriptPrependMs / 1000.0;
-                    for (int segmentIndex = 0; segmentIndex < segments.size(); ++segmentIndex) {
+                    for (int segmentIndex = 0; segmentIndex < segments.size(); ++segmentIndex)
+                    {
                         const QJsonObject segmentObj = segments[segmentIndex].toObject();
                         const QJsonArray words = segmentObj.value(QStringLiteral("words")).toArray();
-                        for (int wordIndex = 0; wordIndex < words.size(); ++wordIndex) {
+                        for (int wordIndex = 0; wordIndex < words.size(); ++wordIndex)
+                        {
                             const QJsonObject wordObj = words[wordIndex].toObject();
                             m_transcriptTable->insertRow(row);
                             // Ground truth times
@@ -6128,9 +4938,9 @@ private:
                             const double gtEnd = wordObj.value(QStringLiteral("end")).toDouble();
                             // Display times with runtime offset applied
                             const double displayStart = qMax(0.0, gtStart + prependSeconds);
-                            auto* startItem = new QTableWidgetItem(secondsToTranscriptTime(displayStart));
-                            auto* endItem = new QTableWidgetItem(secondsToTranscriptTime(gtEnd));
-                            auto* textItem = new QTableWidgetItem(wordObj.value(QStringLiteral("word")).toString());
+                            auto *startItem = new QTableWidgetItem(secondsToTranscriptTime(displayStart));
+                            auto *endItem = new QTableWidgetItem(secondsToTranscriptTime(gtEnd));
+                            auto *textItem = new QTableWidgetItem(wordObj.value(QStringLiteral("word")).toString());
                             // Use display-adjusted frame for playhead sync
                             const int64_t startFrame = qMax<int64_t>(
                                 0, static_cast<int64_t>(std::floor(displayStart * kTimelineFps)));
@@ -6166,23 +4976,26 @@ private:
         m_updatingTranscriptInspector = false;
         const bool transcriptOverlayAvailable =
             clip->mediaType == ClipMediaType::Audio && !m_loadedTranscriptPath.isEmpty();
-        for (QWidget* widget : {static_cast<QWidget*>(m_transcriptOverlayEnabledCheckBox),
-                                static_cast<QWidget*>(m_transcriptMaxLinesSpin),
-                                static_cast<QWidget*>(m_transcriptMaxCharsSpin),
-                                static_cast<QWidget*>(m_transcriptAutoScrollCheckBox),
-                                static_cast<QWidget*>(m_transcriptOverlayXSpin),
-                                static_cast<QWidget*>(m_transcriptOverlayYSpin),
-                                static_cast<QWidget*>(m_transcriptOverlayWidthSpin),
-                                static_cast<QWidget*>(m_transcriptOverlayHeightSpin),
-                                static_cast<QWidget*>(m_transcriptFontFamilyCombo),
-                                static_cast<QWidget*>(m_transcriptFontSizeSpin),
-                                static_cast<QWidget*>(m_transcriptBoldCheckBox),
-                                static_cast<QWidget*>(m_transcriptItalicCheckBox)}) {
-            if (widget) {
+        for (QWidget *widget : {static_cast<QWidget *>(m_transcriptOverlayEnabledCheckBox),
+                                static_cast<QWidget *>(m_transcriptMaxLinesSpin),
+                                static_cast<QWidget *>(m_transcriptMaxCharsSpin),
+                                static_cast<QWidget *>(m_transcriptAutoScrollCheckBox),
+                                static_cast<QWidget *>(m_transcriptOverlayXSpin),
+                                static_cast<QWidget *>(m_transcriptOverlayYSpin),
+                                static_cast<QWidget *>(m_transcriptOverlayWidthSpin),
+                                static_cast<QWidget *>(m_transcriptOverlayHeightSpin),
+                                static_cast<QWidget *>(m_transcriptFontFamilyCombo),
+                                static_cast<QWidget *>(m_transcriptFontSizeSpin),
+                                static_cast<QWidget *>(m_transcriptBoldCheckBox),
+                                static_cast<QWidget *>(m_transcriptItalicCheckBox)})
+        {
+            if (widget)
+            {
                 widget->setEnabled(transcriptOverlayAvailable);
             }
         }
-        if (transcriptOverlayAvailable) {
+        if (transcriptOverlayAvailable)
+        {
             QSignalBlocker block1(m_transcriptOverlayEnabledCheckBox);
             QSignalBlocker block2(m_transcriptMaxLinesSpin);
             QSignalBlocker block3(m_transcriptMaxCharsSpin);
@@ -6215,14 +5028,18 @@ private:
                     .arg(clip->transcriptOverlay.maxCharsPerLine));
         }
         syncTranscriptTableToPlayhead();
-        if (clipHasVisuals(*clip)) {
+        if (clipHasVisuals(*clip))
+        {
             m_gradingPathLabel->setText(QDir::toNativeSeparators(clip->filePath));
-        } else {
+        }
+        else
+        {
             m_gradingPathLabel->setText(QStringLiteral("Audio clips do not use visual grading controls."));
         }
         const bool isAudioClip = clipIsAudioOnly(*clip);
         m_audioFadeSamplesSpin->setEnabled(isAudioClip);
-        if (isAudioClip) {
+        if (isAudioClip)
+        {
             m_audioInspectorClipLabel->setText(QStringLiteral("Track %1  %2").arg(clip->trackIndex + 1).arg(clip->label));
             m_audioInspectorDetailsLabel->setText(
                 QStringLiteral("Path: %1\nDuration: %2\nTransport volume: %3%%\nMuted: %4\nFade: %5 samples")
@@ -6234,7 +5051,9 @@ private:
             m_updatingAudioInspector = true;
             m_audioFadeSamplesSpin->setValue(clip->fadeSamples);
             m_updatingAudioInspector = false;
-        } else {
+        }
+        else
+        {
             m_audioInspectorClipLabel->setText(QStringLiteral("No audio clip selected"));
             m_audioInspectorDetailsLabel->setText(QStringLiteral("Select an audio clip to inspect playback details."));
         }
@@ -6250,7 +5069,8 @@ private:
         }
     }
 
-    QJsonObject profilingSnapshot() const {
+    QJsonObject profilingSnapshot() const
+    {
         const qint64 now = nowMs();
         QJsonObject snapshot{
             {QStringLiteral("playback_active"), m_playbackTimer.isActive()},
@@ -6261,97 +5081,99 @@ private:
             {QStringLiteral("main_thread_heartbeat_ms"), m_lastMainThreadHeartbeatMs.load()},
             {QStringLiteral("last_playhead_advance_ms"), m_lastPlayheadAdvanceMs.load()},
             {QStringLiteral("main_thread_heartbeat_age_ms"), m_lastMainThreadHeartbeatMs.load() > 0 ? now - m_lastMainThreadHeartbeatMs.load() : -1},
-            {QStringLiteral("last_playhead_advance_age_ms"), m_lastPlayheadAdvanceMs.load() > 0 ? now - m_lastPlayheadAdvanceMs.load() : -1}
-        };
+            {QStringLiteral("last_playhead_advance_age_ms"), m_lastPlayheadAdvanceMs.load() > 0 ? now - m_lastPlayheadAdvanceMs.load() : -1}};
 
-        if (m_preview) {
+        if (m_preview)
+        {
             snapshot[QStringLiteral("preview")] = m_preview->profilingSnapshot();
         }
 
         return snapshot;
     }
-    
-    QFileSystemModel* m_fsModel = nullptr;
-    QTreeView* m_tree = nullptr;
-    QStackedWidget* m_explorerStack = nullptr;
-    QListWidget* m_galleryList = nullptr;
-    QLabel* m_explorerHoverPreview = nullptr;
-    QPushButton* m_folderPickerButton = nullptr;
-    QToolButton* m_refreshExplorerButton = nullptr;
-    QToolButton* m_galleryBackButton = nullptr;
-    QToolButton* m_newProjectButton = nullptr;
-    QToolButton* m_saveProjectAsButton = nullptr;
-    QLabel* m_rootPathLabel = nullptr;
-    QLabel* m_galleryTitleLabel = nullptr;
-    QLabel* m_projectSectionLabel = nullptr;
-    QListWidget* m_projectsList = nullptr;
-    PreviewWindow* m_preview = nullptr;
-    TimelineWidget* m_timeline = nullptr;
-    QPushButton* m_playButton = nullptr;
-    QSlider* m_seekSlider = nullptr;
-    QLabel* m_timecodeLabel = nullptr;
-    QToolButton* m_audioMuteButton = nullptr;
-    QSlider* m_audioVolumeSlider = nullptr;
-    QLabel* m_audioNowPlayingLabel = nullptr;
-    QLabel* m_statusBadge = nullptr;
-    QLabel* m_previewInfo = nullptr;
-    QTabWidget* m_inspectorTabs = nullptr;
-    QLabel* m_gradingClipLabel = nullptr;
-    QLabel* m_gradingPathLabel = nullptr;
-    QLabel* m_videoInspectorClipLabel = nullptr;
-    QLabel* m_videoInspectorDetailsLabel = nullptr;
-    QLabel* m_keyframesInspectorClipLabel = nullptr;
-    QLabel* m_keyframesInspectorDetailsLabel = nullptr;
-    QLabel* m_audioInspectorClipLabel = nullptr;
-    QLabel* m_audioInspectorDetailsLabel = nullptr;
-    QSpinBox* m_audioFadeSamplesSpin = nullptr;
+
+    QFileSystemModel *m_fsModel = nullptr;
+    QTreeView *m_tree = nullptr;
+    QStackedWidget *m_explorerStack = nullptr;
+    QListWidget *m_galleryList = nullptr;
+    QLabel *m_explorerHoverPreview = nullptr;
+    QPushButton *m_folderPickerButton = nullptr;
+    QToolButton *m_refreshExplorerButton = nullptr;
+    QToolButton *m_galleryBackButton = nullptr;
+    QToolButton *m_newProjectButton = nullptr;
+    QToolButton *m_saveProjectAsButton = nullptr;
+    QLabel *m_rootPathLabel = nullptr;
+    QLabel *m_galleryTitleLabel = nullptr;
+    QLabel *m_projectSectionLabel = nullptr;
+    QListWidget *m_projectsList = nullptr;
+    PreviewWindow *m_preview = nullptr;
+    TimelineWidget *m_timeline = nullptr;
+    QPushButton *m_playButton = nullptr;
+    QSlider *m_seekSlider = nullptr;
+    QLabel *m_timecodeLabel = nullptr;
+    QToolButton *m_audioMuteButton = nullptr;
+    QSlider *m_audioVolumeSlider = nullptr;
+    QLabel *m_audioNowPlayingLabel = nullptr;
+    QLabel *m_statusBadge = nullptr;
+    QLabel *m_previewInfo = nullptr;
+    QTabWidget *m_inspectorTabs = nullptr;
+    QLabel *m_gradingClipLabel = nullptr;
+    QLabel *m_gradingPathLabel = nullptr;
+    QLabel *m_videoInspectorClipLabel = nullptr;
+    QLabel *m_videoInspectorDetailsLabel = nullptr;
+    QLabel *m_keyframesInspectorClipLabel = nullptr;
+    QLabel *m_keyframesInspectorDetailsLabel = nullptr;
+    QLabel *m_audioInspectorClipLabel = nullptr;
+    QLabel *m_audioInspectorDetailsLabel = nullptr;
+    QSpinBox *m_audioFadeSamplesSpin = nullptr;
     bool m_updatingAudioInspector = false;
-    QLabel* m_transcriptInspectorClipLabel = nullptr;
-    QLabel* m_transcriptInspectorDetailsLabel = nullptr;
-    QLabel* m_syncInspectorClipLabel = nullptr;
-    QLabel* m_syncInspectorDetailsLabel = nullptr;
-    QDoubleSpinBox* m_brightnessSpin = nullptr;
-    QDoubleSpinBox* m_contrastSpin = nullptr;
-    QDoubleSpinBox* m_saturationSpin = nullptr;
-    QDoubleSpinBox* m_opacitySpin = nullptr;
-    QCheckBox* m_bypassGradingCheckBox = nullptr;
-    QSpinBox* m_outputWidthSpin = nullptr;
-    QSpinBox* m_outputHeightSpin = nullptr;
-    QSpinBox* m_exportStartSpin = nullptr;
-    QSpinBox* m_exportEndSpin = nullptr;
-    QComboBox* m_outputFormatCombo = nullptr;
-    QCheckBox* m_exportOnlyTranscriptWordsCheckBox = nullptr;
-    QDoubleSpinBox* m_videoTranslationXSpin = nullptr;
-    QDoubleSpinBox* m_videoTranslationYSpin = nullptr;
-    QDoubleSpinBox* m_videoRotationSpin = nullptr;
-    QDoubleSpinBox* m_videoScaleXSpin = nullptr;
-    QDoubleSpinBox* m_videoScaleYSpin = nullptr;
-    QComboBox* m_videoInterpolationCombo = nullptr;
-    QCheckBox* m_mirrorHorizontalCheckBox = nullptr;
-    QCheckBox* m_mirrorVerticalCheckBox = nullptr;
-    QCheckBox* m_lockVideoScaleCheckBox = nullptr;
-    QCheckBox* m_keyframeSpaceCheckBox = nullptr;
-    QCheckBox* m_transcriptOverlayEnabledCheckBox = nullptr;
-    QSpinBox* m_transcriptMaxLinesSpin = nullptr;
-    QSpinBox* m_transcriptMaxCharsSpin = nullptr;
-    QCheckBox* m_transcriptAutoScrollCheckBox = nullptr;
-    QCheckBox* m_transcriptFollowCurrentWordCheckBox = nullptr;
-    QSpinBox* m_transcriptPrependMsSpin = nullptr;
+    QLabel *m_transcriptInspectorClipLabel = nullptr;
+    QLabel *m_transcriptInspectorDetailsLabel = nullptr;
+    QLabel *m_syncInspectorClipLabel = nullptr;
+    QLabel *m_syncInspectorDetailsLabel = nullptr;
+    QDoubleSpinBox *m_brightnessSpin = nullptr;
+    QDoubleSpinBox *m_contrastSpin = nullptr;
+    QDoubleSpinBox *m_saturationSpin = nullptr;
+    QDoubleSpinBox *m_opacitySpin = nullptr;
+    QCheckBox *m_bypassGradingCheckBox = nullptr;
+    QSpinBox *m_outputWidthSpin = nullptr;
+    QSpinBox *m_outputHeightSpin = nullptr;
+    QSpinBox *m_exportStartSpin = nullptr;
+    QSpinBox *m_exportEndSpin = nullptr;
+    QComboBox *m_outputFormatCombo = nullptr;
+    QCheckBox *m_exportOnlyTranscriptWordsCheckBox = nullptr;
+    QDoubleSpinBox *m_videoTranslationXSpin = nullptr;
+    QDoubleSpinBox *m_videoTranslationYSpin = nullptr;
+    QDoubleSpinBox *m_videoRotationSpin = nullptr;
+    QDoubleSpinBox *m_videoScaleXSpin = nullptr;
+    QDoubleSpinBox *m_videoScaleYSpin = nullptr;
+    QComboBox *m_videoInterpolationCombo = nullptr;
+    QCheckBox *m_mirrorHorizontalCheckBox = nullptr;
+    QCheckBox *m_mirrorVerticalCheckBox = nullptr;
+    QCheckBox *m_lockVideoScaleCheckBox = nullptr;
+    QCheckBox *m_keyframeSpaceCheckBox = nullptr;
+    QCheckBox *m_transcriptOverlayEnabledCheckBox = nullptr;
+    QSpinBox *m_transcriptMaxLinesSpin = nullptr;
+    QSpinBox *m_transcriptMaxCharsSpin = nullptr;
+    QCheckBox *m_transcriptAutoScrollCheckBox = nullptr;
+    QCheckBox *m_transcriptFollowCurrentWordCheckBox = nullptr;
+    QSpinBox *m_transcriptPrependMsSpin = nullptr;
+    QSpinBox *m_transcriptPostpendMsSpin = nullptr;
     int m_transcriptPrependMs = 0;  // Runtime offset (not persisted)
-    QDoubleSpinBox* m_transcriptOverlayXSpin = nullptr;
-    QDoubleSpinBox* m_transcriptOverlayYSpin = nullptr;
-    QSpinBox* m_transcriptOverlayWidthSpin = nullptr;
-    QSpinBox* m_transcriptOverlayHeightSpin = nullptr;
-    QFontComboBox* m_transcriptFontFamilyCombo = nullptr;
-    QSpinBox* m_transcriptFontSizeSpin = nullptr;
-    QCheckBox* m_transcriptBoldCheckBox = nullptr;
-    QCheckBox* m_transcriptItalicCheckBox = nullptr;
-    QTableWidget* m_videoKeyframeTable = nullptr;
-    QTableWidget* m_transcriptTable = nullptr;
-    QTableWidget* m_syncTable = nullptr;
-    QPushButton* m_addVideoKeyframeButton = nullptr;
-    QPushButton* m_removeVideoKeyframeButton = nullptr;
-    QPushButton* m_renderButton = nullptr;
+    int m_transcriptPostpendMs = 0; // Runtime offset for end times (not persisted)
+    QDoubleSpinBox *m_transcriptOverlayXSpin = nullptr;
+    QDoubleSpinBox *m_transcriptOverlayYSpin = nullptr;
+    QSpinBox *m_transcriptOverlayWidthSpin = nullptr;
+    QSpinBox *m_transcriptOverlayHeightSpin = nullptr;
+    QFontComboBox *m_transcriptFontFamilyCombo = nullptr;
+    QSpinBox *m_transcriptFontSizeSpin = nullptr;
+    QCheckBox *m_transcriptBoldCheckBox = nullptr;
+    QCheckBox *m_transcriptItalicCheckBox = nullptr;
+    QTableWidget *m_videoKeyframeTable = nullptr;
+    QTableWidget *m_transcriptTable = nullptr;
+    QTableWidget *m_syncTable = nullptr;
+    QPushButton *m_addVideoKeyframeButton = nullptr;
+    QPushButton *m_removeVideoKeyframeButton = nullptr;
+    QPushButton *m_renderButton = nullptr;
     std::unique_ptr<ControlServer> m_controlServer;
     std::unique_ptr<AudioEngine> m_audioEngine;
     QTimer m_playbackTimer;
@@ -6387,15 +5209,16 @@ private:
 // ============================================================================
 // Main Entry Point
 // ============================================================================
-int main(int argc, char** argv) {
+int main(int argc, char **argv)
+{
     QElapsedTimer startupTimer;
     startupTimer.start();
-    
+
     qDebug() << "[STARTUP] main() started";
     QApplication app(argc, argv);
     qDebug() << "[STARTUP] QApplication created in" << startupTimer.elapsed() << "ms";
     QApplication::setApplicationName(QStringLiteral("QRhi Editor Professional"));
-    
+
     // Register metatypes
     qRegisterMetaType<editor::FrameHandle>();
 
@@ -6403,13 +5226,14 @@ int main(int argc, char** argv) {
     quint16 controlPort = kDefaultControlPort;
     bool ok = false;
     const uint envControlPort = qEnvironmentVariableIntValue("EDITOR_CONTROL_PORT", &ok);
-    if (ok && envControlPort <= std::numeric_limits<quint16>::max()) {
+    if (ok && envControlPort <= std::numeric_limits<quint16>::max())
+    {
         controlPort = static_cast<quint16>(envControlPort);
     }
 
     EditorWindow window(controlPort);
     window.show();
-    
+
     return app.exec();
 }
 
