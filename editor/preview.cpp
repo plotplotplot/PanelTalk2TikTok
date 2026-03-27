@@ -400,7 +400,9 @@ void PreviewWindow::setCurrentPlaybackSample(int64_t samplePosition) {
     if (m_playbackPipeline) {
         m_playbackPipeline->setPlayheadFrame(displayFrame);
     }
-    if (isVisible()) {
+    if (m_bulkUpdateDepth > 0) {
+        m_pendingFrameRequest = true;
+    } else if (isVisible()) {
         requestFramesForCurrentPosition();
     }
     scheduleRepaint();
@@ -454,7 +456,11 @@ void PreviewWindow::setTimelineClips(const QVector<TimelineClip>& clips) {
     }
     m_registeredClips = registeredIds;
     
-    requestFramesForCurrentPosition();
+    if (m_bulkUpdateDepth > 0) {
+        m_pendingFrameRequest = true;
+    } else {
+        requestFramesForCurrentPosition();
+    }
     scheduleRepaint();
 }
 
@@ -466,8 +472,31 @@ void PreviewWindow::setRenderSyncMarkers(const QVector<RenderSyncMarker>& marker
     if (m_playbackPipeline) {
         m_playbackPipeline->setRenderSyncMarkers(markers);
     }
-    requestFramesForCurrentPosition();
+    if (m_bulkUpdateDepth > 0) {
+        m_pendingFrameRequest = true;
+    } else {
+        requestFramesForCurrentPosition();
+    }
     scheduleRepaint();
+}
+
+void PreviewWindow::beginBulkUpdate() {
+    ++m_bulkUpdateDepth;
+}
+
+void PreviewWindow::endBulkUpdate() {
+    if (m_bulkUpdateDepth <= 0) {
+        m_bulkUpdateDepth = 0;
+        return;
+    }
+    --m_bulkUpdateDepth;
+    if (m_bulkUpdateDepth == 0 && m_pendingFrameRequest) {
+        m_pendingFrameRequest = false;
+        if (isVisible()) {
+            requestFramesForCurrentPosition();
+        }
+        scheduleRepaint();
+    }
 }
 
 void PreviewWindow::setExportRanges(const QVector<ExportRangeSegment>& ranges) {
@@ -990,7 +1019,7 @@ const QVector<TranscriptSection>& PreviewWindow::transcriptSectionsForClip(const
     const QString key = clip.filePath;
     auto it = m_transcriptSectionsCache.find(key);
     if (it == m_transcriptSectionsCache.end()) {
-        it = m_transcriptSectionsCache.insert(key, loadTranscriptSections(transcriptPathForClipFile(clip.filePath)));
+        it = m_transcriptSectionsCache.insert(key, loadTranscriptSections(transcriptWorkingPathForClipFile(clip.filePath)));
     }
     return it.value();
 }
@@ -1533,9 +1562,16 @@ void PreviewWindow::requestFramesForCurrentPosition() {
             m_playing &&
             m_playbackPipeline &&
             clip->mediaType != ClipMediaType::Image;
+        const bool usePlaybackBuffer =
+            m_playing &&
+            !usePlaybackPipeline &&
+            m_cache;
         const bool cached = usePlaybackPipeline
                                 ? m_playbackPipeline->isFrameBuffered(clip->id, localFrame)
-                                : m_cache->isFrameCached(clip->id, localFrame);
+                                : (usePlaybackBuffer
+                                       ? (m_cache->isPlaybackFrameBuffered(clip->id, localFrame) ||
+                                          m_cache->isFrameCached(clip->id, localFrame))
+                                       : m_cache->isFrameCached(clip->id, localFrame));
         playbackTrace(QStringLiteral("PreviewWindow::visible-request"),
                       QStringLiteral("clip=%1 localFrame=%2 cached=%3")
                           .arg(clip->id)
@@ -1621,13 +1657,21 @@ void PreviewWindow::drawCompositedPreview(QPainter* painter, const QRect& safeRe
             m_playing &&
             m_playbackPipeline &&
             clip.mediaType != ClipMediaType::Image;
+        const bool usePlaybackBuffer =
+            m_playing &&
+            !usePlaybackPipeline &&
+            m_cache;
         const FrameHandle exactFrame = usePlaybackPipeline
                                            ? m_playbackPipeline->getFrame(clip.id, localFrame)
-                                           : (m_cache ? m_cache->getCachedFrame(clip.id, localFrame) : FrameHandle());
+                                           : (usePlaybackBuffer
+                                                  ? m_cache->getPlaybackFrame(clip.id, localFrame)
+                                                  : (m_cache ? m_cache->getCachedFrame(clip.id, localFrame) : FrameHandle()));
         const FrameHandle frame = usePlaybackPipeline
                                       ? m_playbackPipeline->getPresentationFrame(clip.id, localFrame)
                                       : (exactFrame.isNull() && m_cache
-                                             ? m_cache->getBestCachedFrame(clip.id, localFrame)
+                                             ? (usePlaybackBuffer
+                                                    ? m_cache->getBestPlaybackFrame(clip.id, localFrame)
+                                                    : m_cache->getBestCachedFrame(clip.id, localFrame))
                                              : exactFrame);
         playbackFrameSelectionTrace(QStringLiteral("PreviewWindow::drawCompositedPreview.select"),
                                     clip,

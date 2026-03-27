@@ -421,10 +421,13 @@ void TimelineCache::registerClip(const TimelineClip& clip) {
     
     ClipInfo info;
     info.clip = clip;
-    info.isSingleFrame = isSingleFramePath(clip.filePath);
+    info.decodePath = interactivePreviewMediaPathForClip(clip);
+    info.isSingleFrame = isSingleFramePath(info.decodePath.isEmpty() ? clip.filePath : info.decodePath);
     
     m_clips[clip.id] = info;
-    m_caches[clip.id] = new ClipCache(clip.filePath, clip.durationFrames, m_budget);
+    m_caches[clip.id] = new ClipCache(info.decodePath.isEmpty() ? clip.filePath : info.decodePath,
+                                      clip.durationFrames,
+                                      m_budget);
     m_playbackBuffers[clip.id] = new PlaybackBuffer();
 }
 
@@ -516,6 +519,10 @@ void TimelineCache::requestFrame(const QString& clipId, int64_t frameNumber,
     const ClipInfo info = it.value();
     lock.unlock();
     const int64_t canonicalFrame = normalizeFrameNumber(info, normalizedFrame);
+    if (info.decodePath.isEmpty()) {
+        callback(FrameHandle());
+        return;
+    }
     const QString key = requestKey(clipId, canonicalFrame);
 
     {
@@ -543,7 +550,7 @@ void TimelineCache::requestFrame(const QString& clipId, int64_t frameNumber,
     if (m_decoder) {
         if (m_state.load() == PlaybackState::Playing && !info.isSingleFrame) {
             const int64_t keepFromFrame = qMax<int64_t>(0, canonicalFrame - kVisibleDecodeKeepWindow);
-            m_decoder->cancelForFileBefore(info.clip.filePath, keepFromFrame);
+            m_decoder->cancelForFileBefore(info.decodePath, keepFromFrame);
         }
 
         int priority = calculatePriority(canonicalFrame);
@@ -556,7 +563,7 @@ void TimelineCache::requestFrame(const QString& clipId, int64_t frameNumber,
                        .arg(canonicalFrame)
                        .arg(priority));
         
-        const uint64_t seqId = m_decoder->requestFrame(info.clip.filePath, canonicalFrame, priority, 10000,
+        const uint64_t seqId = m_decoder->requestFrame(info.decodePath, canonicalFrame, priority, 10000,
             DecodeRequestKind::Visible,
             [self, aliveToken, clipId, canonicalFrame, requestedAt, key](FrameHandle frame) {
                 if (!aliveToken->load() || !self) {
@@ -827,7 +834,10 @@ void TimelineCache::preloadRange(const QString& clipId, int64_t startFrame, int6
         const int64_t normalizedFrame = normalizeFrameNumber(info, f);
         if (isFrameCached(clipId, normalizedFrame)) continue;
         
-        m_decoder->requestFrame(info.clip.filePath, normalizedFrame, 5, 30000,
+        if (info.decodePath.isEmpty()) {
+            continue;
+        }
+        m_decoder->requestFrame(info.decodePath, normalizedFrame, 5, 30000,
             DecodeRequestKind::Preload,
             [this, clipId, normalizedFrame](FrameHandle frame) {
                 QMetaObject::invokeMethod(this, [this, clipId, normalizedFrame, frame]() {
@@ -868,7 +878,7 @@ void TimelineCache::onFrameDecoded(FrameHandle frame) {
         QMutexLocker lock(&m_clipsMutex);
         for (auto it = m_clips.cbegin(); it != m_clips.cend(); ++it) {
             const ClipInfo& info = it.value();
-            if (info.isSingleFrame || info.clip.filePath != sourcePath) {
+            if (info.isSingleFrame || info.decodePath != sourcePath) {
                 continue;
             }
             targets.push_back(qMakePair(it.key(), normalizeFrameNumber(info, frame.frameNumber())));
@@ -1026,7 +1036,10 @@ void TimelineCache::scheduleImmediateLeadPrefetch(const ClipInfo& info, int64_t 
                        .arg(targetFrame)
                        .arg(priority));
 
-        m_decoder->requestFrame(info.clip.filePath, targetFrame, priority, 5000,
+        if (info.decodePath.isEmpty()) {
+            continue;
+        }
+        m_decoder->requestFrame(info.decodePath, targetFrame, priority, 5000,
             DecodeRequestKind::Prefetch,
             [self, aliveToken, clipId = info.clip.id, targetFrame, key](FrameHandle frame) {
                 if (!aliveToken->load() || !self) {
@@ -1188,7 +1201,10 @@ void TimelineCache::schedulePredictiveLoads() {
                            .arg(targetFrame)
                            .arg(priority));
 
-            m_decoder->requestFrame(info.clip.filePath, targetFrame, priority, 5000,
+            if (info.decodePath.isEmpty()) {
+                continue;
+            }
+            m_decoder->requestFrame(info.decodePath, targetFrame, priority, 5000,
                 DecodeRequestKind::Prefetch,
                 [self, aliveToken, id, targetFrame, key](FrameHandle frame) {
                     if (!aliveToken->load() || !self) {
@@ -1267,7 +1283,9 @@ ClipCache* TimelineCache::getOrCreateClipCache(const QString& clipId) {
     auto clipIt = m_clips.find(clipId);
     if (clipIt == m_clips.end()) return nullptr;
     
-    ClipCache* cache = new ClipCache(clipIt->clip.filePath, clipIt->clip.durationFrames, m_budget);
+    ClipCache* cache = new ClipCache(clipIt->decodePath.isEmpty() ? clipIt->clip.filePath : clipIt->decodePath,
+                                     clipIt->clip.durationFrames,
+                                     m_budget);
     m_caches[clipId] = cache;
     if (!m_playbackBuffers.contains(clipId)) {
         m_playbackBuffers[clipId] = new PlaybackBuffer();

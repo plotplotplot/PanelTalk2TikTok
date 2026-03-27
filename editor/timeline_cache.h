@@ -166,6 +166,7 @@ private slots:
 private:
     struct ClipInfo {
         TimelineClip clip;
+        QString decodePath;
         bool isSingleFrame = false;
     };
 

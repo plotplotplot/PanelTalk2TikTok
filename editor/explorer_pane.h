@@ -5,6 +5,8 @@
 #include <QString>
 #include <QStringList>
 #include <QPixmap>
+#include <QHash>
+#include <QPoint>
 
 class QFileSystemModel;
 class QTreeView;
@@ -70,4 +72,7 @@ private:
     PreviewWindow *m_preview = nullptr;
     QString m_currentRootPath;
     QString m_galleryFolderPath;
+    mutable QHash<QString, QPixmap> m_previewPixmapCache;
+    QPoint m_treeDragStartPos;
+    QPoint m_galleryDragStartPos;
 };

@@ -7,6 +7,7 @@
 #include <QApplication>
 #include <QDialog>
 #include <QDir>
+#include <QDrag>
 #include <QEvent>
 #include <QFile>
 #include <QFileDialog>
@@ -21,6 +22,8 @@
 #include <QListWidgetItem>
 #include <QMessageBox>
 #include <QMouseEvent>
+#include <QMimeData>
+#include <QPainter>
 #include <QPlainTextEdit>
 #include <QProcess>
 #include <QPushButton>
@@ -28,13 +31,61 @@
 #include <QTextCursor>
 #include <QToolButton>
 #include <QTreeView>
+#include <QUrl>
 #include <QVBoxLayout>
 
 extern "C"
 {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/frame.h>
 #include <libswscale/swscale.h>
+}
+
+namespace {
+QIcon sequenceFolderIcon(const QSize& size = QSize(48, 48))
+{
+    QPixmap pixmap(size);
+    pixmap.fill(Qt::transparent);
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    const QRect bodyRect(4, 10, size.width() - 8, size.height() - 14);
+    const QRect tabRect(8, 5, size.width() / 2, 10);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(QStringLiteral("#314968")));
+    painter.drawRoundedRect(bodyRect, 8, 8);
+    painter.setBrush(QColor(QStringLiteral("#4b6f99")));
+    painter.drawRoundedRect(tabRect, 6, 6);
+
+    painter.setBrush(QColor(QStringLiteral("#dbe8ff")));
+    for (int i = 0; i < 3; ++i) {
+        const QRect frameRect(11 + (i * 10), 19 + (i * 3), 14, 18);
+        painter.drawRoundedRect(frameRect, 3, 3);
+    }
+
+    painter.setPen(QColor(QStringLiteral("#eef5ff")));
+    QFont font = painter.font();
+    font.setBold(true);
+    font.setPointSizeF(8.5);
+    painter.setFont(font);
+    painter.drawText(QRect(0, size.height() - 17, size.width(), 12),
+                     Qt::AlignCenter,
+                     QStringLiteral("SEQ"));
+    return QIcon(pixmap);
+}
+
+class SequenceAwareIconProvider final : public QFileIconProvider
+{
+public:
+    QIcon icon(const QFileInfo& info) const override
+    {
+        if (info.isDir() && isImageSequencePath(info.absoluteFilePath())) {
+            return sequenceFolderIcon();
+        }
+        return QFileIconProvider::icon(info);
+    }
+};
 }
 
 ExplorerPane::ExplorerPane(QWidget *parent)
@@ -127,50 +178,114 @@ bool ExplorerPane::eventFilter(QObject *watched, QEvent *event)
 {
     if (watched == (m_tree ? m_tree->viewport() : nullptr))
     {
-        if (event->type() == QEvent::Leave)
+        if (event->type() == QEvent::MouseButtonPress)
         {
-            hideExplorerHoverPreview();
+            const auto *mouseEvent = static_cast<QMouseEvent *>(event);
+            if (mouseEvent->button() == Qt::LeftButton)
+            {
+                m_treeDragStartPos = mouseEvent->pos();
+            }
         }
         else if (event->type() == QEvent::MouseMove && m_tree && m_fsModel)
         {
             const auto *mouseEvent = static_cast<QMouseEvent *>(event);
-            const QModelIndex index = m_tree->indexAt(mouseEvent->pos());
-            if (!index.isValid())
+            if (mouseEvent->buttons() & Qt::LeftButton)
             {
-                hideExplorerHoverPreview();
+                if ((mouseEvent->pos() - m_treeDragStartPos).manhattanLength() >= QApplication::startDragDistance())
+                {
+                    const QModelIndex index = m_tree->indexAt(m_treeDragStartPos);
+                    if (index.isValid())
+                    {
+                        const QFileInfo info = m_fsModel->fileInfo(index);
+                        if (info.exists() && (info.isFile() || isImageSequencePath(info.absoluteFilePath())))
+                        {
+                            hideExplorerHoverPreview();
+                            auto *mimeData = new QMimeData;
+                            mimeData->setUrls({QUrl::fromLocalFile(info.absoluteFilePath())});
+                            auto *drag = new QDrag(m_tree);
+                            drag->setMimeData(mimeData);
+                            drag->exec(Qt::CopyAction);
+                            return true;
+                        }
+                    }
+                }
             }
-            else
+            if (!mouseEvent->buttons().testFlag(Qt::LeftButton))
             {
-                const QFileInfo info = m_fsModel->fileInfo(index);
-                if (!info.exists() || !info.isFile())
+                const QModelIndex index = m_tree->indexAt(mouseEvent->pos());
+                if (!index.isValid())
                 {
                     hideExplorerHoverPreview();
                 }
+                else
+                {
+                    const QFileInfo info = m_fsModel->fileInfo(index);
+                    if (!info.exists() || (!info.isFile() && !isImageSequencePath(info.absoluteFilePath())))
+                    {
+                        hideExplorerHoverPreview();
+                    }
+                }
             }
+        }
+        else if (event->type() == QEvent::Leave)
+        {
+            hideExplorerHoverPreview();
         }
     }
     else if (watched == (m_galleryList ? m_galleryList->viewport() : nullptr))
     {
-        if (event->type() == QEvent::Leave)
+        if (event->type() == QEvent::MouseButtonPress)
         {
-            hideExplorerHoverPreview();
+            const auto *mouseEvent = static_cast<QMouseEvent *>(event);
+            if (mouseEvent->button() == Qt::LeftButton)
+            {
+                m_galleryDragStartPos = mouseEvent->pos();
+            }
         }
         else if (event->type() == QEvent::MouseMove && m_galleryList)
         {
             const auto *mouseEvent = static_cast<QMouseEvent *>(event);
-            QListWidgetItem *item = m_galleryList->itemAt(mouseEvent->pos());
-            if (!item)
+            if (mouseEvent->buttons() & Qt::LeftButton)
             {
-                hideExplorerHoverPreview();
+                if ((mouseEvent->pos() - m_galleryDragStartPos).manhattanLength() >= QApplication::startDragDistance())
+                {
+                    QListWidgetItem *item = m_galleryList->itemAt(m_galleryDragStartPos);
+                    if (item)
+                    {
+                        const QFileInfo info(item->data(Qt::UserRole).toString());
+                        if (info.exists() && (info.isFile() || isImageSequencePath(info.absoluteFilePath())))
+                        {
+                            hideExplorerHoverPreview();
+                            auto *mimeData = new QMimeData;
+                            mimeData->setUrls({QUrl::fromLocalFile(info.absoluteFilePath())});
+                            auto *drag = new QDrag(m_galleryList);
+                            drag->setMimeData(mimeData);
+                            drag->exec(Qt::CopyAction);
+                            return true;
+                        }
+                    }
+                }
             }
-            else
+            if (!mouseEvent->buttons().testFlag(Qt::LeftButton))
             {
-                const QFileInfo info(item->data(Qt::UserRole).toString());
-                if (!info.exists() || !info.isFile())
+                QListWidgetItem *item = m_galleryList->itemAt(mouseEvent->pos());
+                if (!item)
                 {
                     hideExplorerHoverPreview();
                 }
+                else
+                {
+                    const QFileInfo info(item->data(Qt::UserRole).toString());
+                    if (!info.exists() || (!info.isFile() && !isImageSequencePath(info.absoluteFilePath())))
+                    {
+                        hideExplorerHoverPreview();
+                    }
+                }
             }
+        }
+        else if (event->type() == QEvent::Leave)
+        {
+            hideExplorerHoverPreview();
         }
     }
 
@@ -231,6 +346,7 @@ QWidget *ExplorerPane::buildTreePage()
 
     m_fsModel = new QFileSystemModel(this);
     m_fsModel->setFilter(QDir::AllEntries | QDir::NoDotAndDotDot);
+    m_fsModel->setIconProvider(new SequenceAwareIconProvider);
 
     m_tree = new QTreeView(page);
     m_tree->setModel(m_fsModel);
@@ -239,6 +355,8 @@ QWidget *ExplorerPane::buildTreePage()
     m_tree->setAnimated(true);
     m_tree->setAlternatingRowColors(false);
     m_tree->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_tree->setDragEnabled(true);
+    m_tree->setDragDropMode(QAbstractItemView::DragOnly);
     m_tree->setMouseTracking(true);
     m_tree->viewport()->installEventFilter(this);
 
@@ -252,11 +370,11 @@ QWidget *ExplorerPane::buildTreePage()
         }
 
         const QFileInfo info = m_fsModel->fileInfo(index);
-        if (info.isDir())
+        if (info.isDir() && !isImageSequencePath(info.absoluteFilePath()))
         {
             setExplorerGalleryPath(info.absoluteFilePath(), true);
         }
-        else if (info.exists() && info.isFile())
+        else if (info.exists() && (info.isFile() || isImageSequencePath(info.absoluteFilePath())))
         {
             emit fileActivated(info.absoluteFilePath());
         }
@@ -271,7 +389,7 @@ QWidget *ExplorerPane::buildTreePage()
         }
 
         const QFileInfo info = m_fsModel->fileInfo(index);
-        if (info.exists() && info.isFile())
+        if (info.exists() && (info.isFile() || isImageSequencePath(info.absoluteFilePath())))
         {
             showExplorerHoverPreview(info.absoluteFilePath());
         }
@@ -320,6 +438,8 @@ QWidget *ExplorerPane::buildGalleryPage()
     m_galleryList->setMovement(QListView::Static);
     m_galleryList->setIconSize(QSize(48, 48));
     m_galleryList->setSpacing(8);
+    m_galleryList->setDragEnabled(true);
+    m_galleryList->setDragDropMode(QAbstractItemView::DragOnly);
     m_galleryList->setMouseTracking(true);
     m_galleryList->viewport()->installEventFilter(this);
 
@@ -343,11 +463,11 @@ QWidget *ExplorerPane::buildGalleryPage()
 
         const QString path = item->data(Qt::UserRole).toString();
         const QFileInfo info(path);
-        if (info.isDir())
+        if (info.isDir() && !isImageSequencePath(path))
         {
             setExplorerGalleryPath(path, true);
         }
-        else if (info.exists() && info.isFile())
+        else if (info.exists() && (info.isFile() || isImageSequencePath(path)))
         {
             emit fileActivated(path);
         }
@@ -362,7 +482,7 @@ QWidget *ExplorerPane::buildGalleryPage()
         }
 
         const QFileInfo info(item->data(Qt::UserRole).toString());
-        if (info.exists() && info.isFile())
+        if (info.exists() && (info.isFile() || isImageSequencePath(info.absoluteFilePath())))
         {
             showExplorerHoverPreview(info.absoluteFilePath());
         }
@@ -432,7 +552,7 @@ void ExplorerPane::populateExplorerGallery(const QString &folderPath)
 
     m_galleryList->clear();
 
-    QFileIconProvider iconProvider;
+    SequenceAwareIconProvider iconProvider;
     QDir dir(folderPath);
     const QFileInfoList entries = dir.entryInfoList(
         QDir::NoDotAndDotDot | QDir::AllEntries,
@@ -440,10 +560,24 @@ void ExplorerPane::populateExplorerGallery(const QString &folderPath)
 
     for (const QFileInfo &info : entries)
     {
-        auto *item = new QListWidgetItem(iconProvider.icon(info), info.fileName(), m_galleryList);
+        const bool isSequence = info.isDir() && isImageSequencePath(info.absoluteFilePath());
+        QIcon itemIcon = iconProvider.icon(info);
+        if (isSequence)
+        {
+            const QPixmap preview = previewPixmapForFile(info.absoluteFilePath());
+            if (!preview.isNull())
+            {
+                itemIcon = QIcon(preview);
+            }
+        }
+        auto *item = new QListWidgetItem(itemIcon, info.fileName(), m_galleryList);
         item->setData(Qt::UserRole, info.absoluteFilePath());
         item->setToolTip(QDir::toNativeSeparators(info.absoluteFilePath()));
-        if (info.isDir())
+        if (isSequence)
+        {
+            item->setText(QStringLiteral("%1 [Sequence]").arg(imageSequenceDisplayLabel(info.absoluteFilePath())));
+        }
+        else if (info.isDir())
         {
             item->setText(QStringLiteral("[%1]").arg(info.fileName()));
         }
@@ -505,16 +639,59 @@ void ExplorerPane::chooseExplorerRoot()
 QPixmap ExplorerPane::previewPixmapForFile(const QString &filePath) const
 {
     const QFileInfo info(filePath);
-    if (!info.exists() || !info.isFile())
+    const bool isSequence = isImageSequencePath(filePath);
+    if (!info.exists() || (!info.isFile() && !isSequence))
     {
         return {};
+    }
+
+    const QString cacheKey = info.absoluteFilePath() + QLatin1Char('|') +
+                             QString::number(info.lastModified().toMSecsSinceEpoch());
+    if (m_previewPixmapCache.contains(cacheKey))
+    {
+        return m_previewPixmapCache.value(cacheKey);
+    }
+
+    if (isSequence)
+    {
+        const QPixmap pixmap = sequenceFolderIcon(QSize(280, 180)).pixmap(QSize(280, 180));
+        if (!pixmap.isNull())
+        {
+            m_previewPixmapCache.insert(cacheKey, pixmap);
+        }
+        return pixmap;
+    }
+
+    const QString suffix = info.suffix().toLower();
+    if (suffix == QStringLiteral("png") ||
+        suffix == QStringLiteral("jpg") ||
+        suffix == QStringLiteral("jpeg") ||
+        suffix == QStringLiteral("webp"))
+    {
+        QImage image(filePath);
+        const QPixmap pixmap = image.isNull() ? QPixmap() : QPixmap::fromImage(image);
+        if (!pixmap.isNull())
+        {
+            m_previewPixmapCache.insert(cacheKey, pixmap);
+        }
+        return pixmap;
     }
 
     const MediaProbeResult probe = probeMediaFile(filePath);
     if (probe.mediaType == ClipMediaType::Image)
     {
-        QImage image(filePath);
-        return image.isNull() ? QPixmap() : QPixmap::fromImage(image);
+        const QString imagePath = filePath;
+        if (imagePath.isEmpty())
+        {
+            return {};
+        }
+        QImage image(imagePath);
+        const QPixmap pixmap = image.isNull() ? QPixmap() : QPixmap::fromImage(image);
+        if (!pixmap.isNull())
+        {
+            m_previewPixmapCache.insert(cacheKey, pixmap);
+        }
+        return pixmap;
     }
 
     if (probe.mediaType != ClipMediaType::Video)
@@ -577,7 +754,20 @@ QPixmap ExplorerPane::previewPixmapForFile(const QString &filePath) const
 
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
+    AVFrame *rgbaFrame = av_frame_alloc();
     QPixmap pixmap;
+
+    if (!packet || !frame || !rgbaFrame)
+    {
+        av_frame_free(&rgbaFrame);
+        av_frame_free(&frame);
+        av_packet_free(&packet);
+        avcodec_free_context(&codecCtx);
+        avformat_close_input(&formatCtx);
+        return {};
+    }
+
+    SwsContext *sws = nullptr;
 
     auto decodeFrame = [&](AVFrame *decodedFrame)
     {
@@ -586,7 +776,8 @@ QPixmap ExplorerPane::previewPixmapForFile(const QString &filePath) const
             return;
         }
 
-        SwsContext *sws = sws_getContext(
+        sws = sws_getCachedContext(
+            sws,
             decodedFrame->width,
             decodedFrame->height,
             static_cast<AVPixelFormat>(decodedFrame->format),
@@ -603,9 +794,24 @@ QPixmap ExplorerPane::previewPixmapForFile(const QString &filePath) const
             return;
         }
 
-        QImage image(decodedFrame->width, decodedFrame->height, QImage::Format_RGBA8888);
-        uint8_t *destData[4] = { image.bits(), nullptr, nullptr, nullptr };
-        int destLinesize[4] = { static_cast<int>(image.bytesPerLine()), 0, 0, 0 };
+        if (rgbaFrame->width != decodedFrame->width || rgbaFrame->height != decodedFrame->height ||
+            rgbaFrame->format != AV_PIX_FMT_RGBA)
+        {
+            av_frame_unref(rgbaFrame);
+            rgbaFrame->format = AV_PIX_FMT_RGBA;
+            rgbaFrame->width = decodedFrame->width;
+            rgbaFrame->height = decodedFrame->height;
+            if (av_frame_get_buffer(rgbaFrame, 32) < 0)
+            {
+                av_frame_unref(rgbaFrame);
+                return;
+            }
+        }
+
+        if (av_frame_make_writable(rgbaFrame) < 0)
+        {
+            return;
+        }
 
         sws_scale(
             sws,
@@ -613,10 +819,14 @@ QPixmap ExplorerPane::previewPixmapForFile(const QString &filePath) const
             decodedFrame->linesize,
             0,
             decodedFrame->height,
-            destData,
-            destLinesize);
+            rgbaFrame->data,
+            rgbaFrame->linesize);
 
-        sws_freeContext(sws);
+        QImage image(rgbaFrame->data[0],
+                     decodedFrame->width,
+                     decodedFrame->height,
+                     rgbaFrame->linesize[0],
+                     QImage::Format_RGBA8888);
         pixmap = QPixmap::fromImage(image.copy());
     };
 
@@ -637,10 +847,27 @@ QPixmap ExplorerPane::previewPixmapForFile(const QString &filePath) const
         av_packet_unref(packet);
     }
 
+    if (pixmap.isNull())
+    {
+        avcodec_send_packet(codecCtx, nullptr);
+        while (avcodec_receive_frame(codecCtx, frame) >= 0 && pixmap.isNull())
+        {
+            decodeFrame(frame);
+            av_frame_unref(frame);
+        }
+    }
+
+    sws_freeContext(sws);
+    av_frame_free(&rgbaFrame);
     av_frame_free(&frame);
     av_packet_free(&packet);
     avcodec_free_context(&codecCtx);
     avformat_close_input(&formatCtx);
+
+    if (!pixmap.isNull())
+    {
+        m_previewPixmapCache.insert(cacheKey, pixmap);
+    }
 
     return pixmap;
 }

@@ -37,6 +37,8 @@ public:
     void setTimelineClips(const QVector<TimelineClip>& clips);
     void setRenderSyncMarkers(const QVector<RenderSyncMarker>& markers);
     void setExportRanges(const QVector<ExportRangeSegment>& ranges);
+    void beginBulkUpdate();
+    void endBulkUpdate();
     QString backendName() const;
     void setAudioMuted(bool muted);
     void setAudioVolume(qreal volume);
@@ -174,6 +176,8 @@ private:
     mutable QHash<QString, QVector<TranscriptSection>> m_transcriptSectionsCache;
     QHash<QString, TextureCacheEntry> m_textureCache;
     QVector<QString> m_paintOrder;
+    int m_bulkUpdateDepth = 0;
+    bool m_pendingFrameRequest = false;
     PreviewDragMode m_dragMode = PreviewDragMode::None;
     QPointF m_dragOriginPos;
     QRectF m_dragOriginBounds;

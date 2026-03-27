@@ -1,11 +1,14 @@
 #include "editor_shared.h"
 
 #include <QDir>
+#include <QCollator>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QRegularExpression>
 #include <QSet>
 
@@ -15,6 +18,7 @@
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
+#include <libavutil/pixdesc.h>
 }
 
 namespace {
@@ -30,6 +34,80 @@ bool isImageSuffix(const QString& suffix) {
 
 int clampChannel(int value) {
     return qBound(0, value, 255);
+}
+
+QStringList collectSequenceFrames(const QString& path) {
+    static QMutex cacheMutex;
+    static QHash<QString, QStringList> cachedFramesByKey;
+
+    const QFileInfo dirInfo(path);
+    if (!dirInfo.exists() || !dirInfo.isDir()) {
+        return {};
+    }
+
+    const QString cacheKey = dirInfo.absoluteFilePath() + QLatin1Char('|') +
+                             QString::number(dirInfo.lastModified().toMSecsSinceEpoch());
+    {
+        QMutexLocker locker(&cacheMutex);
+        const auto it = cachedFramesByKey.constFind(cacheKey);
+        if (it != cachedFramesByKey.cend()) {
+            return it.value();
+        }
+    }
+
+    const QDir dir(dirInfo.absoluteFilePath());
+    QFileInfoList entries = dir.entryInfoList(QDir::Files | QDir::NoDotAndDotDot, QDir::Name | QDir::IgnoreCase);
+    if (entries.size() < 2) {
+        return {};
+    }
+
+    QHash<QString, QFileInfoList> bySuffix;
+    for (const QFileInfo& entry : entries) {
+        const QString suffix = entry.suffix().toLower();
+        if (!isImageSuffix(suffix)) {
+            continue;
+        }
+        bySuffix[suffix].push_back(entry);
+    }
+
+    QFileInfoList bestGroup;
+    for (auto it = bySuffix.begin(); it != bySuffix.end(); ++it) {
+        if (it.value().size() > bestGroup.size()) {
+            bestGroup = it.value();
+        }
+    }
+    if (bestGroup.size() < 2) {
+        return {};
+    }
+
+    static const QRegularExpression kDigitsPattern(QStringLiteral("(\\d+)"));
+    int numberedCount = 0;
+    for (const QFileInfo& entry : bestGroup) {
+        if (kDigitsPattern.match(entry.completeBaseName()).hasMatch()) {
+            ++numberedCount;
+        }
+    }
+    if (numberedCount < 2 || (numberedCount * 2) < bestGroup.size()) {
+        return {};
+    }
+
+    QCollator collator;
+    collator.setNumericMode(true);
+    collator.setCaseSensitivity(Qt::CaseInsensitive);
+    std::sort(bestGroup.begin(), bestGroup.end(), [&collator](const QFileInfo& a, const QFileInfo& b) {
+        return collator.compare(a.fileName(), b.fileName()) < 0;
+    });
+
+    QStringList frames;
+    frames.reserve(bestGroup.size());
+    for (const QFileInfo& entry : bestGroup) {
+        frames.push_back(entry.absoluteFilePath());
+    }
+    {
+        QMutexLocker locker(&cacheMutex);
+        cachedFramesByKey.insert(cacheKey, frames);
+    }
+    return frames;
 }
 }
 
@@ -68,6 +146,31 @@ QString clipMediaTypeLabel(ClipMediaType type) {
     }
 }
 
+QString mediaSourceKindToString(MediaSourceKind kind) {
+    switch (kind) {
+    case MediaSourceKind::ImageSequence:
+        return QStringLiteral("image_sequence");
+    case MediaSourceKind::File:
+    default:
+        return QStringLiteral("file");
+    }
+}
+
+MediaSourceKind mediaSourceKindFromString(const QString& value) {
+    if (value == QStringLiteral("image_sequence")) return MediaSourceKind::ImageSequence;
+    return MediaSourceKind::File;
+}
+
+QString mediaSourceKindLabel(MediaSourceKind kind) {
+    switch (kind) {
+    case MediaSourceKind::ImageSequence:
+        return QStringLiteral("Image Sequence");
+    case MediaSourceKind::File:
+    default:
+        return QStringLiteral("File");
+    }
+}
+
 QString renderSyncActionToString(RenderSyncAction action) {
     switch (action) {
     case RenderSyncAction::DuplicateFrame:
@@ -98,7 +201,9 @@ QString renderSyncActionLabel(RenderSyncAction action) {
 }
 
 bool clipHasVisuals(const TimelineClip& clip) {
-    return clip.mediaType == ClipMediaType::Image || clip.mediaType == ClipMediaType::Video;
+    return clip.mediaType == ClipMediaType::Image ||
+           clip.mediaType == ClipMediaType::Video ||
+           clip.sourceKind == MediaSourceKind::ImageSequence;
 }
 
 bool clipIsAudioOnly(const TimelineClip& clip) {
@@ -141,8 +246,8 @@ void normalizeClipTiming(TimelineClip& clip) {
     normalizeSubframeTiming(clip.sourceInFrame, clip.sourceInSubframeSamples);
 }
 
-QString transformInterpolationLabel(bool interpolated) {
-    return interpolated ? QStringLiteral("Interpolated") : QStringLiteral("Sudden");
+QString transformInterpolationLabel(bool linearInterpolation) {
+    return linearInterpolation ? QStringLiteral("Linear") : QStringLiteral("Step");
 }
 
 qreal sanitizeScaleValue(qreal value) {
@@ -204,7 +309,7 @@ TimelineClip::TransformKeyframe evaluateClipKeyframeOffsetAtFrame(const Timeline
         const TimelineClip::TransformKeyframe& previous = clip.transformKeyframes[i - 1];
         const TimelineClip::TransformKeyframe& current = clip.transformKeyframes[i];
         if (localFrame < current.frame) {
-            if (!current.interpolated || current.frame <= previous.frame) {
+            if (!current.linearInterpolation || current.frame <= previous.frame) {
                 return previous;
             }
             const qreal t = static_cast<qreal>(localFrame - previous.frame) /
@@ -215,7 +320,7 @@ TimelineClip::TransformKeyframe evaluateClipKeyframeOffsetAtFrame(const Timeline
             state.rotation = previous.rotation + ((current.rotation - previous.rotation) * t);
             state.scaleX = previous.scaleX + ((current.scaleX - previous.scaleX) * t);
             state.scaleY = previous.scaleY + ((current.scaleY - previous.scaleY) * t);
-            state.interpolated = current.interpolated;
+            state.linearInterpolation = current.linearInterpolation;
             return state;
         }
         if (localFrame == current.frame) {
@@ -257,7 +362,7 @@ TimelineClip::TransformKeyframe evaluateClipTransformAtPosition(const TimelineCl
             const TimelineClip::TransformKeyframe& previous = clip.transformKeyframes[i - 1];
             const TimelineClip::TransformKeyframe& current = clip.transformKeyframes[i];
             if (localFrame < static_cast<qreal>(current.frame)) {
-                if (!current.interpolated || current.frame <= previous.frame) {
+                if (!current.linearInterpolation || current.frame <= previous.frame) {
                     state = previous;
                 } else {
                     const qreal t = (localFrame - static_cast<qreal>(previous.frame)) /
@@ -268,7 +373,7 @@ TimelineClip::TransformKeyframe evaluateClipTransformAtPosition(const TimelineCl
                     state.rotation = previous.rotation + ((current.rotation - previous.rotation) * t);
                     state.scaleX = previous.scaleX + ((current.scaleX - previous.scaleX) * t);
                     state.scaleY = previous.scaleY + ((current.scaleY - previous.scaleY) * t);
-                    state.interpolated = current.interpolated;
+                    state.linearInterpolation = current.linearInterpolation;
                 }
                 break;
             }
@@ -334,7 +439,27 @@ MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames)
     MediaProbeResult result;
     result.durationFrames = fallbackFrames;
 
+    if (filePath.trimmed().isEmpty()) {
+        return result;
+    }
+
     const QFileInfo info(filePath);
+    if (!info.exists()) {
+        return result;
+    }
+    if (info.exists() && info.isDir()) {
+        const QStringList sequenceFrames = collectSequenceFrames(filePath);
+        if (!sequenceFrames.isEmpty()) {
+            result.mediaType = ClipMediaType::Video;
+            result.sourceKind = MediaSourceKind::ImageSequence;
+            result.hasVideo = true;
+            result.durationFrames = sequenceFrames.size();
+            result.codecName = QStringLiteral("image_sequence");
+            QImage firstImage(sequenceFrames.constFirst());
+            result.hasAlpha = !firstImage.isNull() && firstImage.hasAlphaChannel();
+        }
+        return result;
+    }
     const QString suffix = info.suffix().toLower();
     if (isImageSuffix(suffix)) {
         result.mediaType = ClipMediaType::Image;
@@ -360,6 +485,14 @@ MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames)
             }
             if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
                 result.hasVideo = true;
+                if (result.codecName.isEmpty()) {
+                    result.codecName = QString::fromUtf8(avcodec_get_name(stream->codecpar->codec_id));
+                }
+                const AVPixFmtDescriptor* descriptor =
+                    av_pix_fmt_desc_get(static_cast<AVPixelFormat>(stream->codecpar->format));
+                if (descriptor && (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA)) {
+                    result.hasAlpha = true;
+                }
             } else if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
                 result.hasAudio = true;
             }
@@ -480,9 +613,77 @@ QString playbackMediaPathForClip(const TimelineClip& clip) {
     return proxyPath.isEmpty() ? clip.filePath : proxyPath;
 }
 
+QString interactivePreviewMediaPathForClip(const TimelineClip& clip) {
+    const auto interactivePathAllowed = [durationFrames = clip.durationFrames](const QString& path) {
+        if (path.isEmpty()) {
+            return false;
+        }
+        const MediaProbeResult probe = probeMediaFile(path, durationFrames);
+        const QString suffix = QFileInfo(path).suffix().toLower();
+        const bool disallowAlphaProresMov =
+            probe.mediaType == ClipMediaType::Video &&
+            probe.hasAlpha &&
+            probe.codecName == QStringLiteral("prores") &&
+            suffix == QStringLiteral("mov");
+        return !disallowAlphaProresMov;
+    };
+
+    const QString proxyPath = playbackProxyPathForClip(clip);
+    if (!proxyPath.isEmpty()) {
+        return interactivePathAllowed(proxyPath) ? proxyPath : QString();
+    }
+    if (!clipHasVisuals(clip) || clip.filePath.isEmpty()) {
+        return clip.filePath;
+    }
+
+    return interactivePathAllowed(clip.filePath) ? clip.filePath : QString();
+}
+
+bool isImageSequencePath(const QString& path) {
+    return !collectSequenceFrames(path).isEmpty();
+}
+
+QStringList imageSequenceFramePaths(const QString& path) {
+    return collectSequenceFrames(path);
+}
+
+QString imageSequenceDisplayLabel(const QString& path) {
+    return QFileInfo(path).fileName();
+}
+
 QString transcriptPathForClipFile(const QString& filePath) {
     const QFileInfo info(filePath);
     return info.dir().filePath(info.completeBaseName() + QStringLiteral(".json"));
+}
+
+QString transcriptEditablePathForClipFile(const QString& filePath) {
+    const QFileInfo info(filePath);
+    return info.dir().filePath(info.completeBaseName() + QStringLiteral("_editable.json"));
+}
+
+QString transcriptWorkingPathForClipFile(const QString& filePath) {
+    const QString editablePath = transcriptEditablePathForClipFile(filePath);
+    if (QFileInfo::exists(editablePath)) {
+        return editablePath;
+    }
+    return transcriptPathForClipFile(filePath);
+}
+
+bool ensureEditableTranscriptForClipFile(const QString& filePath, QString* editablePathOut) {
+    const QString editablePath = transcriptEditablePathForClipFile(filePath);
+    if (editablePathOut) {
+        *editablePathOut = editablePath;
+    }
+    if (QFileInfo::exists(editablePath)) {
+        return true;
+    }
+
+    const QString originalPath = transcriptPathForClipFile(filePath);
+    if (!QFileInfo::exists(originalPath)) {
+        return false;
+    }
+    QFile::remove(editablePath);
+    return QFile::copy(originalPath, editablePath);
 }
 
 QVector<TranscriptSection> loadTranscriptSections(const QString& transcriptPath) {

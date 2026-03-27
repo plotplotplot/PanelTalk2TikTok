@@ -90,6 +90,7 @@ protected:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    void leaveEvent(QEvent* event) override;
     void contextMenuEvent(QContextMenuEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
     void paintEvent(QPaintEvent*) override;
@@ -182,6 +183,7 @@ private:
     int exportHandleAtPos(const QPoint& pos, bool* startHandleOut) const;
     const RenderSyncMarker* renderSyncMarkerAtPos(const QPoint& pos, int* clipIndexOut = nullptr) const;
     void openRenderSyncMarkerMenu(const QPoint& globalPos, const QString& clipId);
+    bool clipHasProxyAvailable(const TimelineClip& clip) const;
 
     QVector<TimelineClip> m_clips;
     QVector<TimelineTrack> m_tracks;
@@ -206,6 +208,7 @@ private:
     int m_verticalScrollOffset = 0;
     int64_t m_snapIndicatorFrame = -1;
     QString m_selectedClipId;
+    QString m_hoveredClipId;
     QVector<RenderSyncMarker> m_renderSyncMarkers;
     ExportRangeDragMode m_exportRangeDragMode = ExportRangeDragMode::None;
     int m_exportRangeDragSegmentIndex = -1;

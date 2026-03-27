@@ -10,6 +10,8 @@ class QComboBox;
 class QCheckBox;
 class QFontComboBox;
 class QTableWidget;
+class QPushButton;
+class QPlainTextEdit;
 
 class InspectorPane final : public QWidget
 {
@@ -56,6 +58,8 @@ public:
     QLabel *keyframesInspectorClipLabel() const { return m_keyframesInspectorClipLabel; }
     QLabel *keyframesInspectorDetailsLabel() const { return m_keyframesInspectorDetailsLabel; }
     QTableWidget *videoKeyframeTable() const { return m_videoKeyframeTable; }
+    QCheckBox *keyframesAutoScrollCheckBox() const { return m_keyframesAutoScrollCheckBox; }
+    QCheckBox *keyframesFollowCurrentCheckBox() const { return m_keyframesFollowCurrentCheckBox; }
 
     QLabel *audioInspectorClipLabel() const { return m_audioInspectorClipLabel; }
     QLabel *audioInspectorDetailsLabel() const { return m_audioInspectorDetailsLabel; }
@@ -68,12 +72,16 @@ public:
     QLabel *clipPlaybackSourceLabel() const { return m_clipPlaybackSourceLabel; }
     QLabel *clipOriginalInfoLabel() const { return m_clipOriginalInfoLabel; }
     QLabel *clipProxyInfoLabel() const { return m_clipProxyInfoLabel; }
+    QPlainTextEdit *profileSummaryTextEdit() const { return m_profileSummaryTextEdit; }
+    QPushButton *profileBenchmarkButton() const { return m_profileBenchmarkButton; }
 
     QSpinBox *outputWidthSpin() const { return m_outputWidthSpin; }
     QSpinBox *outputHeightSpin() const { return m_outputHeightSpin; }
     QSpinBox *exportStartSpin() const { return m_exportStartSpin; }
     QSpinBox *exportEndSpin() const { return m_exportEndSpin; }
     QComboBox *outputFormatCombo() const { return m_outputFormatCombo; }
+    QLabel *outputRangeSummaryLabel() const { return m_outputRangeSummaryLabel; }
+    QPushButton *renderButton() const { return m_renderButton; }
 
     QCheckBox *speechFilterEnabledCheckBox() const { return m_speechFilterEnabledCheckBox; }
     QSpinBox *transcriptPrependMsSpin() const { return m_transcriptPrependMsSpin; }
@@ -82,17 +90,18 @@ public:
 
     void refresh();
 
+signals:
+    void refreshRequested();
 
 private:
     QWidget *buildPane();
     QWidget *buildGradingTab();
     QWidget *buildSyncTab();
     QWidget *buildKeyframesTab();
-    QWidget *buildAudioTab();
     QWidget *buildTranscriptTab();
     QWidget *buildClipTab();
     QWidget *buildOutputTab();
-    QWidget *buildSpeechTab();
+    QWidget *buildProfileTab();
 
 private:
     QTabWidget *m_inspectorTabs = nullptr;
@@ -110,6 +119,8 @@ private:
     QLabel *m_keyframesInspectorClipLabel = nullptr;
     QLabel *m_keyframesInspectorDetailsLabel = nullptr;
     QTableWidget *m_videoKeyframeTable = nullptr;
+    QCheckBox *m_keyframesAutoScrollCheckBox = nullptr;
+    QCheckBox *m_keyframesFollowCurrentCheckBox = nullptr;
     QDoubleSpinBox *m_videoTranslationXSpin = nullptr;
     QDoubleSpinBox *m_videoTranslationYSpin = nullptr;
     QDoubleSpinBox *m_videoRotationSpin = nullptr;
@@ -130,6 +141,8 @@ private:
     QLabel *m_clipPlaybackSourceLabel = nullptr;
     QLabel *m_clipOriginalInfoLabel = nullptr;
     QLabel *m_clipProxyInfoLabel = nullptr;
+    QPlainTextEdit *m_profileSummaryTextEdit = nullptr;
+    QPushButton *m_profileBenchmarkButton = nullptr;
     QCheckBox *m_transcriptOverlayEnabledCheckBox = nullptr;
     QSpinBox *m_transcriptMaxLinesSpin = nullptr;
     QSpinBox *m_transcriptMaxCharsSpin = nullptr;
@@ -149,6 +162,8 @@ private:
     QSpinBox *m_exportStartSpin = nullptr;
     QSpinBox *m_exportEndSpin = nullptr;
     QComboBox *m_outputFormatCombo = nullptr;
+    QLabel *m_outputRangeSummaryLabel = nullptr;
+    QPushButton *m_renderButton = nullptr;
 
     QCheckBox *m_speechFilterEnabledCheckBox = nullptr;
     QSpinBox *m_transcriptPrependMsSpin = nullptr;

@@ -8,9 +8,14 @@
 #include <QFrame>
 #include <QHeaderView>
 #include <QLabel>
+#include <QScrollArea>
+#include <QSplitter>
 #include <QSpinBox>
+#include <QTabBar>
 #include <QTabWidget>
 #include <QTableWidget>
+#include <QPushButton>
+#include <QPlainTextEdit>
 #include <QVBoxLayout>
 
 InspectorPane::InspectorPane(QWidget *parent)
@@ -24,22 +29,23 @@ InspectorPane::InspectorPane(QWidget *parent)
 QWidget *InspectorPane::buildPane()
 {
     auto *pane = new QFrame;
-    pane->setMinimumWidth(280);
-    pane->setMaximumWidth(420);
+    pane->setMinimumWidth(320);
+    pane->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
 
     auto *layout = new QVBoxLayout(pane);
     layout->setContentsMargins(8, 8, 8, 8);
     layout->setSpacing(8);
 
     m_inspectorTabs = new QTabWidget(pane);
+    m_inspectorTabs->tabBar()->setExpanding(true);
+    m_inspectorTabs->tabBar()->setUsesScrollButtons(false);
     m_inspectorTabs->addTab(buildGradingTab(), QStringLiteral("Grade"));
     m_inspectorTabs->addTab(buildSyncTab(), QStringLiteral("Sync"));
     m_inspectorTabs->addTab(buildKeyframesTab(), QStringLiteral("Keyframes"));
-    m_inspectorTabs->addTab(buildAudioTab(), QStringLiteral("Audio"));
     m_inspectorTabs->addTab(buildTranscriptTab(), QStringLiteral("Transcript"));
     m_inspectorTabs->addTab(buildClipTab(), QStringLiteral("Clip"));
-    m_inspectorTabs->addTab(buildSpeechTab(), QStringLiteral("Speech"));
     m_inspectorTabs->addTab(buildOutputTab(), QStringLiteral("Output"));
+    m_inspectorTabs->addTab(buildProfileTab(), QStringLiteral("Profile"));
 
     layout->addWidget(m_inspectorTabs);
     return pane;
@@ -122,7 +128,6 @@ QWidget *InspectorPane::buildKeyframesTab()
 
     m_videoInterpolationCombo->addItem(QStringLiteral("Step"));
     m_videoInterpolationCombo->addItem(QStringLiteral("Linear"));
-    m_videoInterpolationCombo->addItem(QStringLiteral("Smooth"));
 
     for (QDoubleSpinBox *spin : {
              m_videoTranslationXSpin, m_videoTranslationYSpin, m_videoRotationSpin,
@@ -141,33 +146,36 @@ QWidget *InspectorPane::buildKeyframesTab()
     form->addRow(QStringLiteral("Scale Y"), m_videoScaleYSpin);
     form->addRow(QStringLiteral("Interpolation"), m_videoInterpolationCombo);
 
+    m_keyframesAutoScrollCheckBox = new QCheckBox(QStringLiteral("Auto Scroll"), page);
+    m_keyframesFollowCurrentCheckBox = new QCheckBox(QStringLiteral("Follow Current Keyframe"), page);
+    m_keyframesAutoScrollCheckBox->setChecked(true);
+    m_keyframesFollowCurrentCheckBox->setChecked(true);
+
     m_videoKeyframeTable = new QTableWidget(page);
-    m_videoKeyframeTable->setColumnCount(1);
-    m_videoKeyframeTable->setHorizontalHeaderLabels({QStringLiteral("Frame")});
+    m_videoKeyframeTable->setColumnCount(7);
+    m_videoKeyframeTable->setHorizontalHeaderLabels({QStringLiteral("Frame"),
+                                                     QStringLiteral("X"),
+                                                     QStringLiteral("Y"),
+                                                     QStringLiteral("Rot"),
+                                                     QStringLiteral("Scale X"),
+                                                     QStringLiteral("Scale Y"),
+                                                     QStringLiteral("Interp")});
+    m_videoKeyframeTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_videoKeyframeTable->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    m_videoKeyframeTable->setEditTriggers(QAbstractItemView::DoubleClicked |
+                                          QAbstractItemView::EditKeyPressed);
+    m_videoKeyframeTable->verticalHeader()->setVisible(false);
     m_videoKeyframeTable->horizontalHeader()->setStretchLastSection(true);
+    m_videoKeyframeTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
 
     layout->addWidget(m_keyframesInspectorClipLabel);
     layout->addWidget(m_keyframesInspectorDetailsLabel);
     layout->addLayout(form);
+    layout->addWidget(m_keyframesAutoScrollCheckBox);
+    layout->addWidget(m_keyframesFollowCurrentCheckBox);
     layout->addWidget(m_mirrorHorizontalCheckBox);
     layout->addWidget(m_mirrorVerticalCheckBox);
     layout->addWidget(m_videoKeyframeTable, 1);
-
-    return page;
-}
-
-QWidget *InspectorPane::buildAudioTab()
-{
-    auto *page = new QWidget;
-    auto *layout = new QVBoxLayout(page);
-
-    m_audioInspectorClipLabel = new QLabel(QStringLiteral("No audio clip selected"), page);
-    m_audioInspectorDetailsLabel = new QLabel(QStringLiteral("Select an audio clip to inspect playback details."), page);
-    m_audioInspectorDetailsLabel->setWordWrap(true);
-
-    layout->addWidget(m_audioInspectorClipLabel);
-    layout->addWidget(m_audioInspectorDetailsLabel);
-    layout->addStretch(1);
 
     return page;
 }
@@ -176,25 +184,33 @@ QWidget *InspectorPane::buildTranscriptTab()
 {
     auto *page = new QWidget;
     auto *layout = new QVBoxLayout(page);
+    layout->setContentsMargins(0, 0, 0, 0);
 
-    m_transcriptInspectorClipLabel = new QLabel(QStringLiteral("No transcript selected"), page);
-    m_transcriptInspectorDetailsLabel = new QLabel(QStringLiteral("Select a clip with a WhisperX JSON transcript."), page);
+    auto *splitter = new QSplitter(Qt::Vertical, page);
+    splitter->setChildrenCollapsible(false);
+
+    auto *settingsContainer = new QWidget(splitter);
+    auto *settingsLayout = new QVBoxLayout(settingsContainer);
+    settingsLayout->setContentsMargins(8, 8, 8, 8);
+
+    m_transcriptInspectorClipLabel = new QLabel(QStringLiteral("No transcript selected"), settingsContainer);
+    m_transcriptInspectorDetailsLabel = new QLabel(QStringLiteral("Select a clip with a WhisperX JSON transcript."), settingsContainer);
     m_transcriptInspectorDetailsLabel->setWordWrap(true);
 
     auto *form = new QFormLayout;
-    m_transcriptOverlayEnabledCheckBox = new QCheckBox(QStringLiteral("Enable Overlay"), page);
-    m_transcriptMaxLinesSpin = new QSpinBox(page);
-    m_transcriptMaxCharsSpin = new QSpinBox(page);
-    m_transcriptAutoScrollCheckBox = new QCheckBox(QStringLiteral("Auto Scroll"), page);
-    m_transcriptFollowCurrentWordCheckBox = new QCheckBox(QStringLiteral("Follow Current Word"), page);
-    m_transcriptOverlayXSpin = new QDoubleSpinBox(page);
-    m_transcriptOverlayYSpin = new QDoubleSpinBox(page);
-    m_transcriptOverlayWidthSpin = new QSpinBox(page);
-    m_transcriptOverlayHeightSpin = new QSpinBox(page);
-    m_transcriptFontFamilyCombo = new QFontComboBox(page);
-    m_transcriptFontSizeSpin = new QSpinBox(page);
-    m_transcriptBoldCheckBox = new QCheckBox(QStringLiteral("Bold"), page);
-    m_transcriptItalicCheckBox = new QCheckBox(QStringLiteral("Italic"), page);
+    m_transcriptOverlayEnabledCheckBox = new QCheckBox(QStringLiteral("Enable Overlay"), settingsContainer);
+    m_transcriptMaxLinesSpin = new QSpinBox(settingsContainer);
+    m_transcriptMaxCharsSpin = new QSpinBox(settingsContainer);
+    m_transcriptAutoScrollCheckBox = new QCheckBox(QStringLiteral("Auto Scroll"), settingsContainer);
+    m_transcriptFollowCurrentWordCheckBox = new QCheckBox(QStringLiteral("Follow Current Word"), settingsContainer);
+    m_transcriptOverlayXSpin = new QDoubleSpinBox(settingsContainer);
+    m_transcriptOverlayYSpin = new QDoubleSpinBox(settingsContainer);
+    m_transcriptOverlayWidthSpin = new QSpinBox(settingsContainer);
+    m_transcriptOverlayHeightSpin = new QSpinBox(settingsContainer);
+    m_transcriptFontFamilyCombo = new QFontComboBox(settingsContainer);
+    m_transcriptFontSizeSpin = new QSpinBox(settingsContainer);
+    m_transcriptBoldCheckBox = new QCheckBox(QStringLiteral("Bold"), settingsContainer);
+    m_transcriptItalicCheckBox = new QCheckBox(QStringLiteral("Italic"), settingsContainer);
 
     m_transcriptMaxLinesSpin->setRange(1, 20);
     m_transcriptMaxCharsSpin->setRange(1, 200);
@@ -216,16 +232,65 @@ QWidget *InspectorPane::buildTranscriptTab()
     form->addRow(QStringLiteral("Bold"), m_transcriptBoldCheckBox);
     form->addRow(QStringLiteral("Italic"), m_transcriptItalicCheckBox);
 
-    m_transcriptTable = new QTableWidget(page);
+    auto *speechSectionLabel = new QLabel(QStringLiteral("Speech Filter"), settingsContainer);
+    speechSectionLabel->setStyleSheet(QStringLiteral("font-weight: 600; color: #8fa3b8;"));
+
+    auto *speechForm = new QFormLayout;
+    m_speechFilterEnabledCheckBox = new QCheckBox(QStringLiteral("Enable Speech Filter"), settingsContainer);
+    m_transcriptPrependMsSpin = new QSpinBox(settingsContainer);
+    m_transcriptPostpendMsSpin = new QSpinBox(settingsContainer);
+    m_speechFilterFadeSamplesSpin = new QSpinBox(settingsContainer);
+
+    m_transcriptPrependMsSpin->setRange(0, 10000);
+    m_transcriptPrependMsSpin->setValue(0);
+    m_transcriptPrependMsSpin->setSuffix(QStringLiteral(" ms"));
+    m_transcriptPrependMsSpin->setToolTip(QStringLiteral("Milliseconds to add before each word"));
+
+    m_transcriptPostpendMsSpin->setRange(0, 10000);
+    m_transcriptPostpendMsSpin->setValue(0);
+    m_transcriptPostpendMsSpin->setSuffix(QStringLiteral(" ms"));
+    m_transcriptPostpendMsSpin->setToolTip(QStringLiteral("Milliseconds to add after each word"));
+
+    m_speechFilterFadeSamplesSpin->setRange(0, 5000);
+    m_speechFilterFadeSamplesSpin->setValue(250);
+    m_speechFilterFadeSamplesSpin->setSuffix(QStringLiteral(" samples"));
+    m_speechFilterFadeSamplesSpin->setToolTip(QStringLiteral("Crossfade duration at speech boundaries (0 = no fade)"));
+
+    speechForm->addRow(QStringLiteral("Speech Filter"), m_speechFilterEnabledCheckBox);
+    speechForm->addRow(QStringLiteral("Prepend Time"), m_transcriptPrependMsSpin);
+    speechForm->addRow(QStringLiteral("Postpend Time"), m_transcriptPostpendMsSpin);
+    speechForm->addRow(QStringLiteral("Fade Length"), m_speechFilterFadeSamplesSpin);
+
+    m_transcriptTable = new QTableWidget(splitter);
     m_transcriptTable->setColumnCount(3);
     m_transcriptTable->setHorizontalHeaderLabels(
         {QStringLiteral("Start"), QStringLiteral("End"), QStringLiteral("Text")});
+    m_transcriptTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_transcriptTable->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    m_transcriptTable->setEditTriggers(QAbstractItemView::DoubleClicked |
+                                       QAbstractItemView::EditKeyPressed);
+    m_transcriptTable->verticalHeader()->setVisible(false);
     m_transcriptTable->horizontalHeader()->setStretchLastSection(true);
 
-    layout->addWidget(m_transcriptInspectorClipLabel);
-    layout->addWidget(m_transcriptInspectorDetailsLabel);
-    layout->addLayout(form);
-    layout->addWidget(m_transcriptTable, 1);
+    settingsLayout->addWidget(m_transcriptInspectorClipLabel);
+    settingsLayout->addWidget(m_transcriptInspectorDetailsLabel);
+    settingsLayout->addLayout(form);
+    settingsLayout->addWidget(speechSectionLabel);
+    settingsLayout->addLayout(speechForm);
+    settingsLayout->addStretch(1);
+
+    auto *settingsScroll = new QScrollArea(page);
+    settingsScroll->setWidgetResizable(true);
+    settingsScroll->setFrameShape(QFrame::NoFrame);
+    settingsScroll->setWidget(settingsContainer);
+
+    splitter->addWidget(settingsScroll);
+    splitter->addWidget(m_transcriptTable);
+    splitter->setStretchFactor(0, 0);
+    splitter->setStretchFactor(1, 1);
+    splitter->setSizes({360, 420});
+
+    layout->addWidget(splitter);
 
     return page;
 }
@@ -234,6 +299,10 @@ QWidget *InspectorPane::buildOutputTab()
 {
     auto *page = new QWidget;
     auto *layout = new QVBoxLayout(page);
+
+    m_outputRangeSummaryLabel = new QLabel(QStringLiteral("Timeline export range: 00:00:00:00 -> 00:00:10:00"), page);
+    m_outputRangeSummaryLabel->setWordWrap(true);
+    m_outputRangeSummaryLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
     auto *form = new QFormLayout;
     m_outputWidthSpin = new QSpinBox(page);
@@ -259,7 +328,11 @@ QWidget *InspectorPane::buildOutputTab()
     form->addRow(QStringLiteral("Export End Frame"), m_exportEndSpin);
     form->addRow(QStringLiteral("Output Format"), m_outputFormatCombo);
 
+    m_renderButton = new QPushButton(QStringLiteral("Render"), page);
+
+    layout->addWidget(m_outputRangeSummaryLabel);
     layout->addLayout(form);
+    layout->addWidget(m_renderButton);
     layout->addStretch(1);
 
     return page;
@@ -275,9 +348,14 @@ QWidget *InspectorPane::buildClipTab()
     m_clipPlaybackSourceLabel = new QLabel(QStringLiteral("Proxy In Use: No"), page);
     m_clipOriginalInfoLabel = new QLabel(QStringLiteral("Original\nNo clip selected."), page);
     m_clipProxyInfoLabel = new QLabel(QStringLiteral("Proxy\nNo proxy configured."), page);
+    auto *audioSectionLabel = new QLabel(QStringLiteral("Audio"), page);
+    audioSectionLabel->setStyleSheet(QStringLiteral("font-weight: 600; color: #8fa3b8;"));
+    m_audioInspectorClipLabel = new QLabel(QStringLiteral("No audio clip selected"), page);
+    m_audioInspectorDetailsLabel = new QLabel(QStringLiteral("Select an audio clip to inspect playback details."), page);
 
     for (QLabel *label : {m_clipInspectorClipLabel, m_clipProxyUsageLabel, m_clipPlaybackSourceLabel,
-                          m_clipOriginalInfoLabel, m_clipProxyInfoLabel})
+                          m_clipOriginalInfoLabel, m_clipProxyInfoLabel,
+                          m_audioInspectorClipLabel, m_audioInspectorDetailsLabel})
     {
         label->setWordWrap(true);
         label->setTextInteractionFlags(Qt::TextSelectableByMouse);
@@ -288,50 +366,32 @@ QWidget *InspectorPane::buildClipTab()
     layout->addWidget(m_clipPlaybackSourceLabel);
     layout->addWidget(m_clipOriginalInfoLabel);
     layout->addWidget(m_clipProxyInfoLabel);
+    layout->addWidget(audioSectionLabel);
+    layout->addWidget(m_audioInspectorClipLabel);
+    layout->addWidget(m_audioInspectorDetailsLabel);
     layout->addStretch(1);
 
     return page;
 }
 
-QWidget *InspectorPane::buildSpeechTab()
+QWidget *InspectorPane::buildProfileTab()
 {
     auto *page = new QWidget;
     auto *layout = new QVBoxLayout(page);
 
-    auto *form = new QFormLayout;
-    m_speechFilterEnabledCheckBox = new QCheckBox(QStringLiteral("Enable Speech Filter"), page);
-    m_transcriptPrependMsSpin = new QSpinBox(page);
-    m_transcriptPostpendMsSpin = new QSpinBox(page);
-    m_speechFilterFadeSamplesSpin = new QSpinBox(page);
+    m_profileSummaryTextEdit = new QPlainTextEdit(page);
+    m_profileSummaryTextEdit->setReadOnly(true);
+    m_profileSummaryTextEdit->setLineWrapMode(QPlainTextEdit::WidgetWidth);
+    m_profileSummaryTextEdit->setPlainText(QStringLiteral("Profile information unavailable."));
 
-    m_transcriptPrependMsSpin->setRange(0, 10000);
-    m_transcriptPrependMsSpin->setValue(0);
-    m_transcriptPrependMsSpin->setSuffix(QStringLiteral(" ms"));
-    m_transcriptPrependMsSpin->setToolTip(QStringLiteral("Milliseconds to add before each word"));
+    m_profileBenchmarkButton = new QPushButton(QStringLiteral("Run Decode Benchmark"), page);
 
-    m_transcriptPostpendMsSpin->setRange(0, 10000);
-    m_transcriptPostpendMsSpin->setValue(0);
-    m_transcriptPostpendMsSpin->setSuffix(QStringLiteral(" ms"));
-    m_transcriptPostpendMsSpin->setToolTip(QStringLiteral("Milliseconds to add after each word"));
-
-    m_speechFilterFadeSamplesSpin->setRange(0, 5000);
-    m_speechFilterFadeSamplesSpin->setValue(250);
-    m_speechFilterFadeSamplesSpin->setSuffix(QStringLiteral(" samples"));
-    m_speechFilterFadeSamplesSpin->setToolTip(QStringLiteral("Crossfade duration at speech boundaries (0 = no fade)"));
-
-    form->addRow(QStringLiteral("Speech Filter"), m_speechFilterEnabledCheckBox);
-    form->addRow(QStringLiteral("Prepend Time"), m_transcriptPrependMsSpin);
-    form->addRow(QStringLiteral("Postpend Time"), m_transcriptPostpendMsSpin);
-    form->addRow(QStringLiteral("Fade Length"), m_speechFilterFadeSamplesSpin);
-
-    layout->addLayout(form);
-    layout->addStretch(1);
-
+    layout->addWidget(m_profileSummaryTextEdit, 1);
+    layout->addWidget(m_profileBenchmarkButton);
     return page;
 }
 
 void InspectorPane::refresh()
 {
-    // TODO: Implement proper refresh with signals/slots architecture
-    // For now, this is handled by EditorWindow directly
+    emit refreshRequested();
 }

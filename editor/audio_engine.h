@@ -49,6 +49,10 @@ public:
         }
     }
 
+    void setSpeechFilterFadeSamples(int samples) {
+        m_speechFilterFadeSamples.store(qMax(0, samples), std::memory_order_release);
+    }
+
     bool initialize() {
         std::lock_guard<std::mutex> lock(m_stateMutex);
         if (m_initialized) {
@@ -154,6 +158,7 @@ public:
         {
             std::lock_guard<std::mutex> queueLock(m_queueMutex);
             m_pcmQueue.clear();
+            m_pcmChunkEndSamples.clear();
         }
         m_stateCondition.notify_all();
         m_decodeCondition.notify_one();
@@ -168,6 +173,7 @@ public:
         {
             std::lock_guard<std::mutex> queueLock(m_queueMutex);
             m_pcmQueue.clear();
+            m_pcmChunkEndSamples.clear();
         }
         {
             std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
@@ -188,6 +194,7 @@ public:
         {
             std::lock_guard<std::mutex> queueLock(m_queueMutex);
             m_pcmQueue.clear();
+            m_pcmChunkEndSamples.clear();
         }
         {
             std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
@@ -249,6 +256,24 @@ private:
         return qMax<int64_t>(0, static_cast<int64_t>(std::floor((static_cast<double>(samples) * kTimelineFps) / m_sampleRate)));
     }
 
+    int64_t nextPlayableSampleAtOrAfter(int64_t samplePos,
+                                        const QVector<ExportRangeSegment>& ranges) const {
+        if (ranges.isEmpty()) {
+            return qMax<int64_t>(0, samplePos);
+        }
+        for (const ExportRangeSegment& range : ranges) {
+            const int64_t rangeStartSample = timelineFrameToSamples(range.startFrame);
+            const int64_t rangeEndSampleExclusive = timelineFrameToSamples(range.endFrame + 1);
+            if (samplePos < rangeStartSample) {
+                return rangeStartSample;
+            }
+            if (samplePos >= rangeStartSample && samplePos < rangeEndSampleExclusive) {
+                return samplePos;
+            }
+        }
+        return qMax<int64_t>(0, samplePos);
+    }
+
     void scheduleDecodesLocked(const QVector<TimelineClip>& clips) {
         for (const TimelineClip& clip : clips) {
             if (!clip.hasAudio || clip.filePath.isEmpty()) {
@@ -262,60 +287,43 @@ private:
         }
     }
 
-    // Calculate fade gain for a sample position considering export ranges
-    // Returns gain factor (0.0 to 1.0) based on proximity to range boundaries
-    float calculateRangeFadeGain(int64_t samplePos, const QVector<ExportRangeSegment>& ranges, 
-                                  int fadeSamples) const {
+    // Calculate fade gain for a sample position considering export ranges.
+    // Uses sample distance from range boundaries for stable fades.
+    float calculateRangeFadeGain(int64_t samplePos, const QVector<ExportRangeSegment>& ranges,
+                                 int fadeSamples) const {
         if (ranges.isEmpty() || fadeSamples <= 0) {
             return 1.0f;
         }
 
-        const int64_t frame = samplesToTimelineFrame(samplePos);
-        
-        // Find which range (if any) this frame belongs to
         const ExportRangeSegment* currentRange = nullptr;
         for (const auto& range : ranges) {
-            if (frame >= range.startFrame && frame <= range.endFrame) {
+            const int64_t rangeStartSample = timelineFrameToSamples(range.startFrame);
+            const int64_t rangeEndSampleExclusive = timelineFrameToSamples(range.endFrame + 1);
+            if (samplePos >= rangeStartSample && samplePos < rangeEndSampleExclusive) {
                 currentRange = &range;
                 break;
             }
         }
 
         if (!currentRange) {
-            // Outside all ranges - full mute
             return 0.0f;
         }
 
-        // Check if we're near the start of a range (fade in)
-        if (frame <= currentRange->startFrame) {
-            const int64_t rangeStartSample = timelineFrameToSamples(currentRange->startFrame);
-            const int64_t samplesIntoRange = samplePos - rangeStartSample;
-            if (samplesIntoRange < 0) {
-                // Before range start
-                return 0.0f;
-            }
-            if (samplesIntoRange < fadeSamples) {
-                // Fade in
-                return static_cast<float>(samplesIntoRange) / static_cast<float>(fadeSamples);
-            }
-        }
+        const int64_t rangeStartSample = timelineFrameToSamples(currentRange->startFrame);
+        const int64_t rangeEndSampleExclusive = timelineFrameToSamples(currentRange->endFrame + 1);
+        const int64_t samplesFromStart = samplePos - rangeStartSample;
+        const int64_t samplesToEnd = rangeEndSampleExclusive - samplePos;
 
-        // Check if we're near the end of a range (fade out)
-        if (frame >= currentRange->endFrame) {
-            const int64_t rangeEndSample = timelineFrameToSamples(currentRange->endFrame);
-            const int64_t samplesPastEnd = samplePos - rangeEndSample;
-            if (samplesPastEnd > 0) {
-                // After range end
-                return 0.0f;
-            }
-            const int64_t samplesBeforeEnd = rangeEndSample - samplePos;
-            if (samplesBeforeEnd < fadeSamples) {
-                // Fade out
-                return static_cast<float>(samplesBeforeEnd) / static_cast<float>(fadeSamples);
-            }
+        float gain = 1.0f;
+        if (samplesFromStart < fadeSamples) {
+            gain = qMin(gain,
+                        static_cast<float>(samplesFromStart) / static_cast<float>(fadeSamples));
         }
-
-        return 1.0f;
+        if (samplesToEnd < fadeSamples) {
+            gain = qMin(gain,
+                        static_cast<float>(samplesToEnd) / static_cast<float>(fadeSamples));
+        }
+        return qBound(0.0f, gain, 1.0f);
     }
 
     // Calculate fade gain for clip-to-clip crossfade
@@ -526,8 +534,9 @@ private:
                 
                 // Apply speech filter range fade (if export ranges are set)
                 if (!context.exportRanges.isEmpty()) {
-                    gain *= calculateRangeFadeGain(samplePos, context.exportRanges, 
-                                                    clip.fadeSamples > 0 ? clip.fadeSamples : m_defaultFadeSamples);
+                    gain *= calculateRangeFadeGain(samplePos,
+                                                   context.exportRanges,
+                                                   m_speechFilterFadeSamples.load(std::memory_order_acquire));
                 }
                 
                 // Apply clip crossfade at clip boundaries
@@ -607,10 +616,10 @@ private:
                 if (!m_playing) {
                     continue;
                 }
-                chunkStartSample = m_timelineSampleCursor;
-                m_timelineSampleCursor += m_periodFrames;
                 context.clips = m_timelineClips;
                 context.exportRanges = exportRangesCopy();
+                chunkStartSample = nextPlayableSampleAtOrAfter(m_timelineSampleCursor, context.exportRanges);
+                m_timelineSampleCursor = chunkStartSample + m_periodFrames;
                 context.muted = m_muted;
                 context.volume = m_volume;
             }
@@ -623,11 +632,11 @@ private:
 
             {
                 std::lock_guard<std::mutex> queueLock(m_queueMutex);
-                for (int16_t sample : pcmBuffer) {
-                    if (m_pcmQueue.size() >= m_maxQueuedSamples) {
-                        break;
+                if (m_pcmQueue.size() + static_cast<size_t>(pcmBuffer.size()) <= m_maxQueuedSamples) {
+                    for (int16_t sample : pcmBuffer) {
+                        m_pcmQueue.push_back(sample);
                     }
-                    m_pcmQueue.push_back(sample);
+                    m_pcmChunkEndSamples.push_back(chunkStartSample + m_periodFrames);
                 }
             }
             m_queueCondition.notify_all();
@@ -662,6 +671,7 @@ private:
             }
 
             bool hadAudio = false;
+            int64_t consumedChunkEndSample = -1;
             {
                 std::unique_lock<std::mutex> queueLock(m_queueMutex);
                 if (m_pcmQueue.size() < pcmBuffer.size()) {
@@ -676,6 +686,10 @@ private:
                     for (int i = 0; i < pcmBuffer.size(); ++i) {
                         pcmBuffer[i] = m_pcmQueue.front();
                         m_pcmQueue.pop_front();
+                    }
+                    if (!m_pcmChunkEndSamples.empty()) {
+                        consumedChunkEndSample = m_pcmChunkEndSamples.front();
+                        m_pcmChunkEndSamples.pop_front();
                     }
                     hadAudio = true;
                 }
@@ -715,7 +729,11 @@ private:
             if (!hadAudio) {
                 m_underrunCount.fetch_add(1, std::memory_order_relaxed);
             } else {
-                m_audioClockSample.fetch_add(m_periodFrames, std::memory_order_release);
+                if (consumedChunkEndSample >= 0) {
+                    m_audioClockSample.store(consumedChunkEndSample, std::memory_order_release);
+                } else {
+                    m_audioClockSample.fetch_add(m_periodFrames, std::memory_order_release);
+                }
             }
             m_queueCondition.notify_all();
         }
@@ -733,6 +751,7 @@ private:
     std::deque<QString> m_pendingDecodePaths;
     QSet<QString> m_pendingDecodeSet;
     std::deque<int16_t> m_pcmQueue;
+    std::deque<int64_t> m_pcmChunkEndSamples;
     std::thread m_decodeWorker;
     std::thread m_mixWorker;
     std::thread m_outputWorker;
@@ -753,4 +772,5 @@ private:
     static constexpr int m_maxQueuedFrames = 8192;
     static constexpr size_t m_maxQueuedSamples = static_cast<size_t>(m_maxQueuedFrames * m_channelCount);
     static constexpr int m_defaultFadeSamples = 250;  // Default fade duration for speech filter boundaries
+    std::atomic<int> m_speechFilterFadeSamples{m_defaultFadeSamples};
 };

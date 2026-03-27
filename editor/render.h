@@ -18,6 +18,8 @@ struct RenderProgress {
     int64_t segmentStartFrame = 0;
     int64_t segmentEndFrame = 0;
     bool usingGpu = false;
+    bool usingHardwareEncode = false;
+    QString encoderLabel;
     QImage previewFrame;
 };
 
@@ -36,6 +38,8 @@ struct RenderResult {
     bool success = false;
     bool cancelled = false;
     bool usedGpu = false;
+    bool usedHardwareEncode = false;
+    QString encoderLabel;
     QString message;
 };
 

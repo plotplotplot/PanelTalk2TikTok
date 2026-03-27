@@ -44,6 +44,18 @@ void TimelineWidget::setClips(const QVector<TimelineClip>& clips) {
     if (!selectedClip()) {
         m_selectedClipId.clear();
     }
+    bool hoveredClipStillExists = m_hoveredClipId.isEmpty();
+    if (!hoveredClipStillExists) {
+        for (const TimelineClip& clip : m_clips) {
+            if (clip.id == m_hoveredClipId) {
+                hoveredClipStillExists = true;
+                break;
+            }
+        }
+    }
+    if (!hoveredClipStillExists) {
+        m_hoveredClipId.clear();
+    }
     normalizeExportRange();
     updateMinimumTimelineHeight();
     update();
@@ -919,6 +931,13 @@ void TimelineWidget::updateHoverCursor(const QPoint& pos) {
     setCursor(Qt::ArrowCursor);
 }
 
+bool TimelineWidget::clipHasProxyAvailable(const TimelineClip& clip) const {
+    if (clip.mediaType != ClipMediaType::Video || isImageSequencePath(clip.filePath)) {
+        return false;
+    }
+    return !playbackProxyPathForClip(clip).isEmpty();
+}
+
 int64_t TimelineWidget::frameFromX(qreal x) const {
     const int left = timelineContentRect().left();
     const qreal normalized = qMax<qreal>(0.0, x - left);
@@ -983,8 +1002,9 @@ TimelineClip TimelineWidget::buildClipFromFile(const QString& filePath,
     TimelineClip clip;
     clip.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     clip.filePath = filePath;
-    clip.label = info.fileName();
+    clip.label = isImageSequencePath(filePath) ? imageSequenceDisplayLabel(filePath) : info.fileName();
     clip.mediaType = probe.mediaType;
+    clip.sourceKind = probe.sourceKind;
     clip.hasAudio = probe.hasAudio;
     clip.sourceDurationFrames = probe.durationFrames;
     clip.startFrame = startFrame;
@@ -1000,7 +1020,7 @@ TimelineClip TimelineWidget::buildClipFromFile(const QString& filePath,
 
 void TimelineWidget::addClipFromFile(const QString& filePath, int64_t startFrame) {
     const QFileInfo info(filePath);
-    if (!info.exists() || !info.isFile()) return;
+    if (!info.exists() || (!info.isFile() && !isImageSequencePath(filePath))) return;
 
     TimelineClip clip = buildClipFromFile(filePath,
                                           startFrame >= 0 ? startFrame : totalFrames(),
@@ -1063,7 +1083,7 @@ void TimelineWidget::dropEvent(QDropEvent* event) {
 
         const QString filePath = url.toLocalFile();
         const QFileInfo info(filePath);
-        if (!info.exists() || info.isDir()) continue;
+        if (!info.exists() || (info.isDir() && !isImageSequencePath(filePath))) continue;
 
         ensureTrackCount(targetTrack + 1);
         TimelineClip clip = buildClipFromFile(filePath, insertFrame, targetTrack);
@@ -1186,6 +1206,33 @@ void TimelineWidget::mousePressEvent(QMouseEvent* event) {
 }
 
 void TimelineWidget::mouseMoveEvent(QMouseEvent* event) {
+    const int hoveredClipIndex = clipIndexAt(event->position().toPoint());
+    const QString hoveredClipId =
+        hoveredClipIndex >= 0 ? m_clips[hoveredClipIndex].id : QString();
+    if (hoveredClipId != m_hoveredClipId) {
+        m_hoveredClipId = hoveredClipId;
+        update();
+    }
+    if (hoveredClipIndex >= 0) {
+        const TimelineClip& hoveredClip = m_clips[hoveredClipIndex];
+        const bool isSequence = hoveredClip.sourceKind == MediaSourceKind::ImageSequence;
+        const QString typeLabel =
+            hoveredClip.mediaType == ClipMediaType::Audio ? QStringLiteral("Audio")
+            : (hoveredClip.mediaType == ClipMediaType::Image ? QStringLiteral("Image")
+               : (isSequence ? QStringLiteral("Sequence") : QStringLiteral("Video")));
+        const int64_t localTimelineFrame =
+            qBound<int64_t>(0,
+                            m_currentFrame - hoveredClip.startFrame,
+                            qMax<int64_t>(0, hoveredClip.durationFrames - 1));
+        const int64_t clipFrame =
+            adjustedClipLocalFrameAtTimelineFrame(hoveredClip, localTimelineFrame, m_renderSyncMarkers);
+        setToolTip(QStringLiteral("%1\n%2\nFrame %3")
+                       .arg(hoveredClip.label, typeLabel)
+                       .arg(clipFrame));
+    } else {
+        setToolTip(QString());
+    }
+
     if (m_exportRangeDragMode != ExportRangeDragMode::None && (event->buttons() & Qt::LeftButton)) {
         if (m_exportRangeDragSegmentIndex < 0 || m_exportRangeDragSegmentIndex >= m_exportRanges.size()) {
             m_exportRangeDragMode = ExportRangeDragMode::None;
@@ -1316,6 +1363,15 @@ void TimelineWidget::mouseMoveEvent(QMouseEvent* event) {
     }
     updateHoverCursor(event->position().toPoint());
     QWidget::mouseMoveEvent(event);
+}
+
+void TimelineWidget::leaveEvent(QEvent* event) {
+    if (!m_hoveredClipId.isEmpty()) {
+        m_hoveredClipId.clear();
+        update();
+    }
+    setToolTip(QString());
+    QWidget::leaveEvent(event);
 }
 
 void TimelineWidget::mouseReleaseEvent(QMouseEvent* event) {
@@ -1459,7 +1515,9 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
         createProxyAction = menu.addAction(
             detectedProxyPath.isEmpty() ? QStringLiteral("Create Proxy...")
                                         : QStringLiteral("Recreate Proxy..."));
-        createProxyAction->setEnabled(m_clips[clipIndex].mediaType == ClipMediaType::Video);
+        createProxyAction->setEnabled(
+            m_clips[clipIndex].mediaType == ClipMediaType::Video &&
+            !isImageSequencePath(m_clips[clipIndex].filePath));
         propertiesAction = menu.addAction(QStringLiteral("Properties"));
         menu.addSeparator();
     }
@@ -1602,12 +1660,13 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
     if (selected == propertiesAction) {
         const TimelineClip& clip = m_clips[clipIndex];
         QMessageBox::information(this, QStringLiteral("Clip Properties"),
-            QStringLiteral("Name: %1\nPath: %2\nProxy: %3\nType: %4\nStart: %5\nSource In: %6\nDuration: %7 frames\nAudio start offset: %8 ms\nBrightness: %9\nContrast: %10\nSaturation: %11\nOpacity: %12\nLocked: %13")
+            QStringLiteral("Name: %1\nPath: %2\nProxy: %3\nType: %4\nSource Kind: %5\nStart: %6\nSource In: %7\nDuration: %8 frames\nAudio start offset: %9 ms\nBrightness: %10\nContrast: %11\nSaturation: %12\nOpacity: %13\nLocked: %14")
                 .arg(clip.label)
                 .arg(QDir::toNativeSeparators(clip.filePath))
                 .arg(playbackProxyPathForClip(clip).isEmpty() ? QStringLiteral("None")
                                                                : QDir::toNativeSeparators(playbackProxyPathForClip(clip)))
                 .arg(clipMediaTypeLabel(clip.mediaType))
+                .arg(mediaSourceKindLabel(clip.sourceKind))
                 .arg(timecodeForFrame(clip.startFrame))
                 .arg(timecodeForFrame(clip.sourceInFrame))
                 .arg(clip.durationFrames)
@@ -1805,6 +1864,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
     for (const TimelineClip& clip : m_clips) {
         const QRect clipRect = clipRectFor(clip);
         const bool audioOnly = clipIsAudioOnly(clip);
+        const bool hovered = clip.id == m_hoveredClipId;
         const bool showSourceGhost = clip.mediaType != ClipMediaType::Image;
         if (showSourceGhost) {
             const int64_t ghostStartFrame = qMax<int64_t>(0, clip.startFrame - clip.sourceInFrame);
@@ -1880,6 +1940,64 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
                         Qt::AlignLeft | Qt::AlignVCenter,
                         painter.fontMetrics().elidedText(clipTitle, Qt::ElideRight,
                                                          clipRect.width() - 20));
+
+        if (hovered) {
+            const bool isSequence = clip.sourceKind == MediaSourceKind::ImageSequence;
+            const bool hasProxy = clipHasProxyAvailable(clip);
+            QString badgeText;
+            if (clip.mediaType == ClipMediaType::Audio) {
+                badgeText = QStringLiteral("AUDIO");
+            } else if (clip.mediaType == ClipMediaType::Image) {
+                badgeText = QStringLiteral("IMAGE");
+            } else if (isSequence) {
+                badgeText = QStringLiteral("SEQUENCE");
+            } else {
+                badgeText = hasProxy ? QStringLiteral("PROXY")
+                                     : QStringLiteral("NEEDS PROXY");
+            }
+            const QFontMetrics badgeMetrics = painter.fontMetrics();
+            const int badgeWidth = badgeMetrics.horizontalAdvance(badgeText) + 18;
+            const int badgeHeight = 18;
+            const QRect badgeRect(clipRect.right() - badgeWidth - 8,
+                                  clipRect.top() + 7,
+                                  badgeWidth,
+                                  badgeHeight);
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(clip.mediaType == ClipMediaType::Audio
+                                 ? QColor(QStringLiteral("#1f3e4c"))
+                                 : (clip.mediaType == ClipMediaType::Image
+                                 ? QColor(QStringLiteral("#3a2c12"))
+                                 : (isSequence ? QColor(QStringLiteral("#1f2f5a"))
+                                               : (hasProxy ? QColor(QStringLiteral("#113c28"))
+                                                           : QColor(QStringLiteral("#4a3113"))))));
+            painter.drawRoundedRect(badgeRect, 9, 9);
+            painter.setPen(clip.mediaType == ClipMediaType::Audio
+                               ? QColor(QStringLiteral("#cfefff"))
+                               : (clip.mediaType == ClipMediaType::Image
+                               ? QColor(QStringLiteral("#ffe4a8"))
+                               : (isSequence ? QColor(QStringLiteral("#c9d9ff"))
+                                             : (hasProxy ? QColor(QStringLiteral("#b8f5cf"))
+                                                         : QColor(QStringLiteral("#ffe1a8"))))));
+            painter.drawText(badgeRect, Qt::AlignCenter, badgeText);
+
+            const int64_t localTimelineFrame =
+                qBound<int64_t>(0,
+                                m_currentFrame - clip.startFrame,
+                                qMax<int64_t>(0, clip.durationFrames - 1));
+            const int64_t clipFrame =
+                adjustedClipLocalFrameAtTimelineFrame(clip, localTimelineFrame, m_renderSyncMarkers);
+            const QString frameBadgeText = QStringLiteral("FRAME %1").arg(clipFrame);
+            const int frameBadgeWidth = badgeMetrics.horizontalAdvance(frameBadgeText) + 18;
+            const QRect frameBadgeRect(clipRect.right() - frameBadgeWidth - 8,
+                                       badgeRect.bottom() + 6,
+                                       frameBadgeWidth,
+                                       badgeHeight);
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(QColor(QStringLiteral("#18303e")));
+            painter.drawRoundedRect(frameBadgeRect, 9, 9);
+            painter.setPen(QColor(QStringLiteral("#d7f2ff")));
+            painter.drawText(frameBadgeRect, Qt::AlignCenter, frameBadgeText);
+        }
 
     }
 

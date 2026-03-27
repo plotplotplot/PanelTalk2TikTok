@@ -1,5 +1,6 @@
 #include "async_decoder.h"
 #include "debug_controls.h"
+#include "editor_shared.h"
 
 #include <QDebug>
 #include <QDateTime>
@@ -9,6 +10,7 @@
 #include <QHash>
 #include <QImageReader>
 #include <QGuiApplication>
+#include <QPainter>
 #include <QThread>
 #include <QThreadStorage>
 
@@ -56,6 +58,144 @@ bool isStillImagePath(const QString& path) {
         QStringLiteral("tiff")
     };
     return suffixes.contains(QFileInfo(path).suffix().toLower());
+}
+
+QImage loadSingleImageFile(const QString& framePath);
+
+QImage loadSequenceFrameImage(const QStringList& framePaths, int64_t frameNumber) {
+    if (framePaths.isEmpty()) {
+        return QImage();
+    }
+    const int index = qBound(0, static_cast<int>(frameNumber), framePaths.size() - 1);
+    const QString framePath = framePaths.at(index);
+    return loadSingleImageFile(framePath);
+}
+
+QImage loadSingleImageFile(const QString& framePath) {
+    if (framePath.isEmpty()) {
+        return QImage();
+    }
+
+    QImageReader reader(framePath);
+    reader.setAutoTransform(true);
+    QImage image = reader.read();
+    if (!image.isNull()) {
+        return image;
+    }
+
+    AVFormatContext* formatCtx = nullptr;
+    const QByteArray pathBytes = QFile::encodeName(framePath);
+    const QString suffix = QFileInfo(framePath).suffix().toLower();
+    const AVInputFormat* inputFormat = nullptr;
+    if (suffix == QStringLiteral("webp")) {
+        inputFormat = av_find_input_format("webp_pipe");
+    } else {
+        inputFormat = av_find_input_format("image2");
+    }
+    if (avformat_open_input(&formatCtx, pathBytes.constData(), inputFormat, nullptr) < 0) {
+        return QImage();
+    }
+
+    if (avformat_find_stream_info(formatCtx, nullptr) < 0) {
+        avformat_close_input(&formatCtx);
+        return QImage();
+    }
+
+    int videoStreamIndex = -1;
+    for (unsigned i = 0; i < formatCtx->nb_streams; ++i) {
+        if (formatCtx->streams[i] &&
+            formatCtx->streams[i]->codecpar &&
+            formatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            videoStreamIndex = static_cast<int>(i);
+            break;
+        }
+    }
+    if (videoStreamIndex < 0) {
+        avformat_close_input(&formatCtx);
+        return QImage();
+    }
+
+    AVStream* stream = formatCtx->streams[videoStreamIndex];
+    const AVCodec* decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+    if (!decoder) {
+        avformat_close_input(&formatCtx);
+        return QImage();
+    }
+
+    AVCodecContext* codecCtx = avcodec_alloc_context3(decoder);
+    if (!codecCtx) {
+        avformat_close_input(&formatCtx);
+        return QImage();
+    }
+    if (avcodec_parameters_to_context(codecCtx, stream->codecpar) < 0 ||
+        avcodec_open2(codecCtx, decoder, nullptr) < 0) {
+        avcodec_free_context(&codecCtx);
+        avformat_close_input(&formatCtx);
+        return QImage();
+    }
+
+    AVPacket* packet = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    SwsContext* swsCtx = nullptr;
+    QImage decodedImage;
+
+    while (packet && frame && av_read_frame(formatCtx, packet) >= 0 && decodedImage.isNull()) {
+        if (packet->stream_index == videoStreamIndex && avcodec_send_packet(codecCtx, packet) >= 0) {
+            while (avcodec_receive_frame(codecCtx, frame) >= 0) {
+                swsCtx = sws_getCachedContext(swsCtx,
+                                              frame->width,
+                                              frame->height,
+                                              static_cast<AVPixelFormat>(frame->format),
+                                              frame->width,
+                                              frame->height,
+                                              AV_PIX_FMT_RGBA,
+                                              SWS_BILINEAR,
+                                              nullptr,
+                                              nullptr,
+                                              nullptr);
+                if (!swsCtx) {
+                    av_frame_unref(frame);
+                    break;
+                }
+
+                QImage rgba(frame->width, frame->height, QImage::Format_RGBA8888);
+                if (rgba.isNull()) {
+                    av_frame_unref(frame);
+                    break;
+                }
+
+                uint8_t* destData[4] = { rgba.bits(), nullptr, nullptr, nullptr };
+                int destLinesize[4] = { static_cast<int>(rgba.bytesPerLine()), 0, 0, 0 };
+                if (sws_scale(swsCtx,
+                              frame->data,
+                              frame->linesize,
+                              0,
+                              frame->height,
+                              destData,
+                              destLinesize) > 0) {
+                    decodedImage = rgba;
+                }
+                av_frame_unref(frame);
+                if (!decodedImage.isNull()) {
+                    break;
+                }
+            }
+        }
+        av_packet_unref(packet);
+    }
+
+    if (swsCtx) {
+        sws_freeContext(swsCtx);
+    }
+    if (frame) {
+        av_frame_free(&frame);
+    }
+    if (packet) {
+        av_packet_free(&packet);
+    }
+    avcodec_free_context(&codecCtx);
+    avformat_close_input(&formatCtx);
+    return decodedImage;
 }
 
 void decodeTrace(const QString& stage, const QString& detail = QString()) {
@@ -167,6 +307,13 @@ void DecoderContext::shutdown() {
 }
 
 bool DecoderContext::initialize() {
+    if (isImageSequencePath(m_path)) {
+        if (!loadImageSequence()) {
+            return false;
+        }
+        updateAccessTime();
+        return true;
+    }
     if (isStillImagePath(m_path)) {
         if (!loadStillImage()) {
             return false;
@@ -238,11 +385,9 @@ bool DecoderContext::openInput() {
 }
 
 bool DecoderContext::loadStillImage() {
-    QImageReader reader(m_path);
-    reader.setAutoTransform(true);
-    QImage image = reader.read();
+    QImage image = loadSingleImageFile(m_path);
     if (image.isNull()) {
-        qWarning() << "Failed to load image:" << m_path << reader.errorString();
+        qWarning() << "Failed to load image:" << m_path;
         return false;
     }
 
@@ -257,6 +402,36 @@ bool DecoderContext::loadStillImage() {
     m_info.fps = 30.0;
     m_info.frameSize = image.size();
     m_info.codecName = QStringLiteral("still-image");
+    m_info.hasAlpha = image.hasAlphaChannel();
+    m_info.isValid = true;
+    m_lastDecodedFrame = 0;
+    m_eof = false;
+    return true;
+}
+
+bool DecoderContext::loadImageSequence() {
+    const QStringList framePaths = imageSequenceFramePaths(m_path);
+    if (framePaths.isEmpty()) {
+        return false;
+    }
+
+    QImage image = loadSequenceFrameImage(framePaths, 0);
+    if (image.isNull()) {
+        qWarning() << "Failed to load first image sequence frame:" << m_path;
+        return false;
+    }
+    if (image.format() != QImage::Format_ARGB32_Premultiplied) {
+        image = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    }
+
+    m_isImageSequence = true;
+    m_sequenceFramePaths = framePaths;
+    m_stillImage = image;
+    m_info.path = m_path;
+    m_info.durationFrames = framePaths.size();
+    m_info.fps = 30.0;
+    m_info.frameSize = image.size();
+    m_info.codecName = QStringLiteral("image_sequence");
     m_info.hasAlpha = image.hasAlphaChannel();
     m_info.isValid = true;
     m_lastDecodedFrame = 0;
@@ -413,6 +588,18 @@ bool DecoderContext::initHardwareAccel(const AVCodec* decoder) {
 }
 
 FrameHandle DecoderContext::decodeFrame(int64_t frameNumber) {
+    if (m_isImageSequence) {
+        updateAccessTime();
+        QImage image = loadSequenceFrameImage(m_sequenceFramePaths, frameNumber);
+        if (image.isNull()) {
+            return FrameHandle();
+        }
+        if (image.format() != QImage::Format_ARGB32_Premultiplied) {
+            image = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        }
+        m_lastDecodedFrame = qBound<int64_t>(0, frameNumber, static_cast<int64_t>(m_sequenceFramePaths.size() - 1));
+        return FrameHandle::createCpuFrame(image, m_lastDecodedFrame, m_path);
+    }
     if (m_isStillImage) {
         updateAccessTime();
         return FrameHandle::createCpuFrame(m_stillImage, 0, m_path);
@@ -423,20 +610,7 @@ FrameHandle DecoderContext::decodeFrame(int64_t frameNumber) {
                     .arg(shortPath(m_path))
                     .arg(frameNumber)
                     .arg(m_lastDecodedFrame));
-    if (m_eof) {
-        m_eof = false;
-    }
-    
-    updateAccessTime();
-    
-    const QVector<FrameHandle> frames = decodeThroughFrame(frameNumber);
-    FrameHandle result;
-    for (const FrameHandle& frame : frames) {
-        if (!frame.isNull() && frame.frameNumber() >= frameNumber) {
-            result = frame;
-            break;
-        }
-    }
+    FrameHandle result = seekAndDecode(frameNumber);
     decodeTrace(QStringLiteral("DecoderContext::decodeFrame.end"),
                 QStringLiteral("file=%1 target=%2 null=%3 decoded=%4")
                     .arg(shortPath(m_path))
@@ -447,6 +621,10 @@ FrameHandle DecoderContext::decodeFrame(int64_t frameNumber) {
 }
 
 QVector<FrameHandle> DecoderContext::decodeThroughFrame(int64_t targetFrame) {
+    if (m_isImageSequence) {
+        FrameHandle frame = decodeFrame(targetFrame);
+        return frame.isNull() ? QVector<FrameHandle>() : QVector<FrameHandle>{frame};
+    }
     if (m_isStillImage) {
         updateAccessTime();
         return {FrameHandle::createCpuFrame(m_stillImage, 0, m_path)};
@@ -471,6 +649,9 @@ QVector<FrameHandle> DecoderContext::decodeThroughFrame(int64_t targetFrame) {
 }
 
 FrameHandle DecoderContext::seekAndDecode(int64_t frameNumber) {
+    if (m_isImageSequence) {
+        return decodeFrame(frameNumber);
+    }
     if (m_isStillImage) {
         updateAccessTime();
         return FrameHandle::createCpuFrame(m_stillImage, 0, m_path);
@@ -1017,7 +1198,6 @@ void DecoderWorker::run() {
 }
 
 void DecoderWorker::processRequest(const DecodeRequest& req) {
-    static constexpr int kMaxVisibleBatchRequests = 6;
     const qint64 startedAt = decodeTraceMs();
     decodeTrace(QStringLiteral("DecoderWorker::processRequest.begin"),
                 QStringLiteral("seq=%1 file=%2 frame=%3 priority=%4 queue=%5 thread=%6")
@@ -1037,37 +1217,6 @@ void DecoderWorker::processRequest(const DecodeRequest& req) {
         return;
     }
 
-    if (req.kind == DecodeRequestKind::Visible) {
-        QVector<DecodeRequest> batch;
-        batch.push_back(req);
-        QVector<DecodeRequest> followups =
-            m_queue ? m_queue->takeSameFileVisibleRequests(req.filePath, req.frameNumber + 1, kMaxVisibleBatchRequests - 1)
-                    : QVector<DecodeRequest>();
-        batch += followups;
-        std::sort(batch.begin(), batch.end(),
-                  [](const DecodeRequest& a, const DecodeRequest& b) {
-                      if (a.frameNumber == b.frameNumber) {
-                          return a.sequenceId < b.sequenceId;
-                      }
-                      return a.frameNumber < b.frameNumber;
-                  });
-        decodeTrace(QStringLiteral("DecoderWorker::processRequest.batch"),
-                    QStringLiteral("file=%1 first=%2 last=%3 count=%4")
-                        .arg(shortPath(req.filePath))
-                        .arg(batch.first().frameNumber)
-                        .arg(batch.last().frameNumber)
-                        .arg(batch.size()));
-        processVisibleBatch(batch, ctx);
-        decodeTrace(QStringLiteral("DecoderWorker::processRequest.end"),
-                    QStringLiteral("seq=%1 file=%2 frame=%3 kind=visible-batch count=%4 waitMs=%5")
-                        .arg(req.sequenceId)
-                        .arg(shortPath(req.filePath))
-                        .arg(req.frameNumber)
-                        .arg(batch.size())
-                        .arg(decodeTraceMs() - startedAt));
-        return;
-    }
-
     FrameHandle frame = ctx->decodeFrame(req.frameNumber);
 
     if (frame.isNull()) {
@@ -1082,10 +1231,11 @@ void DecoderWorker::processRequest(const DecodeRequest& req) {
 
     emit frameDecoded(frame);
     decodeTrace(QStringLiteral("DecoderWorker::processRequest.end"),
-                QStringLiteral("seq=%1 file=%2 frame=%3 null=%4 waitMs=%5")
+                QStringLiteral("seq=%1 file=%2 frame=%3 kind=%4 null=%5 waitMs=%6")
                     .arg(req.sequenceId)
                     .arg(shortPath(req.filePath))
                     .arg(req.frameNumber)
+                    .arg(static_cast<int>(req.kind))
                     .arg(frame.isNull())
                     .arg(decodeTraceMs() - startedAt));
 }

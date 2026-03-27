@@ -40,6 +40,17 @@ namespace {
 constexpr int kRenderAudioSampleRate = 48000;
 constexpr int kRenderAudioChannels = 2;
 
+bool isHardwareEncoderLabel(const QString& codecLabel) {
+    const QString lowered = codecLabel.toLower();
+    return lowered.contains(QStringLiteral("nvenc")) ||
+           lowered.contains(QStringLiteral("qsv")) ||
+           lowered.contains(QStringLiteral("vaapi")) ||
+           lowered.contains(QStringLiteral("videotoolbox")) ||
+           lowered.contains(QStringLiteral("amf")) ||
+           lowered.contains(QStringLiteral("omx")) ||
+           lowered.contains(QStringLiteral("mediacodec"));
+}
+
 QString avErrToString(int errnum) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE];
     av_strerror(errnum, errbuf, AV_ERROR_MAX_STRING_SIZE);
@@ -67,7 +78,7 @@ TranscriptOverlayLayout transcriptOverlayLayoutForFrame(const TimelineClip& clip
     }
     const QString cacheKey = clip.filePath;
     if (!transcriptCache.contains(cacheKey)) {
-        transcriptCache.insert(cacheKey, loadTranscriptSections(transcriptPathForClipFile(clip.filePath)));
+        transcriptCache.insert(cacheKey, loadTranscriptSections(transcriptWorkingPathForClipFile(clip.filePath)));
     }
     const QVector<TranscriptSection>& sections = transcriptCache.value(cacheKey);
     if (sections.isEmpty()) {
@@ -1253,6 +1264,9 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
         result.message = QStringLiteral("No encoder available for format %1.").arg(request.outputFormat);
         return result;
     }
+    const bool usingHardwareEncode = isHardwareEncoderLabel(codecLabel);
+    result.usedHardwareEncode = usingHardwareEncode;
+    result.encoderLabel = codecLabel;
 
     AVStream* stream = avformat_new_stream(formatCtx, nullptr);
     if (!stream) {
@@ -1420,6 +1434,8 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
                 progress.segmentStartFrame = exportStart;
                 progress.segmentEndFrame = exportEnd;
                 progress.usingGpu = useGpuRenderer;
+                progress.usingHardwareEncode = usingHardwareEncode;
+                progress.encoderLabel = codecLabel;
                 if (!progressCallback(progress)) {
                     result.cancelled = true;
                     errorMessage = QStringLiteral("Render cancelled.");
@@ -1448,6 +1464,8 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
                 progress.segmentStartFrame = exportStart;
                 progress.segmentEndFrame = exportEnd;
                 progress.usingGpu = useGpuRenderer;
+                progress.usingHardwareEncode = usingHardwareEncode;
+                progress.encoderLabel = codecLabel;
                 progress.previewFrame = rendered;
                 if (!progressCallback(progress)) {
                     result.cancelled = true;

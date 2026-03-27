@@ -65,6 +65,7 @@
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QProgressBar>
+#include <QProgressDialog>
 #include <QPushButton>
 #include <QRandomGenerator>
 #include <QRegularExpression>
@@ -88,6 +89,7 @@
 #include <QStandardPaths>
 #include <QTableWidget>
 #include <QTextDocument>
+#include <QTextEdit>
 #include <QPointer>
 #include <QElapsedTimer>
 
@@ -113,6 +115,7 @@ extern "C"
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 #include <libavutil/samplefmt.h>
@@ -206,6 +209,8 @@ public:
         m_opacitySpin = m_inspectorPane->opacitySpin();
         m_keyframesInspectorClipLabel = m_inspectorPane->keyframesInspectorClipLabel();
         m_keyframesInspectorDetailsLabel = m_inspectorPane->keyframesInspectorDetailsLabel();
+        m_keyframesAutoScrollCheckBox = m_inspectorPane->keyframesAutoScrollCheckBox();
+        m_keyframesFollowCurrentCheckBox = m_inspectorPane->keyframesFollowCurrentCheckBox();
         m_audioInspectorClipLabel = m_inspectorPane->audioInspectorClipLabel();
         m_audioInspectorDetailsLabel = m_inspectorPane->audioInspectorDetailsLabel();
         m_videoTranslationXSpin = m_inspectorPane->videoTranslationXSpin();
@@ -222,9 +227,14 @@ public:
         m_exportStartSpin = m_inspectorPane->exportStartSpin();
         m_exportEndSpin = m_inspectorPane->exportEndSpin();
         m_outputFormatCombo = m_inspectorPane->outputFormatCombo();
+        m_outputRangeSummaryLabel = m_inspectorPane->outputRangeSummaryLabel();
+        m_renderButton = m_inspectorPane->renderButton();
+        m_profileSummaryTextEdit = m_inspectorPane->profileSummaryTextEdit();
+        m_profileBenchmarkButton = m_inspectorPane->profileBenchmarkButton();
         m_transcriptPrependMsSpin = m_inspectorPane->transcriptPrependMsSpin();
         m_transcriptPostpendMsSpin = m_inspectorPane->transcriptPostpendMsSpin();
         m_speechFilterEnabledCheckBox = m_inspectorPane->speechFilterEnabledCheckBox();
+        m_speechFilterFadeSamplesSpin = m_inspectorPane->speechFilterFadeSamplesSpin();
 
         splitter->setStretchFactor(0, 0);
         splitter->setStretchFactor(1, 1);
@@ -238,10 +248,17 @@ public:
         m_playbackTimer.setInterval(16);
         auto *undoShortcut = new QShortcut(QKeySequence::Undo, this);
         connect(undoShortcut, &QShortcut::activated, this, [this]()
-                { undoHistory(); });
+                {
+            if (shouldBlockGlobalEditorShortcuts()) {
+                return;
+            }
+            undoHistory(); });
         auto *splitShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+B")), this);
         connect(splitShortcut, &QShortcut::activated, this, [this]()
                 {
+            if (shouldBlockGlobalEditorShortcuts()) {
+                return;
+            }
             if (!m_timeline) {
                 return;
             }
@@ -251,6 +268,9 @@ public:
         auto *deleteShortcut = new QShortcut(QKeySequence::Delete, this);
         connect(deleteShortcut, &QShortcut::activated, this, [this]()
                 {
+            if (focusInTranscriptTable() || focusInKeyframeTable() || shouldBlockGlobalEditorShortcuts()) {
+                return;
+            }
             if (!m_timeline) {
                 return;
             }
@@ -260,18 +280,27 @@ public:
         auto *nudgeLeftShortcut = new QShortcut(QKeySequence(QStringLiteral("Alt+Left")), this);
         connect(nudgeLeftShortcut, &QShortcut::activated, this, [this]()
                 {
+            if (shouldBlockGlobalEditorShortcuts()) {
+                return;
+            }
             if (m_timeline) {
                 m_timeline->nudgeSelectedClip(-1);
             } });
         auto *nudgeRightShortcut = new QShortcut(QKeySequence(QStringLiteral("Alt+Right")), this);
         connect(nudgeRightShortcut, &QShortcut::activated, this, [this]()
                 {
+            if (shouldBlockGlobalEditorShortcuts()) {
+                return;
+            }
             if (m_timeline) {
                 m_timeline->nudgeSelectedClip(1);
             } });
         auto *playbackShortcut = new QShortcut(QKeySequence(Qt::Key_Space), this);
         connect(playbackShortcut, &QShortcut::activated, this, [this]()
                 {
+            if (shouldBlockGlobalEditorShortcuts()) {
+                return;
+            }
             if (m_timeline) {
                 togglePlayback();
             } });
@@ -284,6 +313,10 @@ public:
         m_stateSaveTimer.setInterval(250);
         connect(&m_stateSaveTimer, &QTimer::timeout, this, [this]()
                 { saveStateNow(); });
+        initializeDeferredTimelineSeek(&m_transcriptClickSeekTimer,
+                                       &m_pendingTranscriptClickTimelineFrame);
+        initializeDeferredTimelineSeek(&m_keyframeClickSeekTimer,
+                                       &m_pendingKeyframeClickTimelineFrame);
 
         m_fastCurrentFrame.store(0);
         m_fastPlaybackActive.store(false);
@@ -313,6 +346,110 @@ public:
         m_controlServer->start(controlPort);
         qDebug() << "[STARTUP] ControlServer started in" << ctorTimer.elapsed() << "ms";
         m_audioEngine = std::make_unique<AudioEngine>();
+        m_audioEngine->setSpeechFilterFadeSamples(m_speechFilterFadeSamples);
+
+        const auto refreshSpeechFilterRouting = [this](bool pushHistory = false)
+        {
+            const QVector<ExportRangeSegment> ranges = effectivePlaybackRanges();
+            if (m_preview)
+            {
+                m_preview->setExportRanges(ranges);
+            }
+            if (m_audioEngine)
+            {
+                m_audioEngine->setExportRanges(ranges);
+                m_audioEngine->setSpeechFilterFadeSamples(m_speechFilterFadeSamples);
+            }
+            m_inspectorPane->refresh();
+            scheduleSaveState();
+            if (pushHistory)
+            {
+                pushHistorySnapshot();
+            }
+        };
+
+        connect(m_speechFilterEnabledCheckBox, &QCheckBox::toggled, this, [refreshSpeechFilterRouting](bool)
+                { refreshSpeechFilterRouting(true); });
+        connect(m_transcriptPrependMsSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this, refreshSpeechFilterRouting](int value)
+                {
+            m_transcriptPrependMs = qMax(0, value);
+            refreshSpeechFilterRouting(true); });
+        connect(m_transcriptPostpendMsSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this, refreshSpeechFilterRouting](int value)
+                {
+            m_transcriptPostpendMs = qMax(0, value);
+            refreshSpeechFilterRouting(true); });
+        connect(m_speechFilterFadeSamplesSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this, refreshSpeechFilterRouting](int value)
+                {
+            m_speechFilterFadeSamples = qMax(0, value);
+            refreshSpeechFilterRouting(true); });
+
+        auto connectTranscriptOverlayLive = [this](auto *widget, auto signal)
+        {
+            connect(widget, signal, this, [this]()
+                    { applySelectedTranscriptOverlayFromInspector(true); });
+        };
+        connectTranscriptOverlayLive(m_transcriptOverlayEnabledCheckBox, &QCheckBox::toggled);
+        connectTranscriptOverlayLive(m_transcriptMaxLinesSpin, qOverload<int>(&QSpinBox::valueChanged));
+        connectTranscriptOverlayLive(m_transcriptMaxCharsSpin, qOverload<int>(&QSpinBox::valueChanged));
+        connectTranscriptOverlayLive(m_transcriptAutoScrollCheckBox, &QCheckBox::toggled);
+        connectTranscriptOverlayLive(m_transcriptOverlayXSpin, qOverload<double>(&QDoubleSpinBox::valueChanged));
+        connectTranscriptOverlayLive(m_transcriptOverlayYSpin, qOverload<double>(&QDoubleSpinBox::valueChanged));
+        connectTranscriptOverlayLive(m_transcriptOverlayWidthSpin, qOverload<int>(&QSpinBox::valueChanged));
+        connectTranscriptOverlayLive(m_transcriptOverlayHeightSpin, qOverload<int>(&QSpinBox::valueChanged));
+        connectTranscriptOverlayLive(m_transcriptFontFamilyCombo, &QFontComboBox::currentFontChanged);
+        connectTranscriptOverlayLive(m_transcriptFontSizeSpin, qOverload<int>(&QSpinBox::valueChanged));
+        connectTranscriptOverlayLive(m_transcriptBoldCheckBox, &QCheckBox::toggled);
+        connectTranscriptOverlayLive(m_transcriptItalicCheckBox, &QCheckBox::toggled);
+        connect(m_transcriptFollowCurrentWordCheckBox, &QCheckBox::toggled, this, [this](bool)
+                {
+            scheduleSaveState();
+            m_inspectorPane->refresh();
+        });
+        connect(m_keyframesAutoScrollCheckBox, &QCheckBox::toggled, this, [this](bool)
+                {
+            scheduleSaveState();
+        });
+        connect(m_keyframesFollowCurrentCheckBox, &QCheckBox::toggled, this, [this](bool)
+                {
+            if (m_keyframesFollowCurrentCheckBox && m_keyframesFollowCurrentCheckBox->isChecked()) {
+                syncKeyframeTableToPlayhead();
+            }
+            scheduleSaveState();
+        });
+        connect(m_outputWidthSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int)
+                {
+            if (m_preview) {
+                m_preview->setOutputSize(QSize(m_outputWidthSpin->value(), m_outputHeightSpin->value()));
+            }
+            scheduleSaveState();
+        });
+        connect(m_outputHeightSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int)
+                {
+            if (m_preview) {
+                m_preview->setOutputSize(QSize(m_outputWidthSpin->value(), m_outputHeightSpin->value()));
+            }
+            scheduleSaveState();
+        });
+        connect(m_outputFormatCombo, &QComboBox::currentIndexChanged, this, [this](int)
+                {
+            scheduleSaveState();
+        });
+        connect(m_exportStartSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int)
+                {
+            applyOutputRangeFromInspector();
+        });
+        connect(m_exportEndSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int)
+                {
+            applyOutputRangeFromInspector();
+        });
+        connect(m_renderButton, &QPushButton::clicked, this, [this]()
+                {
+            renderFromOutputInspector();
+        });
+        connect(m_profileBenchmarkButton, &QPushButton::clicked, this, [this]()
+                {
+            runDecodeBenchmarkFromProfile();
+        });
 
         auto connectGradeLive = [this](QDoubleSpinBox *spin)
         {
@@ -354,6 +491,224 @@ public:
                 { applySelectedVideoKeyframeFromInspector(true); });
         connect(m_mirrorVerticalCheckBox, &QCheckBox::toggled, this, [this](bool)
                 { applySelectedVideoKeyframeFromInspector(true); });
+        connect(m_videoKeyframeTable, &QTableWidget::itemSelectionChanged, this, [this]()
+                {
+            if (m_updatingVideoInspector || !m_timeline) {
+                return;
+            }
+            QList<QTableWidgetItem*> selectedItems = m_videoKeyframeTable->selectedItems();
+            if (selectedItems.isEmpty()) {
+                return;
+            }
+            QSet<int64_t> selectedFrames;
+            int64_t primaryFrame = -1;
+            for (QTableWidgetItem* item : selectedItems) {
+                const QVariant frameData = item->data(Qt::UserRole);
+                if (!frameData.isValid()) {
+                    continue;
+                }
+                const int64_t frame = frameData.toLongLong();
+                selectedFrames.insert(frame);
+                if (primaryFrame < 0 || frame < primaryFrame) {
+                    primaryFrame = frame;
+                }
+            }
+            if (primaryFrame < 0) {
+                return;
+            }
+            m_selectedVideoKeyframeFrame = primaryFrame;
+            m_selectedVideoKeyframeFrames = selectedFrames;
+            refreshVideoKeyframeInspector();
+            if (m_syncingKeyframeTableSelection) {
+                return;
+            }
+            const TimelineClip *selectedClip = m_timeline->selectedClip();
+            if (!selectedClip || !clipHasVisuals(*selectedClip)) {
+                return;
+            }
+            scheduleDeferredTimelineSeek(&m_keyframeClickSeekTimer,
+                                         &m_pendingKeyframeClickTimelineFrame,
+                                         selectedClip->startFrame + qMax<int64_t>(0, primaryFrame));
+        });
+        connect(m_videoKeyframeTable, &QTableWidget::itemDoubleClicked, this, [this](QTableWidgetItem *)
+                {
+            cancelDeferredTimelineSeek(&m_keyframeClickSeekTimer,
+                                       &m_pendingKeyframeClickTimelineFrame);
+        });
+        connect(m_videoKeyframeTable, &QTableWidget::itemClicked, this, [this](QTableWidgetItem *item)
+                {
+            if (m_updatingVideoInspector || !item) {
+                return;
+            }
+            if (item->column() != 6) {
+                return;
+            }
+            item->setText(nextVideoInterpolationLabel(item->text()));
+        });
+        connect(m_videoKeyframeTable, &QTableWidget::itemChanged, this, [this](QTableWidgetItem *item)
+                {
+            applyVideoKeyframeTableEdit(item);
+        });
+        m_videoKeyframeTable->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(m_videoKeyframeTable, &QWidget::customContextMenuRequested, this, [this](const QPoint &pos)
+                {
+            if (!m_videoKeyframeTable) {
+                return;
+            }
+            QTableWidgetItem *item = m_videoKeyframeTable->itemAt(pos);
+            if (!item) {
+                return;
+            }
+            const int row = item->row();
+            if (!m_videoKeyframeTable->selectionModel()->isRowSelected(row, QModelIndex())) {
+                m_videoKeyframeTable->clearSelection();
+                m_videoKeyframeTable->selectRow(row);
+            }
+
+            const int64_t anchorFrame = item->data(Qt::UserRole).toLongLong();
+            int64_t previousFrame = -1;
+            int64_t nextFrame = -1;
+            if (row > 0) {
+                if (QTableWidgetItem *previousItem = m_videoKeyframeTable->item(row - 1, 0)) {
+                    previousFrame = previousItem->data(Qt::UserRole).toLongLong();
+                }
+            }
+            if (row + 1 < m_videoKeyframeTable->rowCount()) {
+                if (QTableWidgetItem *nextItem = m_videoKeyframeTable->item(row + 1, 0)) {
+                    nextFrame = nextItem->data(Qt::UserRole).toLongLong();
+                }
+            }
+
+            int deletableRowCount = 0;
+            const QList<QTableWidgetSelectionRange> ranges = m_videoKeyframeTable->selectedRanges();
+            for (const QTableWidgetSelectionRange &range : ranges) {
+                for (int selectedRow = range.topRow(); selectedRow <= range.bottomRow(); ++selectedRow) {
+                    QTableWidgetItem *selectedItem = m_videoKeyframeTable->item(selectedRow, 0);
+                    if (selectedItem && selectedItem->data(Qt::UserRole).toLongLong() > 0) {
+                        ++deletableRowCount;
+                    }
+                }
+            }
+
+            QMenu menu(this);
+            QAction *addAboveAction = menu.addAction(QStringLiteral("Add Keyframe Above"));
+            addAboveAction->setEnabled(previousFrame >= 0);
+            QAction *addBelowAction = menu.addAction(QStringLiteral("Add Keyframe Below"));
+            addBelowAction->setEnabled(nextFrame >= 0);
+            QAction *copyToNextFrameAction = menu.addAction(QStringLiteral("Copy to Next Frame"));
+            const TimelineClip *selectedClip = m_timeline ? m_timeline->selectedClip() : nullptr;
+            const bool canCopyToNextFrame =
+                selectedClip &&
+                clipHasVisuals(*selectedClip) &&
+                anchorFrame >= 0 &&
+                anchorFrame < qMax<int64_t>(0, selectedClip->durationFrames - 1);
+            copyToNextFrameAction->setEnabled(canCopyToNextFrame);
+            menu.addSeparator();
+            QAction *deleteAction = menu.addAction(deletableRowCount == 1
+                                                       ? QStringLiteral("Delete Row")
+                                                       : QStringLiteral("Delete Rows"));
+            deleteAction->setEnabled(deletableRowCount > 0);
+            QAction *chosen = menu.exec(m_videoKeyframeTable->viewport()->mapToGlobal(pos));
+            if (chosen == addAboveAction && addAboveAction->isEnabled()) {
+                insertInterpolatedVideoKeyframeBetween(previousFrame, anchorFrame);
+            } else if (chosen == addBelowAction && addBelowAction->isEnabled()) {
+                insertInterpolatedVideoKeyframeBetween(anchorFrame, nextFrame);
+            } else if (chosen == copyToNextFrameAction && copyToNextFrameAction->isEnabled()) {
+                m_selectedVideoKeyframeFrame = anchorFrame;
+                m_selectedVideoKeyframeFrames = {anchorFrame};
+                duplicateSelectedClipVideoKeyframes(1);
+            } else if (chosen == deleteAction && deleteAction->isEnabled()) {
+                removeSelectedClipVideoKeyframe();
+            }
+        });
+        connect(m_transcriptTable, &QTableWidget::itemClicked, this, [this](QTableWidgetItem *item)
+                {
+            if (m_updatingTranscriptInspector || !m_timeline || !item) {
+                return;
+            }
+            const TimelineClip *selectedClip = m_timeline->selectedClip();
+            if (!selectedClip || selectedClip->mediaType != ClipMediaType::Audio) {
+                return;
+            }
+            const int64_t startFrame = item->data(Qt::UserRole + 2).toLongLong();
+            const int64_t timelineFrame = qMax<int64_t>(selectedClip->startFrame,
+                                                        selectedClip->startFrame + (startFrame - selectedClip->sourceInFrame));
+            scheduleDeferredTimelineSeek(&m_transcriptClickSeekTimer,
+                                         &m_pendingTranscriptClickTimelineFrame,
+                                         timelineFrame);
+        });
+        connect(m_transcriptTable, &QTableWidget::itemDoubleClicked, this, [this](QTableWidgetItem *)
+                {
+            cancelDeferredTimelineSeek(&m_transcriptClickSeekTimer,
+                                       &m_pendingTranscriptClickTimelineFrame);
+        });
+        connect(m_transcriptTable, &QTableWidget::itemChanged, this, [this](QTableWidgetItem *item)
+                {
+            applyTranscriptTableEdit(item);
+        });
+        m_transcriptTable->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(m_transcriptTable, &QWidget::customContextMenuRequested, this, [this](const QPoint &pos)
+                {
+            if (!m_transcriptTable) {
+                return;
+            }
+            QTableWidgetItem *item = m_transcriptTable->itemAt(pos);
+            if (!item) {
+                return;
+            }
+            const int row = item->row();
+            if (!m_transcriptTable->selectionModel()->isRowSelected(row, QModelIndex())) {
+                m_transcriptTable->clearSelection();
+                m_transcriptTable->selectRow(row);
+            }
+
+            int deletableRowCount = 0;
+            const QList<QTableWidgetSelectionRange> ranges = m_transcriptTable->selectedRanges();
+            for (const QTableWidgetSelectionRange &range : ranges) {
+                for (int selectedRow = range.topRow(); selectedRow <= range.bottomRow(); ++selectedRow) {
+                    QTableWidgetItem *selectedItem = m_transcriptTable->item(selectedRow, 0);
+                    if (selectedItem && !selectedItem->data(Qt::UserRole + 4).toBool()) {
+                        ++deletableRowCount;
+                    }
+                }
+            }
+
+            QMenu menu(this);
+            QAction *deleteAction = menu.addAction(deletableRowCount == 1
+                                                       ? QStringLiteral("Delete Row")
+                                                       : QStringLiteral("Delete Rows"));
+            deleteAction->setEnabled(deletableRowCount > 0);
+            QAction *chosen = menu.exec(m_transcriptTable->viewport()->mapToGlobal(pos));
+            if (chosen == deleteAction && deleteAction->isEnabled()) {
+                deleteSelectedTranscriptRows();
+            }
+        });
+        auto *deleteTranscriptShortcut = new QShortcut(QKeySequence::Delete, m_transcriptTable);
+        deleteTranscriptShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+        connect(deleteTranscriptShortcut, &QShortcut::activated, this, [this]()
+                {
+            deleteSelectedTranscriptRows();
+        });
+        auto *deleteKeyframeShortcut = new QShortcut(QKeySequence::Delete, m_videoKeyframeTable);
+        deleteKeyframeShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+        connect(deleteKeyframeShortcut, &QShortcut::activated, this, [this]()
+                {
+            removeSelectedClipVideoKeyframe();
+        });
+        m_transcriptTable->installEventFilter(this);
+        m_transcriptTable->viewport()->installEventFilter(this);
+        m_videoKeyframeTable->installEventFilter(this);
+        m_videoKeyframeTable->viewport()->installEventFilter(this);
+        connect(m_inspectorPane, &InspectorPane::refreshRequested, this, [this]()
+                {
+            refreshGradingInspector();
+            refreshSyncInspector();
+            refreshTranscriptInspector();
+            refreshClipInspector();
+            refreshVideoKeyframeInspector();
+            refreshOutputInspector();
+            refreshProfileInspector();
+        });
 
         QTimer::singleShot(0, this, [this]()
                            {
@@ -377,8 +732,28 @@ protected:
 
     bool eventFilter(QObject *watched, QEvent *event) override
     {
-        Q_UNUSED(watched)
-        Q_UNUSED(event)
+        if (m_transcriptTable &&
+            (watched == m_transcriptTable || watched == m_transcriptTable->viewport()) &&
+            event->type() == QEvent::KeyPress)
+        {
+            auto *keyEvent = static_cast<QKeyEvent *>(event);
+            if (keyEvent->key() == Qt::Key_Delete && !(keyEvent->modifiers() & Qt::KeyboardModifierMask))
+            {
+                deleteSelectedTranscriptRows();
+                return true;
+            }
+        }
+        if (m_videoKeyframeTable &&
+            (watched == m_videoKeyframeTable || watched == m_videoKeyframeTable->viewport()) &&
+            event->type() == QEvent::KeyPress)
+        {
+            auto *keyEvent = static_cast<QKeyEvent *>(event);
+            if (keyEvent->key() == Qt::Key_Delete && !(keyEvent->modifiers() & Qt::KeyboardModifierMask))
+            {
+                removeSelectedClipVideoKeyframe();
+                return true;
+            }
+        }
         return QMainWindow::eventFilter(watched, event);
     }
 
@@ -475,6 +850,10 @@ private slots:
             "border-radius: 8px; font-family: monospace; font-size: 12px; }"));
         layout->addWidget(output, 1);
 
+        auto *autoScrollBox = new QCheckBox(QStringLiteral("Auto-scroll"), dialog);
+        autoScrollBox->setChecked(true);
+        layout->addWidget(autoScrollBox);
+
         auto *inputRow = new QHBoxLayout;
         inputRow->setContentsMargins(0, 0, 0, 0);
         inputRow->setSpacing(8);
@@ -493,15 +872,21 @@ private slots:
         process->setProcessChannelMode(QProcess::MergedChannels);
         process->setWorkingDirectory(QDir::currentPath());
 
-        const auto appendOutput = [output](const QString &text)
+        const auto appendOutput = [output, autoScrollBox](const QString &text)
         {
             if (text.isEmpty())
             {
                 return;
             }
-            output->moveCursor(QTextCursor::End);
+            if (autoScrollBox->isChecked())
+            {
+                output->moveCursor(QTextCursor::End);
+            }
             output->insertPlainText(text);
-            output->moveCursor(QTextCursor::End);
+            if (autoScrollBox->isChecked())
+            {
+                output->moveCursor(QTextCursor::End);
+            }
         };
 
         connect(process, &QProcess::readyReadStandardOutput, dialog, [process, appendOutput]()
@@ -549,7 +934,8 @@ private slots:
             QStringLiteral("%1.proxy.mov").arg(sourceInfo.completeBaseName()));
     }
 
-    QString clipFileInfoSummary(const QString &filePath) const
+    QString clipFileInfoSummary(const QString &filePath,
+                                const MediaProbeResult *knownProbe = nullptr) const
     {
         if (filePath.isEmpty())
         {
@@ -568,8 +954,8 @@ private slots:
         lines << QStringLiteral("Size: %1 MB").arg(
             QString::number(static_cast<double>(info.size()) / (1024.0 * 1024.0), 'f', 1));
         lines << QStringLiteral("Modified: %1").arg(info.lastModified().toString(Qt::ISODate));
-
-        const MediaProbeResult probe = probeMediaFile(filePath);
+        MediaProbeResult fallbackProbe;
+        const MediaProbeResult &probe = knownProbe ? *knownProbe : fallbackProbe;
         lines << QStringLiteral("Media Type: %1").arg(clipMediaTypeLabel(probe.mediaType));
         lines << QStringLiteral("Duration: %1 frames").arg(probe.durationFrames);
         lines << QStringLiteral("Audio: %1").arg(probe.hasAudio ? QStringLiteral("Yes") : QStringLiteral("No"));
@@ -602,6 +988,13 @@ private slots:
             QMessageBox::information(this,
                                      QStringLiteral("Create Proxy"),
                                      QStringLiteral("Proxy creation is currently available for video clips."));
+            return;
+        }
+        if (isImageSequencePath(clip->filePath))
+        {
+            QMessageBox::information(this,
+                                     QStringLiteral("Create Proxy"),
+                                     QStringLiteral("Image-sequence clips do not need proxy creation."));
             return;
         }
 
@@ -651,6 +1044,10 @@ private slots:
             "border-radius: 8px; font-family: monospace; font-size: 12px; }"));
         layout->addWidget(output, 1);
 
+        auto *autoScrollBox = new QCheckBox(QStringLiteral("Auto-scroll"), dialog);
+        autoScrollBox->setChecked(true);
+        layout->addWidget(autoScrollBox);
+
         auto *buttonRow = new QHBoxLayout;
         buttonRow->setContentsMargins(0, 0, 0, 0);
         buttonRow->setSpacing(8);
@@ -663,20 +1060,22 @@ private slots:
         process->setProcessChannelMode(QProcess::MergedChannels);
         process->setWorkingDirectory(QDir::currentPath());
 
+        const MediaProbeResult sourceProbe = probeMediaFile(clip->filePath, clip->durationFrames);
+
         QStringList arguments = {
             QStringLiteral("-y"),
             QStringLiteral("-hide_banner"),
             QStringLiteral("-i"), QFileInfo(clip->filePath).absoluteFilePath(),
             QStringLiteral("-map"), QStringLiteral("0:v:0"),
             QStringLiteral("-map"), QStringLiteral("0:a?")};
-        const bool alphaProxy = QFileInfo(clip->filePath).suffix().compare(QStringLiteral("webm"), Qt::CaseInsensitive) == 0;
+        const bool alphaProxy = sourceProbe.hasAlpha;
         if (alphaProxy)
         {
-            arguments << QStringLiteral("-c:v") << QStringLiteral("prores_ks")
-                      << QStringLiteral("-profile:v") << QStringLiteral("4")
-                      << QStringLiteral("-pix_fmt") << QStringLiteral("yuva444p10le")
-                      << QStringLiteral("-vendor") << QStringLiteral("apl0")
-                      << QStringLiteral("-bits_per_mb") << QStringLiteral("8000");
+            // Use a safer alpha-capable intraframe proxy for interactive work.
+            // ProRes 4444 preserves alpha, but this app's current FFmpeg preview
+            // path is not stable on alpha ProRes MOV during interactive decode.
+            arguments << QStringLiteral("-c:v") << QStringLiteral("png")
+                      << QStringLiteral("-pix_fmt") << QStringLiteral("rgba");
         }
         else
         {
@@ -687,15 +1086,21 @@ private slots:
         arguments << QStringLiteral("-c:a") << QStringLiteral("pcm_s16le")
                   << QFileInfo(outputPath).absoluteFilePath();
 
-        const auto appendOutput = [output](const QString &text)
+        const auto appendOutput = [output, autoScrollBox](const QString &text)
         {
             if (text.isEmpty())
             {
                 return;
             }
-            output->moveCursor(QTextCursor::End);
+            if (autoScrollBox->isChecked())
+            {
+                output->moveCursor(QTextCursor::End);
+            }
             output->insertPlainText(text);
-            output->moveCursor(QTextCursor::End);
+            if (autoScrollBox->isChecked())
+            {
+                output->moveCursor(QTextCursor::End);
+            }
         };
 
         connect(process, &QProcess::readyReadStandardOutput, dialog, [process, appendOutput]()
@@ -792,15 +1197,18 @@ private slots:
         m_timeline->clipsChanged = [this]()
         {
             syncSliderRange();
+            m_preview->beginBulkUpdate();
             m_preview->setClipCount(m_timeline->clips().size());
             m_preview->setTimelineClips(m_timeline->clips());
             m_preview->setExportRanges(effectivePlaybackRanges());
             m_preview->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
             m_preview->setSelectedClipId(m_timeline->selectedClipId());
+            m_preview->endBulkUpdate();
             if (m_audioEngine)
             {
                 m_audioEngine->setTimelineClips(m_timeline->clips());
                 m_audioEngine->setExportRanges(effectivePlaybackRanges());
+                m_audioEngine->setSpeechFilterFadeSamples(m_speechFilterFadeSamples);
             }
             refreshClipInspector();
             m_inspectorPane->refresh();
@@ -813,6 +1221,8 @@ private slots:
             refreshSyncInspector();
             refreshTranscriptInspector();
             refreshClipInspector();
+            refreshOutputInspector();
+            refreshProfileInspector();
             m_inspectorPane->refresh();
         };
         m_timeline->renderSyncMarkersChanged = [this]()
@@ -825,6 +1235,7 @@ private slots:
         };
         m_timeline->exportRangeChanged = [this]()
         {
+            refreshOutputInspector();
             m_inspectorPane->refresh();
             scheduleSaveState();
             pushHistorySnapshot();
@@ -1098,6 +1509,124 @@ private slots:
         return nearestIndex;
     }
 
+    QString videoInterpolationLabel(bool linearInterpolation) const
+    {
+        return linearInterpolation ? QStringLiteral("Linear") : QStringLiteral("Step");
+    }
+
+    QString nextVideoInterpolationLabel(const QString &text) const
+    {
+        bool linearInterpolation = true;
+        if (!parseVideoInterpolationText(text, &linearInterpolation))
+        {
+            linearInterpolation = true;
+        }
+        return videoInterpolationLabel(!linearInterpolation);
+    }
+
+    bool parseVideoInterpolationText(const QString &text, bool *linearInterpolationOut) const
+    {
+        const QString normalized = text.trimmed().toLower();
+        if (normalized.isEmpty() || normalized == QStringLiteral("step"))
+        {
+            *linearInterpolationOut = false;
+            return true;
+        }
+        if (normalized == QStringLiteral("linear") || normalized == QStringLiteral("smooth"))
+        {
+            *linearInterpolationOut = true;
+            return true;
+        }
+        return false;
+    }
+
+    void applyVideoKeyframeTableEdit(QTableWidgetItem *changedItem)
+    {
+        if (m_updatingVideoInspector || !changedItem || !m_timeline)
+        {
+            return;
+        }
+
+        const TimelineClip *selectedClip = m_timeline->selectedClip();
+        if (!selectedClip || !clipHasVisuals(*selectedClip))
+        {
+            return;
+        }
+
+        const int row = changedItem->row();
+        if (row < 0 || row >= m_videoKeyframeTable->rowCount())
+        {
+            return;
+        }
+
+        auto tableText = [this, row](int column) -> QString
+        {
+            QTableWidgetItem *item = m_videoKeyframeTable->item(row, column);
+            return item ? item->text().trimmed() : QString();
+        };
+
+        bool ok = false;
+        TimelineClip::TransformKeyframe displayed;
+        displayed.frame = tableText(0).toLongLong(&ok);
+        if (!ok) { refreshVideoKeyframeInspector(); return; }
+        displayed.translationX = tableText(1).toDouble(&ok);
+        if (!ok) { refreshVideoKeyframeInspector(); return; }
+        displayed.translationY = tableText(2).toDouble(&ok);
+        if (!ok) { refreshVideoKeyframeInspector(); return; }
+        displayed.rotation = tableText(3).toDouble(&ok);
+        if (!ok) { refreshVideoKeyframeInspector(); return; }
+        displayed.scaleX = tableText(4).toDouble(&ok);
+        if (!ok) { refreshVideoKeyframeInspector(); return; }
+        displayed.scaleY = tableText(5).toDouble(&ok);
+        if (!ok) { refreshVideoKeyframeInspector(); return; }
+        if (!parseVideoInterpolationText(tableText(6), &displayed.linearInterpolation))
+        {
+            refreshVideoKeyframeInspector();
+            return;
+        }
+
+        displayed.frame = qBound<int64_t>(0, displayed.frame, qMax<int64_t>(0, selectedClip->durationFrames - 1));
+        const TimelineClip::TransformKeyframe stored = keyframeFromInspectorDisplay(*selectedClip, displayed);
+        const int64_t originalFrame = changedItem->data(Qt::UserRole).toLongLong();
+
+        const bool updated = m_timeline->updateClipById(selectedClip->id, [stored, originalFrame](TimelineClip &clip)
+        {
+            bool replaced = false;
+            for (TimelineClip::TransformKeyframe &existing : clip.transformKeyframes)
+            {
+                if (existing.frame == originalFrame)
+                {
+                    existing = stored;
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced)
+            {
+                clip.transformKeyframes.push_back(stored);
+            }
+            std::sort(clip.transformKeyframes.begin(), clip.transformKeyframes.end(),
+                      [](const TimelineClip::TransformKeyframe &a, const TimelineClip::TransformKeyframe &b)
+                      {
+                          return a.frame < b.frame;
+                      });
+            normalizeClipTransformKeyframes(clip);
+        });
+
+        if (!updated)
+        {
+            refreshVideoKeyframeInspector();
+            return;
+        }
+
+        m_selectedVideoKeyframeFrame = stored.frame;
+        m_selectedVideoKeyframeFrames = {stored.frame};
+        m_preview->setTimelineClips(m_timeline->clips());
+        refreshVideoKeyframeInspector();
+        scheduleSaveState();
+        pushHistorySnapshot();
+    }
+
     void applySelectedVideoKeyframeFromInspector(bool pushHistoryAfterChange = false)
     {
         if (m_updatingVideoInspector || !m_timeline)
@@ -1132,7 +1661,7 @@ private slots:
             keyframe.rotation = stored.rotation;
             keyframe.scaleX = stored.scaleX;
             keyframe.scaleY = stored.scaleY;
-            keyframe.interpolated = m_videoInterpolationCombo->currentIndex() == 0;
+            keyframe.linearInterpolation = m_videoInterpolationCombo->currentIndex() == 1;
             normalizeClipTransformKeyframes(clip); });
 
         if (!updated)
@@ -1179,7 +1708,7 @@ private slots:
                                                        m_mirrorVerticalCheckBox && m_mirrorVerticalCheckBox->isChecked());
             keyframe = keyframeFromInspectorDisplay(editableClip, keyframe);
             keyframe.frame = keyframeFrame;
-            keyframe.interpolated = m_videoInterpolationCombo->currentIndex() == 0;
+            keyframe.linearInterpolation = m_videoInterpolationCombo->currentIndex() == 1;
 
             bool replaced = false;
             for (TimelineClip::TransformKeyframe& existing : editableClip.transformKeyframes) {
@@ -1271,6 +1800,87 @@ private slots:
         m_inspectorPane->refresh();
         scheduleSaveState();
         pushHistorySnapshot();
+    }
+
+    bool insertInterpolatedVideoKeyframeBetween(int64_t earlierFrame, int64_t laterFrame)
+    {
+        if (!m_timeline || earlierFrame < 0 || laterFrame < 0 || laterFrame <= earlierFrame)
+        {
+            return false;
+        }
+
+        const TimelineClip *selectedClip = m_timeline->selectedClip();
+        if (!selectedClip || !clipHasVisuals(*selectedClip))
+        {
+            return false;
+        }
+
+        const int64_t midpointFrame = earlierFrame + ((laterFrame - earlierFrame) / 2);
+        if (midpointFrame <= earlierFrame || midpointFrame >= laterFrame)
+        {
+            return false;
+        }
+
+        const auto findKeyframeAt = [](const TimelineClip &clip, int64_t frame) -> const TimelineClip::TransformKeyframe *
+        {
+            for (const TimelineClip::TransformKeyframe &keyframe : clip.transformKeyframes)
+            {
+                if (keyframe.frame == frame)
+                {
+                    return &keyframe;
+                }
+            }
+            return nullptr;
+        };
+
+        const TimelineClip::TransformKeyframe *earlier = findKeyframeAt(*selectedClip, earlierFrame);
+        const TimelineClip::TransformKeyframe *later = findKeyframeAt(*selectedClip, laterFrame);
+        if (!earlier || !later)
+        {
+            return false;
+        }
+
+        const qreal t = static_cast<qreal>(midpointFrame - earlierFrame) /
+                        static_cast<qreal>(laterFrame - earlierFrame);
+        TimelineClip::TransformKeyframe midpoint;
+        midpoint.frame = midpointFrame;
+        midpoint.translationX = earlier->translationX + ((later->translationX - earlier->translationX) * t);
+        midpoint.translationY = earlier->translationY + ((later->translationY - earlier->translationY) * t);
+        midpoint.rotation = earlier->rotation + ((later->rotation - earlier->rotation) * t);
+        midpoint.scaleX = earlier->scaleX + ((later->scaleX - earlier->scaleX) * t);
+        midpoint.scaleY = earlier->scaleY + ((later->scaleY - earlier->scaleY) * t);
+        midpoint.linearInterpolation = later->linearInterpolation;
+
+        const bool updated = m_timeline->updateClipById(selectedClip->id, [midpoint](TimelineClip &clip)
+                                                        {
+            for (TimelineClip::TransformKeyframe &existing : clip.transformKeyframes)
+            {
+                if (existing.frame == midpoint.frame)
+                {
+                    existing = midpoint;
+                    normalizeClipTransformKeyframes(clip);
+                    return;
+                }
+            }
+            clip.transformKeyframes.push_back(midpoint);
+            normalizeClipTransformKeyframes(clip);
+        });
+
+        if (!updated)
+        {
+            return false;
+        }
+
+        m_selectedVideoKeyframeFrame = midpoint.frame;
+        m_selectedVideoKeyframeFrames = {midpoint.frame};
+        m_preview->setTimelineClips(m_timeline->clips());
+        m_inspectorPane->refresh();
+        scheduleDeferredTimelineSeek(&m_keyframeClickSeekTimer,
+                                     &m_pendingKeyframeClickTimelineFrame,
+                                     selectedClip->startFrame + midpoint.frame);
+        scheduleSaveState();
+        pushHistorySnapshot();
+        return true;
     }
 
     void removeSelectedClipVideoKeyframe()
@@ -1418,8 +2028,19 @@ private slots:
         setCurrentPlaybackSample(frameToSamples(frame), syncAudio);
     }
 
+    bool playbackActive() const
+    {
+        return m_fastPlaybackActive.load();
+    }
+
     void setPlaybackActive(bool playing)
     {
+        if (playing == playbackActive())
+        {
+            updateTransportLabels();
+            return;
+        }
+
         if (playing)
         {
             // Update export ranges on audio engine and cache for speech filter awareness
@@ -1427,6 +2048,7 @@ private slots:
             if (m_audioEngine)
             {
                 m_audioEngine->setExportRanges(ranges);
+                m_audioEngine->setSpeechFilterFadeSamples(m_speechFilterFadeSamples);
             }
             if (m_audioEngine && m_audioEngine->hasPlayableAudio())
             {
@@ -1451,13 +2073,14 @@ private slots:
             m_fastPlaybackActive.store(false);
             m_preview->setPlaybackState(false);
         }
+        updateTransportLabels();
         m_inspectorPane->refresh();
         scheduleSaveState();
     }
 
     void togglePlayback()
     {
-        setPlaybackActive(!m_playbackTimer.isActive());
+        setPlaybackActive(!playbackActive());
     }
 
     void setCurrentPlaybackSample(int64_t samplePosition, bool syncAudio = true, bool duringPlayback = false)
@@ -1476,7 +2099,8 @@ private slots:
         {
             m_lastPlayheadAdvanceMs.store(nowMs());
         }
-        m_currentPlaybackSample = boundedSample;
+        m_absolutePlaybackSample = boundedSample;
+        m_filteredPlaybackSample = filteredPlaybackSampleForAbsoluteSample(boundedSample);
         m_fastCurrentFrame.store(bounded);
         if (syncAudio && m_audioEngine && m_audioEngine->hasPlayableAudio())
         {
@@ -1497,10 +2121,12 @@ private slots:
         {
             updateTransportLabels();
             syncTranscriptTableToPlayhead();
+            syncKeyframeTableToPlayhead();
         }
         else
         {
             m_inspectorPane->refresh();
+            syncKeyframeTableToPlayhead();
         }
         scheduleSaveState();
     }
@@ -1527,7 +2153,7 @@ private slots:
 
         const int64_t sourceFrame =
             sourceFrameForClipAtTimelinePosition(*clip,
-                                                 samplesToFramePosition(m_currentPlaybackSample),
+                                                 samplesToFramePosition(m_absolutePlaybackSample),
                                                  {});
         int matchingRow = -1;
         for (int row = 0; row < m_transcriptTable->rowCount(); ++row)
@@ -1564,6 +2190,75 @@ private slots:
         }
     }
 
+    void syncKeyframeTableToPlayhead()
+    {
+        if (!m_timeline || !m_videoKeyframeTable || m_updatingVideoInspector)
+        {
+            return;
+        }
+        if (!m_keyframesFollowCurrentCheckBox || !m_keyframesFollowCurrentCheckBox->isChecked())
+        {
+            return;
+        }
+
+        const TimelineClip *clip = m_timeline->selectedClip();
+        if (!clip || !clipHasVisuals(*clip) || m_videoKeyframeTable->rowCount() <= 0)
+        {
+            m_videoKeyframeTable->clearSelection();
+            return;
+        }
+
+        QWidget *focus = QApplication::focusWidget();
+        const bool editingKeyframes =
+            m_videoKeyframeTable &&
+            focus &&
+            m_videoKeyframeTable->isAncestorOf(focus) &&
+            focusInEditableInput();
+        if (editingKeyframes)
+        {
+            return;
+        }
+
+        const int64_t localFrame =
+            qBound<int64_t>(0, m_timeline->currentFrame() - clip->startFrame, qMax<int64_t>(0, clip->durationFrames - 1));
+
+        int matchingRow = -1;
+        int64_t matchingFrame = -1;
+        for (int row = 0; row < m_videoKeyframeTable->rowCount(); ++row)
+        {
+            QTableWidgetItem *item = m_videoKeyframeTable->item(row, 0);
+            if (!item)
+            {
+                continue;
+            }
+            const int64_t frame = item->data(Qt::UserRole).toLongLong();
+            if (frame <= localFrame && frame >= matchingFrame)
+            {
+                matchingFrame = frame;
+                matchingRow = row;
+            }
+        }
+        if (matchingRow < 0)
+        {
+            matchingRow = 0;
+        }
+
+        if (!m_videoKeyframeTable->selectionModel()->isRowSelected(matchingRow, QModelIndex()))
+        {
+            m_syncingKeyframeTableSelection = true;
+            m_videoKeyframeTable->setCurrentCell(matchingRow, 0);
+            m_videoKeyframeTable->selectRow(matchingRow);
+            m_syncingKeyframeTableSelection = false;
+        }
+        if (m_keyframesAutoScrollCheckBox && m_keyframesAutoScrollCheckBox->isChecked())
+        {
+            if (QTableWidgetItem *item = m_videoKeyframeTable->item(matchingRow, 0))
+            {
+                m_videoKeyframeTable->scrollToItem(item, QAbstractItemView::PositionAtCenter);
+            }
+        }
+    }
+
     QString frameToTimecode(int64_t frame) const
     {
         const int fps = 30;
@@ -1581,7 +2276,7 @@ private slots:
     // Lightweight update for transport labels - safe to call during playback
     void updateTransportLabels()
     {
-        const bool playing = m_playbackTimer.isActive();
+        const bool playing = playbackActive();
         const QString state = playing ? QStringLiteral("PLAYING") : QStringLiteral("PAUSED");
         const int clipCount = m_timeline ? m_timeline->clips().size() : 0;
         const QString activeAudio = m_preview ? m_preview->activeAudioClipLabel() : QString();
@@ -1614,6 +2309,8 @@ private slots:
             {QStringLiteral("playback_active"), m_playbackTimer.isActive()},
             {QStringLiteral("timeline_clip_count"), m_timeline ? m_timeline->clips().size() : 0},
             {QStringLiteral("current_frame"), m_timeline ? static_cast<qint64>(m_timeline->currentFrame()) : 0},
+            {QStringLiteral("absolute_playback_sample"), static_cast<qint64>(m_absolutePlaybackSample)},
+            {QStringLiteral("filtered_playback_sample"), static_cast<qint64>(m_filteredPlaybackSample)},
             {QStringLiteral("explorer_root"), m_explorerPane ? m_explorerPane->currentRootPath() : QString()},
             {QStringLiteral("debug"), debugControlsSnapshot()},
             {QStringLiteral("main_thread_heartbeat_ms"), m_lastMainThreadHeartbeatMs.load()},
@@ -1985,6 +2682,13 @@ private slots:
             m_speechFilterEnabledCheckBox ? m_speechFilterEnabledCheckBox->isChecked() : false;
         root[QStringLiteral("transcriptPrependMs")] = m_transcriptPrependMs;
         root[QStringLiteral("transcriptPostpendMs")] = m_transcriptPostpendMs;
+        root[QStringLiteral("speechFilterFadeSamples")] = m_speechFilterFadeSamples;
+        root[QStringLiteral("transcriptFollowCurrentWord")] =
+            m_transcriptFollowCurrentWordCheckBox ? m_transcriptFollowCurrentWordCheckBox->isChecked() : true;
+        root[QStringLiteral("keyframesFollowCurrent")] =
+            m_keyframesFollowCurrentCheckBox ? m_keyframesFollowCurrentCheckBox->isChecked() : true;
+        root[QStringLiteral("keyframesAutoScroll")] =
+            m_keyframesAutoScrollCheckBox ? m_keyframesAutoScrollCheckBox->isChecked() : true;
         root[QStringLiteral("selectedInspectorTab")] =
             m_inspectorTabs ? m_inspectorTabs->currentIndex() : 0;
         root[QStringLiteral("timelineZoom")] = m_timeline ? m_timeline->timelineZoom() : 4.0;
@@ -2175,6 +2879,13 @@ private slots:
             root.value(QStringLiteral("speechFilterEnabled")).toBool(false);
         const int transcriptPrependMs = root.value(QStringLiteral("transcriptPrependMs")).toInt(0);
         const int transcriptPostpendMs = root.value(QStringLiteral("transcriptPostpendMs")).toInt(0);
+        const int speechFilterFadeSamples = root.value(QStringLiteral("speechFilterFadeSamples")).toInt(250);
+        const bool transcriptFollowCurrentWord =
+            root.value(QStringLiteral("transcriptFollowCurrentWord")).toBool(true);
+        const bool keyframesFollowCurrent =
+            root.value(QStringLiteral("keyframesFollowCurrent")).toBool(true);
+        const bool keyframesAutoScroll =
+            root.value(QStringLiteral("keyframesAutoScroll")).toBool(true);
         const int selectedInspectorTab = root.value(QStringLiteral("selectedInspectorTab")).toInt(0);
         const qreal timelineZoom = root.value(QStringLiteral("timelineZoom")).toDouble(4.0);
         const int timelineVerticalScroll = root.value(QStringLiteral("timelineVerticalScroll")).toInt(0);
@@ -2286,6 +2997,7 @@ private slots:
         }
         m_transcriptPrependMs = transcriptPrependMs;
         m_transcriptPostpendMs = transcriptPostpendMs;
+        m_speechFilterFadeSamples = qMax(0, speechFilterFadeSamples);
         if (m_transcriptPrependMsSpin)
         {
             QSignalBlocker block(m_transcriptPrependMsSpin);
@@ -2295,6 +3007,26 @@ private slots:
         {
             QSignalBlocker block(m_transcriptPostpendMsSpin);
             m_transcriptPostpendMsSpin->setValue(m_transcriptPostpendMs);
+        }
+        if (m_speechFilterFadeSamplesSpin)
+        {
+            QSignalBlocker block(m_speechFilterFadeSamplesSpin);
+            m_speechFilterFadeSamplesSpin->setValue(m_speechFilterFadeSamples);
+        }
+        if (m_transcriptFollowCurrentWordCheckBox)
+        {
+            QSignalBlocker block(m_transcriptFollowCurrentWordCheckBox);
+            m_transcriptFollowCurrentWordCheckBox->setChecked(transcriptFollowCurrentWord);
+        }
+        if (m_keyframesFollowCurrentCheckBox)
+        {
+            QSignalBlocker block(m_keyframesFollowCurrentCheckBox);
+            m_keyframesFollowCurrentCheckBox->setChecked(keyframesFollowCurrent);
+        }
+        if (m_keyframesAutoScrollCheckBox)
+        {
+            QSignalBlocker block(m_keyframesAutoScrollCheckBox);
+            m_keyframesAutoScrollCheckBox->setChecked(keyframesAutoScroll);
         }
         if (m_inspectorTabs && m_inspectorTabs->count() > 0)
         {
@@ -2321,15 +3053,18 @@ private slots:
         m_timeline->setRenderSyncMarkers(loadedRenderSyncMarkers);
         m_timeline->setSelectedClipId(selectedClipId);
         syncSliderRange();
+        m_preview->beginBulkUpdate();
         m_preview->setClipCount(m_timeline->clips().size());
         m_preview->setTimelineClips(m_timeline->clips());
         m_preview->setExportRanges(effectivePlaybackRanges());
         m_preview->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
         m_preview->setSelectedClipId(selectedClipId);
+        m_preview->endBulkUpdate();
         if (m_audioEngine)
         {
             m_audioEngine->setTimelineClips(m_timeline->clips());
             m_audioEngine->setExportRanges(effectivePlaybackRanges());
+            m_audioEngine->setSpeechFilterFadeSamples(m_speechFilterFadeSamples);
             m_audioEngine->seek(currentFrame);
         }
         setCurrentFrame(currentFrame);
@@ -2341,6 +3076,7 @@ private slots:
         {
             m_audioEngine->stop();
         }
+        updateTransportLabels();
 
         m_loadingState = false;
         QTimer::singleShot(0, this, [this, resolvedRootPath]()
@@ -2395,6 +3131,32 @@ private slots:
     bool speechFilterPlaybackEnabled() const
     {
         return m_speechFilterEnabledCheckBox && m_speechFilterEnabledCheckBox->isChecked();
+    }
+
+    int64_t filteredPlaybackSampleForAbsoluteSample(int64_t absoluteSample) const
+    {
+        const QVector<ExportRangeSegment> ranges = effectivePlaybackRanges();
+        if (ranges.isEmpty())
+        {
+            return qMax<int64_t>(0, absoluteSample);
+        }
+
+        int64_t filteredSample = 0;
+        for (const ExportRangeSegment &range : ranges)
+        {
+            const int64_t rangeStartSample = frameToSamples(range.startFrame);
+            const int64_t rangeEndSampleExclusive = frameToSamples(range.endFrame + 1);
+            if (absoluteSample <= rangeStartSample)
+            {
+                return filteredSample;
+            }
+            if (absoluteSample < rangeEndSampleExclusive)
+            {
+                return filteredSample + (absoluteSample - rangeStartSample);
+            }
+            filteredSample += (rangeEndSampleExclusive - rangeStartSample);
+        }
+        return filteredSample;
     }
 
     QVector<ExportRangeSegment> effectivePlaybackRanges() const
@@ -2556,7 +3318,11 @@ private slots:
             return;
         }
 
-        const QString transcriptPath = transcriptPathForClipFile(clip->filePath);
+        QString transcriptPath;
+        if (!ensureEditableTranscriptForClipFile(clip->filePath, &transcriptPath))
+        {
+            transcriptPath = transcriptWorkingPathForClipFile(clip->filePath);
+        }
         QFile transcriptFile(transcriptPath);
         if (!transcriptFile.open(QIODevice::ReadOnly))
         {
@@ -2592,46 +3358,512 @@ private slots:
 
         m_transcriptInspectorClipLabel->setText(clip->label);
         m_transcriptInspectorDetailsLabel->setText(
-            QStringLiteral("%1 words across %2 segments").arg(totalWords).arg(segments.size()));
+            QStringLiteral("%1 words across %2 segments, showing normalized speech windows and gaps")
+                .arg(totalWords)
+                .arg(segments.size()));
 
-        int row = 0;
-        for (const QJsonValue &segValue : segments)
         {
-            const QJsonObject segment = segValue.toObject();
-            const QJsonArray words = segment.value(QStringLiteral("words")).toArray();
-            
-            for (const QJsonValue &wordValue : words)
-            {
-                const QJsonObject word = wordValue.toObject();
-                const QString text = word.value(QStringLiteral("word")).toString();
-                const double startTime = word.value(QStringLiteral("start")).toDouble();
-                const double endTime = word.value(QStringLiteral("end")).toDouble();
-                const int64_t startFrame = static_cast<int64_t>(startTime * kTimelineFps);
-                const int64_t endFrame = static_cast<int64_t>(endTime * kTimelineFps);
+            QSignalBlocker enabledBlock(m_transcriptOverlayEnabledCheckBox);
+            QSignalBlocker maxLinesBlock(m_transcriptMaxLinesSpin);
+            QSignalBlocker maxCharsBlock(m_transcriptMaxCharsSpin);
+            QSignalBlocker autoScrollBlock(m_transcriptAutoScrollCheckBox);
+            QSignalBlocker xBlock(m_transcriptOverlayXSpin);
+            QSignalBlocker yBlock(m_transcriptOverlayYSpin);
+            QSignalBlocker widthBlock(m_transcriptOverlayWidthSpin);
+            QSignalBlocker heightBlock(m_transcriptOverlayHeightSpin);
+            QSignalBlocker fontBlock(m_transcriptFontFamilyCombo);
+            QSignalBlocker fontSizeBlock(m_transcriptFontSizeSpin);
+            QSignalBlocker boldBlock(m_transcriptBoldCheckBox);
+            QSignalBlocker italicBlock(m_transcriptItalicCheckBox);
 
-                m_transcriptTable->setRowCount(row + 1);
-                
-                auto *startItem = new QTableWidgetItem(frameToTimecode(startFrame));
-                startItem->setData(Qt::UserRole, startTime);
-                startItem->setData(Qt::UserRole + 1, endTime);
-                startItem->setData(Qt::UserRole + 2, QVariant::fromValue(startFrame));
-                startItem->setData(Qt::UserRole + 3, QVariant::fromValue(endFrame));
-                startItem->setFlags(startItem->flags() & ~Qt::ItemIsEditable);
-                
-                auto *endItem = new QTableWidgetItem(frameToTimecode(endFrame));
-                endItem->setFlags(endItem->flags() & ~Qt::ItemIsEditable);
-                
-                auto *textItem = new QTableWidgetItem(text);
-                textItem->setFlags(textItem->flags() & ~Qt::ItemIsEditable);
-                
-                m_transcriptTable->setItem(row, 0, startItem);
-                m_transcriptTable->setItem(row, 1, endItem);
-                m_transcriptTable->setItem(row, 2, textItem);
-                
-                row++;
+            m_transcriptOverlayEnabledCheckBox->setChecked(clip->transcriptOverlay.enabled);
+            m_transcriptMaxLinesSpin->setValue(clip->transcriptOverlay.maxLines);
+            m_transcriptMaxCharsSpin->setValue(clip->transcriptOverlay.maxCharsPerLine);
+            m_transcriptAutoScrollCheckBox->setChecked(clip->transcriptOverlay.autoScroll);
+            m_transcriptOverlayXSpin->setValue(clip->transcriptOverlay.translationX);
+            m_transcriptOverlayYSpin->setValue(clip->transcriptOverlay.translationY);
+            m_transcriptOverlayWidthSpin->setValue(static_cast<int>(clip->transcriptOverlay.boxWidth));
+            m_transcriptOverlayHeightSpin->setValue(static_cast<int>(clip->transcriptOverlay.boxHeight));
+            m_transcriptFontFamilyCombo->setCurrentFont(QFont(clip->transcriptOverlay.fontFamily));
+            m_transcriptFontSizeSpin->setValue(clip->transcriptOverlay.fontPointSize);
+            m_transcriptBoldCheckBox->setChecked(clip->transcriptOverlay.bold);
+            m_transcriptItalicCheckBox->setChecked(clip->transcriptOverlay.italic);
+        }
+
+        struct TranscriptRow
+        {
+            int64_t startFrame = 0;
+            int64_t endFrame = 0;
+            QString text;
+            bool isGap = false;
+            int segmentIndex = -1;
+            int wordIndex = -1;
+        };
+
+        QVector<TranscriptRow> rows;
+        const double prependSeconds = m_transcriptPrependMs / 1000.0;
+        const double postpendSeconds = m_transcriptPostpendMs / 1000.0;
+
+        for (int segmentIndex = 0; segmentIndex < segments.size(); ++segmentIndex)
+        {
+            const QJsonObject segment = segments.at(segmentIndex).toObject();
+            const QJsonArray words = segment.value(QStringLiteral("words")).toArray();
+
+            for (int wordIndex = 0; wordIndex < words.size(); ++wordIndex)
+            {
+                const QJsonObject word = words.at(wordIndex).toObject();
+                const QString text = word.value(QStringLiteral("word")).toString();
+                const double rawStartTime = word.value(QStringLiteral("start")).toDouble(-1.0);
+                const double rawEndTime = word.value(QStringLiteral("end")).toDouble(-1.0);
+                if (text.trimmed().isEmpty() || rawStartTime < 0.0 || rawEndTime < rawStartTime)
+                {
+                    continue;
+                }
+
+                const double adjustedStartTime = qMax(0.0, rawStartTime - prependSeconds);
+                const double adjustedEndTime = qMax(adjustedStartTime, rawEndTime + postpendSeconds);
+                const int64_t adjustedStartFrame =
+                    qMax<int64_t>(0, static_cast<int64_t>(std::floor(adjustedStartTime * kTimelineFps)));
+                const int64_t adjustedEndFrame =
+                    qMax<int64_t>(adjustedStartFrame, static_cast<int64_t>(std::ceil(adjustedEndTime * kTimelineFps)) - 1);
+
+                TranscriptRow wordRow;
+                wordRow.startFrame = adjustedStartFrame;
+                wordRow.endFrame = adjustedEndFrame;
+                wordRow.text = text;
+                wordRow.isGap = false;
+                wordRow.segmentIndex = segmentIndex;
+                wordRow.wordIndex = wordIndex;
+                rows.push_back(wordRow);
             }
         }
+
+        for (int i = 1; i < rows.size(); ++i)
+        {
+            TranscriptRow &previous = rows[i - 1];
+            TranscriptRow &current = rows[i];
+            if (current.startFrame <= previous.endFrame)
+            {
+                const int64_t overlap = previous.endFrame - current.startFrame + 1;
+                const int64_t trimPrevious = overlap / 2;
+                const int64_t trimCurrent = overlap - trimPrevious;
+                previous.endFrame = qMax(previous.startFrame, previous.endFrame - trimPrevious);
+                current.startFrame = qMin(current.endFrame, current.startFrame + trimCurrent);
+                if (current.startFrame <= previous.endFrame)
+                {
+                    current.startFrame = qMin(current.endFrame, previous.endFrame + 1);
+                }
+            }
+        }
+
+        QVector<TranscriptRow> displayRows;
+        displayRows.reserve(rows.size() * 2);
+        for (const TranscriptRow &wordRow : std::as_const(rows))
+        {
+            if (!displayRows.isEmpty())
+            {
+                const TranscriptRow &previous = displayRows.constLast();
+                if (wordRow.startFrame > previous.endFrame + 1)
+                {
+                    TranscriptRow gapRow;
+                    gapRow.startFrame = previous.endFrame + 1;
+                    gapRow.endFrame = wordRow.startFrame - 1;
+                    gapRow.text = QStringLiteral("[Gap]");
+                    gapRow.isGap = true;
+                    displayRows.push_back(gapRow);
+                }
+            }
+            displayRows.push_back(wordRow);
+        }
+
+        m_transcriptTable->setRowCount(displayRows.size());
+        const QColor gapColor(255, 248, 196);
+        for (int row = 0; row < displayRows.size(); ++row)
+        {
+            const TranscriptRow &entry = displayRows.at(row);
+            const double startTime = static_cast<double>(entry.startFrame) / kTimelineFps;
+            const double endTime = static_cast<double>(entry.endFrame + 1) / kTimelineFps;
+
+            auto *startItem = new QTableWidgetItem(m_transcriptEngine.secondsToTranscriptTime(startTime));
+            startItem->setData(Qt::UserRole, startTime);
+            startItem->setData(Qt::UserRole + 1, endTime);
+            startItem->setData(Qt::UserRole + 2, QVariant::fromValue(entry.startFrame));
+            startItem->setData(Qt::UserRole + 3, QVariant::fromValue(entry.endFrame));
+            startItem->setData(Qt::UserRole + 4, entry.isGap);
+
+            auto *endItem = new QTableWidgetItem(m_transcriptEngine.secondsToTranscriptTime(endTime));
+            endItem->setData(Qt::UserRole, startTime);
+            endItem->setData(Qt::UserRole + 1, endTime);
+            endItem->setData(Qt::UserRole + 2, QVariant::fromValue(entry.startFrame));
+            endItem->setData(Qt::UserRole + 3, QVariant::fromValue(entry.endFrame));
+            endItem->setData(Qt::UserRole + 4, entry.isGap);
+
+            auto *textItem = new QTableWidgetItem(entry.text);
+            textItem->setData(Qt::UserRole, startTime);
+            textItem->setData(Qt::UserRole + 1, endTime);
+            textItem->setData(Qt::UserRole + 2, QVariant::fromValue(entry.startFrame));
+            textItem->setData(Qt::UserRole + 3, QVariant::fromValue(entry.endFrame));
+            textItem->setData(Qt::UserRole + 4, entry.isGap);
+            startItem->setData(Qt::UserRole + 5, entry.segmentIndex);
+            startItem->setData(Qt::UserRole + 6, entry.wordIndex);
+            endItem->setData(Qt::UserRole + 5, entry.segmentIndex);
+            endItem->setData(Qt::UserRole + 6, entry.wordIndex);
+            textItem->setData(Qt::UserRole + 5, entry.segmentIndex);
+            textItem->setData(Qt::UserRole + 6, entry.wordIndex);
+
+            if (entry.isGap)
+            {
+                startItem->setBackground(gapColor);
+                endItem->setBackground(gapColor);
+                textItem->setBackground(gapColor);
+                startItem->setFlags(startItem->flags() & ~Qt::ItemIsEditable);
+                endItem->setFlags(endItem->flags() & ~Qt::ItemIsEditable);
+                textItem->setFlags(textItem->flags() & ~Qt::ItemIsEditable);
+            }
+
+            m_transcriptTable->setItem(row, 0, startItem);
+            m_transcriptTable->setItem(row, 1, endItem);
+            m_transcriptTable->setItem(row, 2, textItem);
+        }
         m_updatingTranscriptInspector = false;
+    }
+
+    void refreshGradingInspector()
+    {
+        if (!m_gradingPathLabel || !m_brightnessSpin || !m_contrastSpin || !m_saturationSpin || !m_opacitySpin)
+        {
+            return;
+        }
+
+        const TimelineClip *clip = m_timeline ? m_timeline->selectedClip() : nullptr;
+        QSignalBlocker brightnessBlock(m_brightnessSpin);
+        QSignalBlocker contrastBlock(m_contrastSpin);
+        QSignalBlocker saturationBlock(m_saturationSpin);
+        QSignalBlocker opacityBlock(m_opacitySpin);
+
+        if (!clip || !clipHasVisuals(*clip))
+        {
+            m_gradingPathLabel->setText(QStringLiteral("No visual clip selected"));
+            m_gradingPathLabel->setToolTip(QString());
+            m_brightnessSpin->setValue(0.0);
+            m_contrastSpin->setValue(1.0);
+            m_saturationSpin->setValue(1.0);
+            m_opacitySpin->setValue(1.0);
+            return;
+        }
+
+        const QString nativePath = QDir::toNativeSeparators(clip->filePath);
+        m_gradingPathLabel->setText(QStringLiteral("%1\n%2").arg(clip->label, nativePath));
+        m_gradingPathLabel->setToolTip(nativePath);
+        m_brightnessSpin->setValue(clip->brightness);
+        m_contrastSpin->setValue(clip->contrast);
+        m_saturationSpin->setValue(clip->saturation);
+        m_opacitySpin->setValue(clip->opacity);
+    }
+
+    void applyTranscriptTableEdit(QTableWidgetItem *item)
+    {
+        if (m_updatingTranscriptInspector || !item || m_loadedTranscriptPath.isEmpty() || !m_loadedTranscriptDoc.isObject())
+        {
+            return;
+        }
+
+        const int segmentIndex = item->data(Qt::UserRole + 5).toInt();
+        const int wordIndex = item->data(Qt::UserRole + 6).toInt();
+        const bool isGap = item->data(Qt::UserRole + 4).toBool();
+        if (isGap || segmentIndex < 0 || wordIndex < 0)
+        {
+            return;
+        }
+
+        QJsonObject root = m_loadedTranscriptDoc.object();
+        QJsonArray segments = root.value(QStringLiteral("segments")).toArray();
+        if (segmentIndex >= segments.size())
+        {
+            return;
+        }
+        QJsonObject segmentObj = segments.at(segmentIndex).toObject();
+        QJsonArray words = segmentObj.value(QStringLiteral("words")).toArray();
+        if (wordIndex >= words.size())
+        {
+            return;
+        }
+
+        QJsonObject wordObj = words.at(wordIndex).toObject();
+        if (item->column() == 0 || item->column() == 1)
+        {
+            double seconds = 0.0;
+            if (!m_transcriptEngine.parseTranscriptTime(item->text(), &seconds))
+            {
+                refreshTranscriptInspector();
+                return;
+            }
+            if (item->column() == 0)
+            {
+                const double currentEnd = wordObj.value(QStringLiteral("end")).toDouble(seconds);
+                wordObj[QStringLiteral("start")] = qMin(seconds, currentEnd);
+            }
+            else
+            {
+                const double currentStart = wordObj.value(QStringLiteral("start")).toDouble(0.0);
+                wordObj[QStringLiteral("end")] = qMax(seconds, currentStart);
+            }
+        }
+        else if (item->column() == 2)
+        {
+            wordObj[QStringLiteral("word")] = item->text();
+        }
+
+        words.replace(wordIndex, wordObj);
+        segmentObj[QStringLiteral("words")] = words;
+        segments.replace(segmentIndex, segmentObj);
+        root[QStringLiteral("segments")] = segments;
+        m_loadedTranscriptDoc.setObject(root);
+        if (!m_transcriptEngine.saveTranscriptJson(m_loadedTranscriptPath, m_loadedTranscriptDoc))
+        {
+            refreshTranscriptInspector();
+            return;
+        }
+
+        refreshTranscriptInspector();
+        scheduleSaveState();
+    }
+
+    void deleteSelectedTranscriptRows()
+    {
+        if (m_updatingTranscriptInspector || !m_transcriptTable || m_loadedTranscriptPath.isEmpty() || !m_loadedTranscriptDoc.isObject())
+        {
+            return;
+        }
+
+        QList<QTableWidgetSelectionRange> ranges = m_transcriptTable->selectedRanges();
+        if (ranges.isEmpty())
+        {
+            return;
+        }
+
+        QSet<quint64> deleteKeys;
+        for (const QTableWidgetSelectionRange &range : ranges)
+        {
+            for (int row = range.topRow(); row <= range.bottomRow(); ++row)
+            {
+                QTableWidgetItem *item = m_transcriptTable->item(row, 0);
+                if (!item || item->data(Qt::UserRole + 4).toBool())
+                {
+                    continue;
+                }
+                const int segmentIndex = item->data(Qt::UserRole + 5).toInt();
+                const int wordIndex = item->data(Qt::UserRole + 6).toInt();
+                if (segmentIndex < 0 || wordIndex < 0)
+                {
+                    continue;
+                }
+                deleteKeys.insert((static_cast<quint64>(segmentIndex) << 32) | static_cast<quint32>(wordIndex));
+            }
+        }
+        if (deleteKeys.isEmpty())
+        {
+            return;
+        }
+
+        QJsonObject root = m_loadedTranscriptDoc.object();
+        QJsonArray segments = root.value(QStringLiteral("segments")).toArray();
+        for (int segmentIndex = 0; segmentIndex < segments.size(); ++segmentIndex)
+        {
+            QJsonObject segmentObj = segments.at(segmentIndex).toObject();
+            const QJsonArray words = segmentObj.value(QStringLiteral("words")).toArray();
+            QJsonArray filteredWords;
+            for (int wordIndex = 0; wordIndex < words.size(); ++wordIndex)
+            {
+                const quint64 key = (static_cast<quint64>(segmentIndex) << 32) | static_cast<quint32>(wordIndex);
+                if (!deleteKeys.contains(key))
+                {
+                    filteredWords.push_back(words.at(wordIndex));
+                }
+            }
+            segmentObj[QStringLiteral("words")] = filteredWords;
+            segments.replace(segmentIndex, segmentObj);
+        }
+        root[QStringLiteral("segments")] = segments;
+        m_loadedTranscriptDoc.setObject(root);
+        if (!m_transcriptEngine.saveTranscriptJson(m_loadedTranscriptPath, m_loadedTranscriptDoc))
+        {
+            refreshTranscriptInspector();
+            return;
+        }
+
+        refreshTranscriptInspector();
+        scheduleSaveState();
+    }
+
+    void refreshVideoKeyframeInspector()
+    {
+        if (!m_videoKeyframeTable || !m_keyframesInspectorClipLabel || !m_keyframesInspectorDetailsLabel)
+        {
+            return;
+        }
+
+        const TimelineClip *clip = m_timeline ? m_timeline->selectedClip() : nullptr;
+        m_updatingVideoInspector = true;
+        QSignalBlocker tableBlocker(m_videoKeyframeTable);
+        QSignalBlocker txBlocker(m_videoTranslationXSpin);
+        QSignalBlocker tyBlocker(m_videoTranslationYSpin);
+        QSignalBlocker rotBlocker(m_videoRotationSpin);
+        QSignalBlocker sxBlocker(m_videoScaleXSpin);
+        QSignalBlocker syBlocker(m_videoScaleYSpin);
+        QSignalBlocker interpBlocker(m_videoInterpolationCombo);
+        QSignalBlocker mirrorHBlocker(m_mirrorHorizontalCheckBox);
+        QSignalBlocker mirrorVBlocker(m_mirrorVerticalCheckBox);
+
+        m_videoKeyframeTable->clearContents();
+        m_videoKeyframeTable->setRowCount(0);
+
+        if (!clip || !clipHasVisuals(*clip))
+        {
+            m_keyframesInspectorClipLabel->setText(QStringLiteral("No visual clip selected"));
+            m_keyframesInspectorDetailsLabel->setText(QStringLiteral("Select a visual clip to inspect its keyframes."));
+            m_videoTranslationXSpin->setValue(0.0);
+            m_videoTranslationYSpin->setValue(0.0);
+            m_videoRotationSpin->setValue(0.0);
+            m_videoScaleXSpin->setValue(1.0);
+            m_videoScaleYSpin->setValue(1.0);
+            m_videoInterpolationCombo->setCurrentIndex(1);
+            m_mirrorHorizontalCheckBox->setChecked(false);
+            m_mirrorVerticalCheckBox->setChecked(false);
+            m_selectedVideoKeyframeFrame = -1;
+            m_selectedVideoKeyframeFrames.clear();
+            m_updatingVideoInspector = false;
+            return;
+        }
+
+        const QString sourcePath = QDir::toNativeSeparators(clip->filePath);
+        const QString sourceLabel = QStringLiteral("%1 | %2")
+                                        .arg(clipMediaTypeLabel(clip->mediaType),
+                                             mediaSourceKindLabel(clip->sourceKind));
+        m_keyframesInspectorClipLabel->setText(QStringLiteral("%1\n%2").arg(clip->label, sourceLabel));
+
+        QList<int64_t> frames;
+        if (clip->transformKeyframes.isEmpty())
+        {
+            frames.push_back(0);
+        }
+        else
+        {
+            frames.reserve(clip->transformKeyframes.size());
+            for (const TimelineClip::TransformKeyframe &keyframe : clip->transformKeyframes)
+            {
+                frames.push_back(keyframe.frame);
+            }
+            std::sort(frames.begin(), frames.end());
+        }
+
+        m_videoKeyframeTable->setRowCount(frames.size());
+        for (int row = 0; row < frames.size(); ++row)
+        {
+            const int64_t frame = frames[row];
+            TimelineClip::TransformKeyframe displayedFrame;
+            if (clip->transformKeyframes.isEmpty())
+            {
+                displayedFrame = evaluateClipTransformAtFrame(*clip, clip->startFrame);
+                displayedFrame.frame = 0;
+            }
+            else
+            {
+                for (const TimelineClip::TransformKeyframe &keyframe : clip->transformKeyframes)
+                {
+                    if (keyframe.frame == frame)
+                    {
+                        displayedFrame = keyframeForInspectorDisplay(*clip, keyframe);
+                        break;
+                    }
+                }
+            }
+
+            const QStringList rowValues = {
+                QString::number(frame),
+                QString::number(displayedFrame.translationX, 'f', 3),
+                QString::number(displayedFrame.translationY, 'f', 3),
+                QString::number(displayedFrame.rotation, 'f', 3),
+                QString::number(displayedFrame.scaleX, 'f', 3),
+                QString::number(displayedFrame.scaleY, 'f', 3),
+                videoInterpolationLabel(displayedFrame.linearInterpolation)};
+
+            for (int column = 0; column < rowValues.size(); ++column)
+            {
+                auto *item = new QTableWidgetItem(rowValues[column]);
+                item->setData(Qt::UserRole, QVariant::fromValue(static_cast<qint64>(frame)));
+                if (clip->transformKeyframes.isEmpty())
+                {
+                    item->setToolTip(QStringLiteral("Base transform (no stored keyframes yet)"));
+                }
+                m_videoKeyframeTable->setItem(row, column, item);
+            }
+        }
+
+        if (m_selectedVideoKeyframeFrame < 0 || !frames.contains(m_selectedVideoKeyframeFrame))
+        {
+            const int selectedIndex = clip->transformKeyframes.isEmpty() ? 0 : nearestVideoKeyframeIndex(*clip);
+            m_selectedVideoKeyframeFrame = selectedIndex >= 0 && selectedIndex < clip->transformKeyframes.size()
+                                               ? clip->transformKeyframes[selectedIndex].frame
+                                               : 0;
+            m_selectedVideoKeyframeFrames = {m_selectedVideoKeyframeFrame};
+        }
+        else if (m_selectedVideoKeyframeFrames.isEmpty())
+        {
+            m_selectedVideoKeyframeFrames = {m_selectedVideoKeyframeFrame};
+        }
+
+        TimelineClip::TransformKeyframe displayed;
+        if (clip->transformKeyframes.isEmpty())
+        {
+            displayed = evaluateClipTransformAtFrame(*clip, clip->startFrame);
+            displayed.frame = 0;
+        }
+        else
+        {
+            int selectedIndex = selectedVideoKeyframeIndex(*clip);
+            if (selectedIndex < 0)
+            {
+                selectedIndex = nearestVideoKeyframeIndex(*clip);
+            }
+            if (selectedIndex < 0)
+            {
+                selectedIndex = 0;
+            }
+            displayed = keyframeForInspectorDisplay(*clip, clip->transformKeyframes[selectedIndex]);
+        }
+
+        m_videoTranslationXSpin->setValue(displayed.translationX);
+        m_videoTranslationYSpin->setValue(displayed.translationY);
+        m_videoRotationSpin->setValue(displayed.rotation);
+        m_videoScaleXSpin->setValue(std::abs(displayed.scaleX));
+        m_videoScaleYSpin->setValue(std::abs(displayed.scaleY));
+        m_mirrorHorizontalCheckBox->setChecked(displayed.scaleX < 0.0);
+        m_mirrorVerticalCheckBox->setChecked(displayed.scaleY < 0.0);
+        m_videoInterpolationCombo->setCurrentIndex(displayed.linearInterpolation ? 1 : 0);
+
+        for (int row = 0; row < m_videoKeyframeTable->rowCount(); ++row)
+        {
+            QTableWidgetItem *item = m_videoKeyframeTable->item(row, 0);
+            if (!item) {
+                continue;
+            }
+            const int64_t frame = item->data(Qt::UserRole).toLongLong();
+            if (m_selectedVideoKeyframeFrames.contains(frame)) {
+                m_videoKeyframeTable->selectRow(row);
+            }
+        }
+
+        const QString keyframeSummary = clip->transformKeyframes.isEmpty()
+                                            ? QStringLiteral("Using base transform only")
+                                            : QStringLiteral("%1 stored transform keyframe%2")
+                                                  .arg(clip->transformKeyframes.size())
+                                                  .arg(clip->transformKeyframes.size() == 1 ? QString() : QStringLiteral("s"));
+        m_keyframesInspectorDetailsLabel->setText(
+            QStringLiteral("%1\nSource: %2")
+                .arg(keyframeSummary, sourcePath));
+        m_keyframesInspectorDetailsLabel->setToolTip(sourcePath);
+        m_updatingVideoInspector = false;
     }
 
     void refreshClipInspector()
@@ -2649,15 +3881,24 @@ private slots:
 
         const QString proxyPath = playbackProxyPathForClip(*clip);
         const QString playbackPath = playbackMediaPathForClip(*clip);
+        MediaProbeResult originalProbe;
+        originalProbe.mediaType = clip->mediaType;
+        originalProbe.sourceKind = clip->sourceKind;
+        originalProbe.hasAudio = clip->hasAudio;
+        originalProbe.hasVideo = clipHasVisuals(*clip);
+        originalProbe.durationFrames = clip->sourceDurationFrames > 0 ? clip->sourceDurationFrames : clip->durationFrames;
         m_clipInspectorClipLabel->setText(QStringLiteral("%1\n%2")
-                                              .arg(clip->label, clipMediaTypeLabel(clip->mediaType)));
+                                              .arg(clip->label,
+                                                   QStringLiteral("%1 | %2")
+                                                       .arg(clipMediaTypeLabel(clip->mediaType),
+                                                            mediaSourceKindLabel(clip->sourceKind))));
         m_clipProxyUsageLabel->setText(QStringLiteral("Proxy In Use: %1")
                                            .arg(playbackPath != clip->filePath ? QStringLiteral("Yes")
                                                                                : QStringLiteral("No")));
         m_clipPlaybackSourceLabel->setText(QStringLiteral("Playback Source\n%1")
                                                .arg(QDir::toNativeSeparators(playbackPath)));
         m_clipOriginalInfoLabel->setText(QStringLiteral("Original\n%1")
-                                             .arg(clipFileInfoSummary(clip->filePath)));
+                                             .arg(clipFileInfoSummary(clip->filePath, &originalProbe)));
         if (proxyPath.isEmpty())
         {
             const QString configuredProxyPath = clip->proxyPath.isEmpty()
@@ -2670,6 +3911,517 @@ private slots:
         {
             m_clipProxyInfoLabel->setText(QStringLiteral("Proxy\n%1")
                                               .arg(clipFileInfoSummary(proxyPath)));
+        }
+    }
+
+    void refreshOutputInspector()
+    {
+        if (!m_outputWidthSpin || !m_outputHeightSpin || !m_exportStartSpin || !m_exportEndSpin || !m_outputRangeSummaryLabel)
+        {
+            return;
+        }
+
+        const bool hasTimeline = m_timeline != nullptr;
+        const QVector<ExportRangeSegment> ranges = hasTimeline ? m_timeline->exportRanges() : QVector<ExportRangeSegment>{};
+        const int64_t startFrame = ranges.isEmpty() ? 0 : ranges.constFirst().startFrame;
+        const int64_t endFrame = ranges.isEmpty() ? 0 : ranges.constLast().endFrame;
+
+        m_updatingOutputInspector = true;
+        QSignalBlocker startBlocker(m_exportStartSpin);
+        QSignalBlocker endBlocker(m_exportEndSpin);
+        m_exportStartSpin->setEnabled(hasTimeline);
+        m_exportEndSpin->setEnabled(hasTimeline);
+        m_exportStartSpin->setValue(static_cast<int>(startFrame));
+        m_exportEndSpin->setValue(static_cast<int>(endFrame));
+
+        QStringList segments;
+        segments.reserve(ranges.size());
+        for (const ExportRangeSegment &range : ranges)
+        {
+            segments.push_back(QStringLiteral("%1-%2").arg(range.startFrame).arg(range.endFrame));
+        }
+        if (ranges.isEmpty())
+        {
+            m_outputRangeSummaryLabel->setText(QStringLiteral("Timeline export range: none"));
+        }
+        else if (ranges.size() == 1)
+        {
+            m_outputRangeSummaryLabel->setText(QStringLiteral("Timeline export range: %1").arg(segments.constFirst()));
+        }
+        else
+        {
+            m_outputRangeSummaryLabel->setText(
+                QStringLiteral("Timeline export ranges (%1): %2\nStart/End fields show the overall span.")
+                    .arg(ranges.size())
+                    .arg(segments.join(QStringLiteral(" | "))));
+        }
+        m_outputRangeSummaryLabel->setToolTip(m_outputRangeSummaryLabel->text());
+        if (m_renderButton)
+        {
+            m_renderButton->setEnabled(hasTimeline && !m_timeline->clips().isEmpty());
+        }
+        m_updatingOutputInspector = false;
+    }
+
+    void applyOutputRangeFromInspector()
+    {
+        if (m_updatingOutputInspector || !m_timeline || !m_exportStartSpin || !m_exportEndSpin)
+        {
+            return;
+        }
+
+        const int64_t startFrame = qMin<int64_t>(m_exportStartSpin->value(), m_exportEndSpin->value());
+        const int64_t endFrame = qMax<int64_t>(m_exportStartSpin->value(), m_exportEndSpin->value());
+        m_timeline->setExportRange(startFrame, endFrame);
+        refreshOutputInspector();
+    }
+
+    void renderFromOutputInspector()
+    {
+        if (!m_timeline || m_timeline->clips().isEmpty())
+        {
+            QMessageBox::warning(this,
+                                 QStringLiteral("Render"),
+                                 QStringLiteral("There is nothing on the timeline to render."));
+            return;
+        }
+
+        setPlaybackActive(false);
+
+        const QString outputFormat = m_outputFormatCombo ? m_outputFormatCombo->currentData().toString() : QStringLiteral("mp4");
+        const QString suffix = outputFormat.isEmpty() ? QStringLiteral("mp4") : outputFormat;
+        const QString defaultDir = QDir::currentPath();
+        const QString defaultBase = QStringLiteral("render_%1.%2")
+                                        .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss")))
+                                        .arg(suffix);
+        const QString selectedPath = QFileDialog::getSaveFileName(
+            this,
+            QStringLiteral("Render Timeline"),
+            QDir(defaultDir).filePath(defaultBase),
+            QStringLiteral("Video Files (*.%1)").arg(suffix));
+        if (selectedPath.isEmpty())
+        {
+            return;
+        }
+
+        QString outputPath = selectedPath;
+        if (QFileInfo(outputPath).suffix().isEmpty())
+        {
+            outputPath += QStringLiteral(".") + suffix;
+        }
+
+        RenderRequest request;
+        request.outputPath = outputPath;
+        request.outputFormat = outputFormat;
+        request.outputSize = QSize(m_outputWidthSpin ? m_outputWidthSpin->value() : 1080,
+                                   m_outputHeightSpin ? m_outputHeightSpin->value() : 1920);
+        request.clips = m_timeline->clips();
+        request.renderSyncMarkers = m_timeline->renderSyncMarkers();
+        request.exportRanges = effectivePlaybackRanges();
+        request.exportStartFrame = request.exportRanges.isEmpty() ? m_timeline->exportStartFrame()
+                                                                 : request.exportRanges.constFirst().startFrame;
+        request.exportEndFrame = request.exportRanges.isEmpty() ? m_timeline->exportEndFrame()
+                                                               : request.exportRanges.constLast().endFrame;
+
+        int64_t totalFramesToRender = 0;
+        for (const ExportRangeSegment &range : std::as_const(request.exportRanges))
+        {
+            totalFramesToRender += qMax<int64_t>(0, range.endFrame - range.startFrame + 1);
+        }
+        if (totalFramesToRender <= 0)
+        {
+            totalFramesToRender = qMax<int64_t>(1, request.exportEndFrame - request.exportStartFrame + 1);
+        }
+
+        QProgressDialog progressDialog(QStringLiteral("Preparing render..."),
+                                       QStringLiteral("Cancel"),
+                                       0,
+                                       static_cast<int>(qMin<int64_t>(totalFramesToRender, std::numeric_limits<int>::max())),
+                                       this);
+        progressDialog.setWindowTitle(QStringLiteral("Render Export"));
+        progressDialog.setWindowModality(Qt::ApplicationModal);
+        progressDialog.setAutoClose(false);
+        progressDialog.setAutoReset(false);
+        progressDialog.setMinimumWidth(460);
+        progressDialog.setStyleSheet(QStringLiteral(
+            "QProgressDialog { background: #f6f3ee; }"
+            "QLabel { color: #1f2430; font-size: 13px; }"
+            "QProgressBar { border: 1px solid #c9c2b8; border-radius: 6px; text-align: center; background: #ffffff; min-height: 20px; }"
+            "QProgressBar::chunk { background: #2f7d67; border-radius: 5px; }"
+            "QPushButton { min-width: 96px; padding: 6px 14px; }"));
+        progressDialog.show();
+
+        QElapsedTimer renderTimer;
+        renderTimer.start();
+        const auto formatEta = [](qint64 remainingMs) -> QString
+        {
+            if (remainingMs <= 0)
+            {
+                return QStringLiteral("calculating...");
+            }
+            const qint64 totalSeconds = remainingMs / 1000;
+            const qint64 hours = totalSeconds / 3600;
+            const qint64 minutes = (totalSeconds % 3600) / 60;
+            const qint64 seconds = totalSeconds % 60;
+            if (hours > 0)
+            {
+                return QStringLiteral("%1h %2m %3s").arg(hours).arg(minutes).arg(seconds);
+            }
+            if (minutes > 0)
+            {
+                return QStringLiteral("%1m %2s").arg(minutes).arg(seconds);
+            }
+            return QStringLiteral("%1s").arg(seconds);
+        };
+
+        const RenderResult result = renderTimelineToFile(
+            request,
+            [this, &progressDialog, &renderTimer, formatEta](const RenderProgress &progress)
+            {
+                progressDialog.setMaximum(qMax(1, static_cast<int>(qMin<int64_t>(progress.totalFrames, std::numeric_limits<int>::max()))));
+                progressDialog.setValue(static_cast<int>(qMin<int64_t>(progress.framesCompleted, std::numeric_limits<int>::max())));
+                const qint64 completedFrames = qMax<int64_t>(1, progress.framesCompleted);
+                const qint64 elapsedMs = renderTimer.elapsed();
+                const qint64 remainingFrames = qMax<int64_t>(0, progress.totalFrames - progress.framesCompleted);
+                const qint64 estimatedRemainingMs =
+                    progress.framesCompleted > 0 ? (elapsedMs * remainingFrames) / completedFrames : -1;
+                const QString rendererMode = progress.usingGpu ? QStringLiteral("GPU render") : QStringLiteral("CPU render");
+                const QString encoderMode = progress.usingHardwareEncode
+                                                ? QStringLiteral("Hardware encode")
+                                                : QStringLiteral("Software encode");
+                const QString encoderLabel = progress.encoderLabel.isEmpty()
+                                                 ? QStringLiteral("unknown")
+                                                 : progress.encoderLabel;
+                progressDialog.setLabelText(
+                    QStringLiteral("<b>Rendering frame %1 of %2</b><br>"
+                                   "Segment %3/%4: %5-%6<br>"
+                                   "%7 | %8 (%9)<br>"
+                                   "Estimated time remaining: %10")
+                        .arg(progress.framesCompleted + 1)
+                        .arg(qMax<int64_t>(1, progress.totalFrames))
+                        .arg(progress.segmentIndex)
+                        .arg(progress.segmentCount)
+                        .arg(progress.segmentStartFrame)
+                        .arg(progress.segmentEndFrame)
+                        .arg(rendererMode)
+                        .arg(encoderMode)
+                        .arg(encoderLabel)
+                        .arg(formatEta(estimatedRemainingMs)));
+                QCoreApplication::processEvents();
+                return !progressDialog.wasCanceled();
+            });
+        progressDialog.setValue(progressDialog.maximum());
+
+        if (result.success)
+        {
+            QMessageBox::information(this, QStringLiteral("Render Complete"), result.message);
+            return;
+        }
+
+        const QString message = result.message.isEmpty()
+                                    ? QStringLiteral("Render failed.")
+                                    : result.message;
+        QMessageBox::warning(this,
+                             result.cancelled ? QStringLiteral("Render Cancelled") : QStringLiteral("Render Failed"),
+                             message);
+    }
+
+    QStringList availableHardwareDeviceTypes() const
+    {
+        QStringList types;
+        for (AVHWDeviceType type = av_hwdevice_iterate_types(AV_HWDEVICE_TYPE_NONE);
+             type != AV_HWDEVICE_TYPE_NONE;
+             type = av_hwdevice_iterate_types(type))
+        {
+            if (const char *name = av_hwdevice_get_type_name(type))
+            {
+                types.push_back(QString::fromLatin1(name));
+            }
+        }
+        return types;
+    }
+
+    bool profileBenchmarkClip(TimelineClip *out) const
+    {
+        if (!out)
+        {
+            return false;
+        }
+        if (!m_timeline)
+        {
+            return false;
+        }
+        const TimelineClip *selected = m_timeline->selectedClip();
+        if (selected && clipHasVisuals(*selected))
+        {
+            *out = *selected;
+            return true;
+        }
+        const QVector<TimelineClip> clips = m_timeline->clips();
+        for (const TimelineClip &clip : clips)
+        {
+            if (clipHasVisuals(clip))
+            {
+                *out = clip;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    QString formatBenchmarkSummary(const QJsonObject &benchmark) const
+    {
+        if (benchmark.isEmpty())
+        {
+            return QStringLiteral("Benchmark: not run yet");
+        }
+        if (!benchmark.value(QStringLiteral("success")).toBool())
+        {
+            return QStringLiteral("Benchmark: failed\nReason: %1")
+                .arg(benchmark.value(QStringLiteral("error")).toString(QStringLiteral("unknown")));
+        }
+
+        return QStringLiteral("Benchmark:\n"
+                              "  clip: %1\n"
+                              "  media path: %2\n"
+                              "  codec: %3\n"
+                              "  decode path: %4\n"
+                              "  frames decoded: %5\n"
+                              "  null frames: %6\n"
+                              "  elapsed: %7 ms\n"
+                              "  throughput: %8 fps")
+            .arg(benchmark.value(QStringLiteral("clip_label")).toString())
+            .arg(benchmark.value(QStringLiteral("path")).toString())
+            .arg(benchmark.value(QStringLiteral("codec")).toString())
+            .arg(benchmark.value(QStringLiteral("decode_path")).toString())
+            .arg(benchmark.value(QStringLiteral("frames_decoded")).toInt())
+            .arg(benchmark.value(QStringLiteral("null_frames")).toInt())
+            .arg(benchmark.value(QStringLiteral("elapsed_ms")).toInt())
+            .arg(benchmark.value(QStringLiteral("fps")).toDouble(), 0, 'f', 1);
+    }
+
+    void refreshProfileInspector()
+    {
+        if (!m_profileSummaryTextEdit)
+        {
+            return;
+        }
+
+        QStringList lines;
+        lines << QStringLiteral("System Profile")
+              << QString()
+              << QStringLiteral("Preview backend: %1").arg(m_preview ? m_preview->backendName() : QStringLiteral("unknown"))
+              << QStringLiteral("Decoder workers: %1").arg(m_preview && m_preview->profilingSnapshot().contains(QStringLiteral("decoder"))
+                                                               ? m_preview->profilingSnapshot().value(QStringLiteral("decoder")).toObject().value(QStringLiteral("worker_count")).toInt()
+                                                               : 0)
+              << QStringLiteral("FFmpeg hardware device types available: %1")
+                     .arg(availableHardwareDeviceTypes().isEmpty()
+                              ? QStringLiteral("none")
+                              : availableHardwareDeviceTypes().join(QStringLiteral(", ")))
+              << QStringLiteral("Preferred Linux decode backends: CUDA, VAAPI")
+              << QStringLiteral("Opaque video decode policy: hardware when supported")
+              << QStringLiteral("Alpha / image / image-sequence decode policy: software")
+              << QStringLiteral("Render export encode path: software by default (current exporter)")
+              << QString();
+
+        TimelineClip clip;
+        if (profileBenchmarkClip(&clip))
+        {
+            const QString mediaPath = playbackMediaPathForClip(clip);
+            const MediaProbeResult probe = probeMediaFile(mediaPath, clip.durationFrames);
+            lines << QStringLiteral("Current benchmark target:")
+                  << QStringLiteral("  label: %1").arg(clip.label)
+                  << QStringLiteral("  source kind: %1 / %2")
+                         .arg(clipMediaTypeLabel(clip.mediaType), mediaSourceKindLabel(clip.sourceKind))
+                  << QStringLiteral("  playback path: %1").arg(QDir::toNativeSeparators(mediaPath))
+                  << QStringLiteral("  codec: %1").arg(probe.codecName.isEmpty() ? QStringLiteral("unknown") : probe.codecName)
+                  << QStringLiteral("  alpha: %1").arg(probe.hasAlpha ? QStringLiteral("yes") : QStringLiteral("no"))
+                  << QStringLiteral("  audio: %1").arg(probe.hasAudio ? QStringLiteral("yes") : QStringLiteral("no"))
+                  << QStringLiteral("  duration frames: %1").arg(probe.durationFrames);
+        }
+        else
+        {
+            lines << QStringLiteral("Current benchmark target: no visual clip selected");
+        }
+
+        lines << QString() << formatBenchmarkSummary(m_lastDecodeBenchmark);
+        m_profileSummaryTextEdit->setPlainText(lines.join(QLatin1Char('\n')));
+    }
+
+    void runDecodeBenchmarkFromProfile()
+    {
+        TimelineClip clip;
+        if (!profileBenchmarkClip(&clip))
+        {
+            QMessageBox::warning(this,
+                                 QStringLiteral("Decode Benchmark"),
+                                 QStringLiteral("Select a visual clip or add one to the timeline first."));
+            return;
+        }
+
+        const QString mediaPath = playbackMediaPathForClip(clip);
+        if (mediaPath.isEmpty())
+        {
+            QMessageBox::warning(this,
+                                 QStringLiteral("Decode Benchmark"),
+                                 QStringLiteral("This clip has no playable media path."));
+            return;
+        }
+
+        QProgressDialog progress(QStringLiteral("Running decode benchmark..."),
+                                 QString(),
+                                 0,
+                                 0,
+                                 this);
+        progress.setWindowTitle(QStringLiteral("Decode Benchmark"));
+        progress.setCancelButton(nullptr);
+        progress.setWindowModality(Qt::ApplicationModal);
+        progress.show();
+        QCoreApplication::processEvents();
+
+        QJsonObject benchmark{
+            {QStringLiteral("success"), false},
+            {QStringLiteral("clip_label"), clip.label},
+            {QStringLiteral("path"), QDir::toNativeSeparators(mediaPath)}
+        };
+
+        DecoderContext ctx(mediaPath);
+        if (!ctx.initialize())
+        {
+            benchmark[QStringLiteral("error")] = QStringLiteral("Failed to initialize decoder context.");
+            m_lastDecodeBenchmark = benchmark;
+            refreshProfileInspector();
+            return;
+        }
+
+        const VideoStreamInfo info = ctx.info();
+        const int64_t durationFrames = qMax<int64_t>(1, info.durationFrames);
+        const int framesToBenchmark = static_cast<int>(qMin<int64_t>(90, durationFrames));
+        int decodedFrames = 0;
+        int nullFrames = 0;
+
+        QElapsedTimer timer;
+        timer.start();
+        for (int i = 0; i < framesToBenchmark; ++i)
+        {
+            FrameHandle frame = ctx.decodeFrame(i);
+            if (frame.isNull())
+            {
+                ++nullFrames;
+            }
+            else
+            {
+                ++decodedFrames;
+            }
+        }
+        const qint64 elapsedMs = qMax<qint64>(1, timer.elapsed());
+        const double fps = (1000.0 * decodedFrames) / static_cast<double>(elapsedMs);
+
+        benchmark[QStringLiteral("success")] = true;
+        benchmark[QStringLiteral("codec")] = info.codecName;
+        benchmark[QStringLiteral("decode_path")] = ctx.isHardwareAccelerated() ? QStringLiteral("hardware") : QStringLiteral("software");
+        benchmark[QStringLiteral("frames_decoded")] = decodedFrames;
+        benchmark[QStringLiteral("null_frames")] = nullFrames;
+        benchmark[QStringLiteral("elapsed_ms")] = static_cast<qint64>(elapsedMs);
+        benchmark[QStringLiteral("fps")] = fps;
+        m_lastDecodeBenchmark = benchmark;
+        refreshProfileInspector();
+    }
+
+    bool focusInTranscriptTable() const
+    {
+        QWidget *focus = QApplication::focusWidget();
+        return m_transcriptTable &&
+               focus &&
+               (focus == m_transcriptTable ||
+                m_transcriptTable->isAncestorOf(focus));
+    }
+
+    bool focusInKeyframeTable() const
+    {
+        QWidget *focus = QApplication::focusWidget();
+        return m_videoKeyframeTable &&
+               focus &&
+               (focus == m_videoKeyframeTable ||
+                m_videoKeyframeTable->isAncestorOf(focus));
+    }
+
+    bool focusInEditableInput() const
+    {
+        QWidget *focus = QApplication::focusWidget();
+        if (!focus)
+        {
+            return false;
+        }
+        if (qobject_cast<QLineEdit *>(focus) ||
+            qobject_cast<QTextEdit *>(focus) ||
+            qobject_cast<QPlainTextEdit *>(focus) ||
+            qobject_cast<QAbstractSpinBox *>(focus))
+        {
+            return true;
+        }
+        if (auto *combo = qobject_cast<QComboBox *>(focus))
+        {
+            if (combo->isEditable())
+            {
+                return true;
+            }
+        }
+        for (QWidget *parent = focus->parentWidget(); parent; parent = parent->parentWidget())
+        {
+            if (qobject_cast<QLineEdit *>(parent) ||
+                qobject_cast<QTextEdit *>(parent) ||
+                qobject_cast<QPlainTextEdit *>(parent) ||
+                qobject_cast<QAbstractSpinBox *>(parent) ||
+                qobject_cast<QAbstractItemView *>(parent))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool shouldBlockGlobalEditorShortcuts() const
+    {
+        return focusInEditableInput();
+    }
+
+    void initializeDeferredTimelineSeek(QTimer *timer, int64_t *pendingFrame)
+    {
+        if (!timer || !pendingFrame)
+        {
+            return;
+        }
+        timer->setSingleShot(true);
+        connect(timer, &QTimer::timeout, this, [this, pendingFrame]()
+                {
+            if (!m_timeline || !pendingFrame || *pendingFrame < 0) {
+                return;
+            }
+            setCurrentPlaybackSample(frameToSamples(*pendingFrame), false, true);
+            *pendingFrame = -1;
+        });
+    }
+
+    void scheduleDeferredTimelineSeek(QTimer *timer, int64_t *pendingFrame, int64_t timelineFrame)
+    {
+        if (!timer || !pendingFrame)
+        {
+            return;
+        }
+        *pendingFrame = timelineFrame;
+        timer->start(QApplication::doubleClickInterval());
+    }
+
+    void cancelDeferredTimelineSeek(QTimer *timer, int64_t *pendingFrame)
+    {
+        if (timer)
+        {
+            timer->stop();
+        }
+        if (pendingFrame)
+        {
+            *pendingFrame = -1;
         }
     }
 private:
@@ -2702,6 +4454,8 @@ private:
 
     QLabel *m_keyframesInspectorClipLabel = nullptr;
     QLabel *m_keyframesInspectorDetailsLabel = nullptr;
+    QCheckBox *m_keyframesAutoScrollCheckBox = nullptr;
+    QCheckBox *m_keyframesFollowCurrentCheckBox = nullptr;
 
     QLabel *m_audioInspectorClipLabel = nullptr;
     QLabel *m_audioInspectorDetailsLabel = nullptr;
@@ -2715,6 +4469,8 @@ private:
     QLabel *m_clipPlaybackSourceLabel = nullptr;
     QLabel *m_clipOriginalInfoLabel = nullptr;
     QLabel *m_clipProxyInfoLabel = nullptr;
+    QPlainTextEdit *m_profileSummaryTextEdit = nullptr;
+    QPushButton *m_profileBenchmarkButton = nullptr;
 
     QLabel *m_syncInspectorClipLabel = nullptr;
     QLabel *m_syncInspectorDetailsLabel = nullptr;
@@ -2730,6 +4486,7 @@ private:
     QSpinBox *m_exportStartSpin = nullptr;
     QSpinBox *m_exportEndSpin = nullptr;
     QComboBox *m_outputFormatCombo = nullptr;
+    QLabel *m_outputRangeSummaryLabel = nullptr;
 
     QDoubleSpinBox *m_videoTranslationXSpin = nullptr;
     QDoubleSpinBox *m_videoTranslationYSpin = nullptr;
@@ -2752,8 +4509,10 @@ private:
     QSpinBox *m_transcriptPrependMsSpin = nullptr;
     QSpinBox *m_transcriptPostpendMsSpin = nullptr;
     QCheckBox *m_speechFilterEnabledCheckBox = nullptr;
+    QSpinBox *m_speechFilterFadeSamplesSpin = nullptr;
     int m_transcriptPrependMs = 0;
     int m_transcriptPostpendMs = 0;
+    int m_speechFilterFadeSamples = 250;
     mutable TranscriptEngine m_transcriptEngine;
 
     QDoubleSpinBox *m_transcriptOverlayXSpin = nullptr;
@@ -2790,18 +4549,26 @@ private:
     bool m_pendingSaveAfterLoad = false;
     bool m_restoringHistory = false;
 
-    int64_t m_currentPlaybackSample = 0;
+    int64_t m_absolutePlaybackSample = 0;
+    int64_t m_filteredPlaybackSample = 0;
+    QTimer m_transcriptClickSeekTimer;
+    int64_t m_pendingTranscriptClickTimelineFrame = -1;
+    QTimer m_keyframeClickSeekTimer;
+    int64_t m_pendingKeyframeClickTimelineFrame = -1;
 
     QString m_currentProjectId;
 
     QByteArray m_lastSavedState;
     QJsonArray m_historyEntries;
     int m_historyIndex = -1;
+    QJsonObject m_lastDecodeBenchmark;
 
     bool m_updatingVideoInspector = false;
     bool m_updatingTranscriptInspector = false;
     bool m_updatingSyncInspector = false;
+    bool m_updatingOutputInspector = false;
     bool m_syncingScaleControls = false;
+    bool m_syncingKeyframeTableSelection = false;
 
     int64_t m_selectedVideoKeyframeFrame = -1;
     QSet<int64_t> m_selectedVideoKeyframeFrames;

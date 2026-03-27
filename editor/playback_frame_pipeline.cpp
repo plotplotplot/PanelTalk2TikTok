@@ -174,7 +174,7 @@ void PlaybackFramePipeline::setTimelineClips(const QVector<TimelineClip>& clips)
         }
         ClipInfo info;
         info.clip = clip;
-        info.playbackPath = playbackMediaPathForClip(clip);
+        info.playbackPath = interactivePreviewMediaPathForClip(clip);
         info.isSingleFrame = isSingleFrameClip(clip);
         nextClips.insert(clip.id, info);
         if (m_buffers.contains(clip.id)) {

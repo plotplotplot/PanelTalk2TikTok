@@ -15,6 +15,7 @@ QJsonObject clipToJson(const TimelineClip &clip)
         obj[QStringLiteral("proxyPath")] = clip.proxyPath;
         obj[QStringLiteral("label")] = clip.label;
         obj[QStringLiteral("mediaType")] = clipMediaTypeToString(clip.mediaType);
+        obj[QStringLiteral("sourceKind")] = mediaSourceKindToString(clip.sourceKind);
         obj[QStringLiteral("hasAudio")] = clip.hasAudio;
         obj[QStringLiteral("sourceDurationFrames")] = static_cast<qint64>(clip.sourceDurationFrames);
         obj[QStringLiteral("sourceInFrame")] = static_cast<qint64>(clip.sourceInFrame);
@@ -43,7 +44,7 @@ QJsonObject clipToJson(const TimelineClip &clip)
             keyframeObj[QStringLiteral("rotation")] = keyframe.rotation;
             keyframeObj[QStringLiteral("scaleX")] = keyframe.scaleX;
             keyframeObj[QStringLiteral("scaleY")] = keyframe.scaleY;
-            keyframeObj[QStringLiteral("interpolated")] = keyframe.interpolated;
+            keyframeObj[QStringLiteral("linearInterpolation")] = keyframe.linearInterpolation;
             keyframes.push_back(keyframeObj);
         }
         obj[QStringLiteral("transformKeyframes")] = keyframes;
@@ -76,6 +77,7 @@ TimelineClip clipFromJson(const QJsonObject &obj)
         clip.proxyPath = obj.value(QStringLiteral("proxyPath")).toString();
         clip.label = obj.value(QStringLiteral("label")).toString(QFileInfo(clip.filePath).fileName());
         clip.mediaType = clipMediaTypeFromString(obj.value(QStringLiteral("mediaType")).toString());
+        clip.sourceKind = mediaSourceKindFromString(obj.value(QStringLiteral("sourceKind")).toString());
         clip.hasAudio = obj.value(QStringLiteral("hasAudio")).toBool(false);
         clip.sourceDurationFrames = obj.value(QStringLiteral("sourceDurationFrames")).toVariant().toLongLong();
         clip.sourceInFrame = obj.value(QStringLiteral("sourceInFrame")).toVariant().toLongLong();
@@ -90,6 +92,7 @@ TimelineClip clipFromJson(const QJsonObject &obj)
         {
             const MediaProbeResult probe = probeMediaFile(clip.filePath, clip.durationFrames);
             clip.mediaType = probe.mediaType;
+            clip.sourceKind = probe.sourceKind;
             clip.hasAudio = probe.hasAudio;
             clip.durationFrames = probe.durationFrames;
             clip.sourceDurationFrames = probe.durationFrames;
@@ -132,7 +135,14 @@ TimelineClip clipFromJson(const QJsonObject &obj)
             keyframe.rotation = keyframeObj.value(QStringLiteral("rotation")).toDouble(0.0);
             keyframe.scaleX = keyframeObj.value(QStringLiteral("scaleX")).toDouble(1.0);
             keyframe.scaleY = keyframeObj.value(QStringLiteral("scaleY")).toDouble(1.0);
-            keyframe.interpolated = keyframeObj.value(QStringLiteral("interpolated")).toBool(true);
+            if (keyframeObj.contains(QStringLiteral("linearInterpolation"))) {
+                keyframe.linearInterpolation =
+                    keyframeObj.value(QStringLiteral("linearInterpolation")).toBool(true);
+            } else {
+                // Backward compatibility with older saved projects.
+                keyframe.linearInterpolation =
+                    keyframeObj.value(QStringLiteral("interpolated")).toBool(true);
+            }
             clip.transformKeyframes.push_back(keyframe);
         }
         const QJsonObject transcriptOverlayObj = obj.value(QStringLiteral("transcriptOverlay")).toObject();

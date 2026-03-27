@@ -1,6 +1,7 @@
 #include "transcript_engine.h"
 
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QSaveFile>
@@ -13,7 +14,7 @@ namespace editor
 
 QString TranscriptEngine::transcriptPathForClip(const TimelineClip &clip) const
     {
-        return transcriptPathForClipFile(clip.filePath);
+        return transcriptWorkingPathForClipFile(clip.filePath);
     }
 
 QString TranscriptEngine::secondsToTranscriptTime(double seconds) const
@@ -127,17 +128,41 @@ QVector<ExportRangeSegment> TranscriptEngine::transcriptWordExportRanges(const Q
                                                            int transcriptPrependMs,
                                                            int transcriptPostpendMs) const
     {
-        // Check if cache is still valid (based on timeline clip count and version)
-        const qint64 currentVersion = clips.size();
-        if (m_transcriptWordRangesCacheVersion == currentVersion && !m_transcriptWordRangesCache.isEmpty())
+        QString cacheSignature;
+        cacheSignature.reserve(256);
+        cacheSignature += QStringLiteral("pre=%1|post=%2|").arg(transcriptPrependMs).arg(transcriptPostpendMs);
+        for (const ExportRangeSegment &range : baseRanges)
         {
-            // Return cached ranges (they're already mapped to timeline frames)
+            cacheSignature += QStringLiteral("base:%1-%2|").arg(range.startFrame).arg(range.endFrame);
+        }
+        for (const RenderSyncMarker &marker : markers)
+        {
+            cacheSignature += QStringLiteral("marker:%1:%2:%3:%4|")
+                                  .arg(marker.clipId)
+                                  .arg(marker.frame)
+                                  .arg(static_cast<int>(marker.action))
+                                  .arg(marker.count);
+        }
+        for (const TimelineClip &clip : clips)
+        {
+            const QFileInfo transcriptInfo(transcriptPathForClip(clip));
+            cacheSignature += QStringLiteral("clip:%1:%2:%3:%4:%5:%6:%7|")
+                                  .arg(clip.id)
+                                  .arg(clip.startFrame)
+                                  .arg(clip.durationFrames)
+                                  .arg(clip.sourceInFrame)
+                                  .arg(clip.sourceDurationFrames)
+                                  .arg(clip.filePath)
+                                  .arg(transcriptInfo.exists() ? transcriptInfo.lastModified().toMSecsSinceEpoch() : -1);
+        }
+
+        if (m_transcriptWordRangesCacheSignature == cacheSignature && !m_transcriptWordRangesCache.isEmpty())
+        {
             QVector<ExportRangeSegment> result;
             for (auto it = m_transcriptWordRangesCache.constBegin(); it != m_transcriptWordRangesCache.constEnd(); ++it)
             {
                 result.append(it.value());
             }
-            // Merge overlapping ranges from different clips
             std::sort(result.begin(), result.end(),
                       [](const ExportRangeSegment &a, const ExportRangeSegment &b)
                       {
@@ -159,7 +184,7 @@ QVector<ExportRangeSegment> TranscriptEngine::transcriptWordExportRanges(const Q
         }
 
         m_transcriptWordRangesCache.clear();
-        m_transcriptWordRangesCacheVersion = currentVersion;
+        m_transcriptWordRangesCacheSignature = cacheSignature;
 
         QVector<ExportRangeSegment> resolvedBaseRanges = baseRanges;
         if (resolvedBaseRanges.isEmpty())
@@ -216,12 +241,10 @@ QVector<ExportRangeSegment> TranscriptEngine::transcriptWordExportRanges(const Q
                         continue;
                     }
 
-                    // Apply runtime prepend offset (in seconds)
                     const double prependSeconds = transcriptPrependMs / 1000.0;
                     const double postpendSeconds = transcriptPostpendMs / 1000.0;
-                    startSeconds = qMax(0.0, startSeconds + prependSeconds);
+                    startSeconds = qMax(0.0, startSeconds - prependSeconds);
                     const double adjustedEndSeconds = qMax(startSeconds, endSeconds + postpendSeconds);
-                    // Clamp to not overlap with previous word (handled by sorting/merging later)
 
                     const int64_t startFrame =
                         qMax<int64_t>(0, static_cast<int64_t>(std::floor(startSeconds * kTimelineFps)));
@@ -261,7 +284,6 @@ QVector<ExportRangeSegment> TranscriptEngine::transcriptWordExportRanges(const Q
                 }
             }
 
-            // Map source word ranges to timeline ranges efficiently (O(n) instead of O(n*m))
             QVector<ExportRangeSegment> clipTimelineRanges;
 
             for (const ExportRangeSegment &baseRange : resolvedBaseRanges)
@@ -274,42 +296,27 @@ QVector<ExportRangeSegment> TranscriptEngine::transcriptWordExportRanges(const Q
                     continue;
                 }
 
-                // For each source word range, map it to timeline frames
-                for (const ExportRangeSegment &wordRange : std::as_const(mergedSourceWordRanges))
+                for (int64_t timelineFrame = clipStart; timelineFrame <= clipEnd; ++timelineFrame)
                 {
-                    // Map source word range to timeline
-                    // sourceFrame = clip.sourceInFrame + adjustedLocalFrameForClip(clip, localTimelineFrame, markers)
-                    // So we need to find timeline frames where sourceFrame is within wordRange
-
-                    // This is a simplified mapping that assumes linear time mapping
-                    // For more complex mappings with markers, we'd need inverse mapping
-                    const int64_t wordStartInSource = wordRange.startFrame;
-                    const int64_t wordEndInSource = wordRange.endFrame;
-
-                    // Map source range to timeline range (clip-relative)
-                    int64_t localStart = wordStartInSource - clip.sourceInFrame;
-                    int64_t localEnd = wordEndInSource - clip.sourceInFrame;
-
-                    // Clamp to clip duration
-                    localStart = qMax<int64_t>(0, localStart);
-                    localEnd = qMin<int64_t>(clip.durationFrames - 1, localEnd);
-
-                    if (localEnd < localStart)
+                    const int64_t localTimelineFrame = timelineFrame - clip.startFrame;
+                    if (localTimelineFrame < 0 || localTimelineFrame >= clip.durationFrames)
                     {
                         continue;
                     }
-
-                    // Map to absolute timeline frames
-                    int64_t timelineStart = clip.startFrame + localStart;
-                    int64_t timelineEnd = clip.startFrame + localEnd;
-
-                    // Intersect with base range
-                    timelineStart = qMax(timelineStart, clipStart);
-                    timelineEnd = qMin(timelineEnd, clipEnd);
-
-                    if (timelineEnd >= timelineStart)
+                    const int64_t adjustedLocalFrame = adjustedLocalFrameForClip(clip, localTimelineFrame, markers);
+                    const int64_t sourceFrame = clip.sourceInFrame + adjustedLocalFrame;
+                    bool inWord = false;
+                    for (const ExportRangeSegment &wordRange : std::as_const(mergedSourceWordRanges))
                     {
-                        clipTimelineRanges.push_back(ExportRangeSegment{timelineStart, timelineEnd});
+                        if (sourceFrame >= wordRange.startFrame && sourceFrame <= wordRange.endFrame)
+                        {
+                            inWord = true;
+                            break;
+                        }
+                    }
+                    if (inWord)
+                    {
+                        appendMergedExportFrame(clipTimelineRanges, timelineFrame);
                     }
                 }
             }
@@ -346,7 +353,7 @@ QVector<ExportRangeSegment> TranscriptEngine::transcriptWordExportRanges(const Q
 void TranscriptEngine::invalidateCache()
 {
     m_transcriptWordRangesCache.clear();
-    m_transcriptWordRangesCacheVersion = -1;
+    m_transcriptWordRangesCacheSignature.clear();
 }
 
 } // namespace editor

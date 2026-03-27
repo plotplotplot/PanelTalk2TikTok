@@ -108,6 +108,7 @@ private:
     bool initHardwareAccel(const AVCodec* decoder);
     bool seekToKeyframe(int64_t targetFrame);
     bool loadStillImage();
+    bool loadImageSequence();
     QVector<FrameHandle> decodeForwardUntil(int64_t targetFrame, bool forceSeek);
     FrameHandle convertToFrame(AVFrame* avFrame, int64_t frameNumber);
     QImage convertAVFrameToImage(AVFrame* frame);
@@ -130,7 +131,9 @@ private:
     bool m_loggedAlphaProbe = false;
     bool m_reportedAlphaMismatch = false;
     bool m_isStillImage = false;
+    bool m_isImageSequence = false;
     QImage m_stillImage;
+    QStringList m_sequenceFramePaths;
     SwsContext* m_swsCtx = nullptr;
     AVFrame* m_convertFrame = nullptr;
     int m_swsSourceFormat = -1;
