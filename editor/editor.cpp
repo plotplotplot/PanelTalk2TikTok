@@ -101,7 +101,9 @@
 
 extern "C"
 {
+#ifdef EDITOR_HAS_ALSA
 #include <alsa/asoundlib.h>
+#endif
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>

@@ -30,3 +30,6 @@ BuiltWithCharm*
 HistoryOfAI*
 ResilientProducts*
 CodeCollective
+*.DS_store
+.venv*
+editor/PanelTalkEditor.dmg

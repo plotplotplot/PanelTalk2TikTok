@@ -18,7 +18,9 @@
 #include <thread>
 
 extern "C" {
+#ifdef EDITOR_HAS_ALSA
 #include <alsa/asoundlib.h>
+#endif
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
@@ -27,6 +29,8 @@ extern "C" {
 #include <libavutil/avutil.h>
 #include <libswresample/swresample.h>
 }
+
+#ifdef EDITOR_HAS_ALSA
 
 class AudioEngine {
 public:
@@ -640,3 +644,29 @@ private:
     static constexpr int m_maxQueuedFrames = 8192;
     static constexpr size_t m_maxQueuedSamples = static_cast<size_t>(m_maxQueuedFrames * m_channelCount);
 };
+
+#else // !EDITOR_HAS_ALSA
+
+// Stub AudioEngine for platforms without ALSA (macOS, Windows).
+// Preserves the full public API so all call sites compile unchanged.
+class AudioEngine {
+public:
+    AudioEngine() = default;
+    ~AudioEngine() { shutdown(); }
+
+    void setTimelineClips(const QVector<TimelineClip>&) {}
+    bool initialize() { return false; }
+    void shutdown() {}
+    void setMuted(bool) {}
+    void setVolume(qreal) {}
+    bool muted() const { return false; }
+    int volumePercent() const { return 0; }
+    void start(int64_t) {}
+    void stop() {}
+    void seek(int64_t) {}
+    bool hasPlayableAudio() const { return false; }
+    int64_t currentSample() const { return 0; }
+    int64_t currentFrame() const { return 0; }
+};
+
+#endif // EDITOR_HAS_ALSA
