@@ -14,6 +14,7 @@
 #include "timeline_widget.h"
 #include "async_decoder.h"
 #include "timeline_cache.h"
+#include "playback_frame_pipeline.h"
 
 QT_BEGIN_NAMESPACE
 class QOpenGLShaderProgram;
@@ -35,6 +36,7 @@ public:
     void setSelectedClipId(const QString& clipId);
     void setTimelineClips(const QVector<TimelineClip>& clips);
     void setRenderSyncMarkers(const QVector<RenderSyncMarker>& markers);
+    void setExportRanges(const QVector<ExportRangeSegment>& ranges);
     QString backendName() const;
     void setAudioMuted(bool muted);
     void setAudioVolume(qreal volume);
@@ -144,6 +146,7 @@ private:
 
     std::unique_ptr<AsyncDecoder> m_decoder;
     std::unique_ptr<TimelineCache> m_cache;
+    std::unique_ptr<PlaybackFramePipeline> m_playbackPipeline;
     std::unique_ptr<QOpenGLShaderProgram> m_shaderProgram;
     QOpenGLBuffer m_quadBuffer;
 

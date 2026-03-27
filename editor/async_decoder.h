@@ -11,6 +11,7 @@
 #include <QMutex>
 #include <QObject>
 #include <QThread>
+#include <QVector>
 #include <QWaitCondition>
 #include <functional>
 #include <atomic>
@@ -32,6 +33,12 @@ struct SwsContext;
 
 namespace editor {
 
+enum class DecodeRequestKind : int {
+    Visible = 0,
+    Prefetch = 1,
+    Preload = 2,
+};
+
 // ============================================================================
 // DecodeRequest - Single frame decode request
 // ============================================================================
@@ -40,6 +47,7 @@ struct DecodeRequest {
     QString filePath;
     int64_t frameNumber;
     int priority;  // Higher = more urgent (0-255)
+    DecodeRequestKind kind = DecodeRequestKind::Visible;
     QDeadlineTimer deadline;
     std::function<void(FrameHandle)> callback;
     qint64 submittedAt;
@@ -79,6 +87,7 @@ public:
     
     // Decode specific frame (blocking)
     FrameHandle decodeFrame(int64_t frameNumber);
+    QVector<FrameHandle> decodeThroughFrame(int64_t targetFrame);
     
     // Precise seek then decode
     FrameHandle seekAndDecode(int64_t frameNumber);
@@ -99,6 +108,7 @@ private:
     bool initHardwareAccel(const AVCodec* decoder);
     bool seekToKeyframe(int64_t targetFrame);
     bool loadStillImage();
+    QVector<FrameHandle> decodeForwardUntil(int64_t targetFrame, bool forceSeek);
     FrameHandle convertToFrame(AVFrame* avFrame, int64_t frameNumber);
     QImage convertAVFrameToImage(AVFrame* frame);
     
@@ -142,6 +152,9 @@ public:
     bool enqueue(DecodeRequest req);
     bool dequeue(DecodeRequest* out);
     bool tryDequeue(DecodeRequest* out, int timeoutMs);
+    QVector<DecodeRequest> takeSameFileVisibleRequests(const QString& path,
+                                                       int64_t minimumFrameNumber,
+                                                       int maxRequests);
     
     void clear();
     void removeForFile(const QString& path);
@@ -160,6 +173,8 @@ private:
     
     // Insert by priority (higher priority = earlier in queue)
     void insertByPriority(const DecodeRequest& req);
+    void collectSupersededRequests(const DecodeRequest& req,
+                                   QVector<std::function<void(FrameHandle)>>* droppedCallbacks);
 };
 
 // ============================================================================
@@ -190,6 +205,7 @@ private:
     DecoderContext* getOrCreateContext(const QString& path);
     void evictOldestContext();
     void processRequest(const DecodeRequest& req);
+    void processVisibleBatch(const QVector<DecodeRequest>& requests, DecoderContext* ctx);
     
     DecodeQueue* m_queue = nullptr;
     MemoryBudget* m_budget = nullptr;
@@ -218,10 +234,16 @@ public:
     // Request a frame decode (non-blocking)
     // callback is invoked on the decoder thread - use QMetaObject::invokeMethod 
     // to get back to main thread if needed
+    uint64_t requestFrame(const QString& path,
+                          int64_t frameNumber,
+                          int priority,
+                          int timeoutMs,
+                          std::function<void(FrameHandle)> callback);
     uint64_t requestFrame(const QString& path, 
                           int64_t frameNumber,
                           int priority,
                           int timeoutMs,
+                          DecodeRequestKind kind,
                           std::function<void(FrameHandle)> callback);
     
     // Cancel pending requests

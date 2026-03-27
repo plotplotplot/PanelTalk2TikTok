@@ -425,7 +425,21 @@ private:
                 if (it.key() == QStringLiteral("ok")) {
                     continue;
                 }
-                if (!it.value().isBool() || !editor::setDebugControl(it.key(), it.value().toBool())) {
+                if (it.value().isBool()) {
+                    if (!editor::setDebugControl(it.key(), it.value().toBool())) {
+                        writeError(socket, 400, QStringLiteral("invalid debug field: %1").arg(it.key()));
+                        return;
+                    }
+                } else if (it.value().isString()) {
+                    editor::DebugLogLevel level = editor::DebugLogLevel::Off;
+                    if (!editor::parseDebugLogLevel(it.value().toString(), &level) ||
+                        !editor::setDebugControlLevel(it.key(), level)) {
+                        writeError(socket, 400, QStringLiteral("invalid debug field: %1").arg(it.key()));
+                        return;
+                    }
+                } else if (editor::setDebugOption(it.key(), it.value())) {
+                    // handled
+                } else {
                     writeError(socket, 400, QStringLiteral("invalid debug field: %1").arg(it.key()));
                     return;
                 }

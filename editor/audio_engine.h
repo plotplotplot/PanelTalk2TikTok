@@ -42,6 +42,13 @@ public:
         m_decodeCondition.notify_one();
     }
 
+    void setExportRanges(const QVector<ExportRangeSegment>& ranges) {
+        {
+            std::lock_guard<std::mutex> lock(m_exportRangesMutex);
+            m_exportRanges = ranges;
+        }
+    }
+
     bool initialize() {
         std::lock_guard<std::mutex> lock(m_stateMutex);
         if (m_initialized) {
@@ -229,6 +236,7 @@ private:
 
     struct MixContext {
         QVector<TimelineClip> clips;
+        QVector<ExportRangeSegment> exportRanges;
         bool muted = false;
         qreal volume = 0.8;
     };
@@ -252,6 +260,87 @@ private:
             m_pendingDecodePaths.push_back(clip.filePath);
             m_pendingDecodeSet.insert(clip.filePath);
         }
+    }
+
+    // Calculate fade gain for a sample position considering export ranges
+    // Returns gain factor (0.0 to 1.0) based on proximity to range boundaries
+    float calculateRangeFadeGain(int64_t samplePos, const QVector<ExportRangeSegment>& ranges, 
+                                  int fadeSamples) const {
+        if (ranges.isEmpty() || fadeSamples <= 0) {
+            return 1.0f;
+        }
+
+        const int64_t frame = samplesToTimelineFrame(samplePos);
+        
+        // Find which range (if any) this frame belongs to
+        const ExportRangeSegment* currentRange = nullptr;
+        for (const auto& range : ranges) {
+            if (frame >= range.startFrame && frame <= range.endFrame) {
+                currentRange = &range;
+                break;
+            }
+        }
+
+        if (!currentRange) {
+            // Outside all ranges - full mute
+            return 0.0f;
+        }
+
+        // Check if we're near the start of a range (fade in)
+        if (frame <= currentRange->startFrame) {
+            const int64_t rangeStartSample = timelineFrameToSamples(currentRange->startFrame);
+            const int64_t samplesIntoRange = samplePos - rangeStartSample;
+            if (samplesIntoRange < 0) {
+                // Before range start
+                return 0.0f;
+            }
+            if (samplesIntoRange < fadeSamples) {
+                // Fade in
+                return static_cast<float>(samplesIntoRange) / static_cast<float>(fadeSamples);
+            }
+        }
+
+        // Check if we're near the end of a range (fade out)
+        if (frame >= currentRange->endFrame) {
+            const int64_t rangeEndSample = timelineFrameToSamples(currentRange->endFrame);
+            const int64_t samplesPastEnd = samplePos - rangeEndSample;
+            if (samplesPastEnd > 0) {
+                // After range end
+                return 0.0f;
+            }
+            const int64_t samplesBeforeEnd = rangeEndSample - samplePos;
+            if (samplesBeforeEnd < fadeSamples) {
+                // Fade out
+                return static_cast<float>(samplesBeforeEnd) / static_cast<float>(fadeSamples);
+            }
+        }
+
+        return 1.0f;
+    }
+
+    // Calculate fade gain for clip-to-clip crossfade
+    float calculateClipCrossfadeGain(int64_t samplePos, const TimelineClip& clip,
+                                      int64_t clipStartSample, int64_t clipEndSample,
+                                      int fadeSamples) const {
+        if (fadeSamples <= 0) {
+            return 1.0f;
+        }
+
+        float gain = 1.0f;
+
+        // Fade in at clip start
+        const int64_t samplesFromStart = samplePos - clipStartSample;
+        if (samplesFromStart >= 0 && samplesFromStart < fadeSamples) {
+            gain *= static_cast<float>(samplesFromStart) / static_cast<float>(fadeSamples);
+        }
+
+        // Fade out at clip end
+        const int64_t samplesToEnd = clipEndSample - samplePos;
+        if (samplesToEnd >= 0 && samplesToEnd < fadeSamples) {
+            gain *= static_cast<float>(samplesToEnd) / static_cast<float>(fadeSamples);
+        }
+
+        return qBound(0.0f, gain, 1.0f);
     }
 
     AudioClipCacheEntry decodeClipAudio(const QString& path) {
@@ -393,6 +482,11 @@ private:
         return m_audioCache.value(path);
     }
 
+    QVector<ExportRangeSegment> exportRangesCopy() const {
+        std::lock_guard<std::mutex> lock(m_exportRangesMutex);
+        return m_exportRanges;
+    }
+
     void mixChunk(const MixContext& context, float* output, int frames, int64_t chunkStartSample) {
         std::fill(output, output + frames * m_channelCount, 0.0f);
 
@@ -420,19 +514,34 @@ private:
 
             const int64_t mixStart = qMax<int64_t>(chunkStartSample, clipStartSample);
             const int64_t mixEnd = qMin<int64_t>(chunkEndSample, clipEndSample);
+            
             for (int64_t samplePos = mixStart; samplePos < mixEnd; ++samplePos) {
                 const int outFrame = static_cast<int>(samplePos - chunkStartSample);
                 const int inFrame = static_cast<int>(sourceInSample + (samplePos - clipStartSample));
                 const int outIndex = outFrame * m_channelCount;
                 const int inIndex = inFrame * m_channelCount;
-                output[outIndex] += audio.samples[inIndex];
-                output[outIndex + 1] += audio.samples[inIndex + 1];
+                
+                // Calculate crossfade gain for this sample
+                float gain = 1.0f;
+                
+                // Apply speech filter range fade (if export ranges are set)
+                if (!context.exportRanges.isEmpty()) {
+                    gain *= calculateRangeFadeGain(samplePos, context.exportRanges, 
+                                                    clip.fadeSamples > 0 ? clip.fadeSamples : m_defaultFadeSamples);
+                }
+                
+                // Apply clip crossfade at clip boundaries
+                gain *= calculateClipCrossfadeGain(samplePos, clip, clipStartSample, clipEndSample, 
+                                                    clip.fadeSamples > 0 ? clip.fadeSamples : m_defaultFadeSamples);
+                
+                output[outIndex] += audio.samples[inIndex] * gain;
+                output[outIndex + 1] += audio.samples[inIndex + 1] * gain;
             }
         }
 
-        const float gain = context.muted ? 0.0f : static_cast<float>(context.volume);
+        const float masterGain = context.muted ? 0.0f : static_cast<float>(context.volume);
         for (int i = 0; i < frames * m_channelCount; ++i) {
-            output[i] = qBound(-1.0f, output[i] * gain, 1.0f);
+            output[i] = qBound(-1.0f, output[i] * masterGain, 1.0f);
         }
     }
 
@@ -501,6 +610,7 @@ private:
                 chunkStartSample = m_timelineSampleCursor;
                 m_timelineSampleCursor += m_periodFrames;
                 context.clips = m_timelineClips;
+                context.exportRanges = exportRangesCopy();
                 context.muted = m_muted;
                 context.volume = m_volume;
             }
@@ -604,18 +714,21 @@ private:
 
             if (!hadAudio) {
                 m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                m_audioClockSample.fetch_add(m_periodFrames, std::memory_order_release);
             }
-            m_audioClockSample.fetch_add(m_periodFrames, std::memory_order_release);
             m_queueCondition.notify_all();
         }
     }
 
     mutable std::mutex m_stateMutex;
     mutable std::mutex m_queueMutex;
+    mutable std::mutex m_exportRangesMutex;
     std::condition_variable m_stateCondition;
     std::condition_variable m_decodeCondition;
     std::condition_variable m_queueCondition;
     QVector<TimelineClip> m_timelineClips;
+    QVector<ExportRangeSegment> m_exportRanges;
     QHash<QString, AudioClipCacheEntry> m_audioCache;
     std::deque<QString> m_pendingDecodePaths;
     QSet<QString> m_pendingDecodeSet;
@@ -639,4 +752,5 @@ private:
     static constexpr int m_mixLowWaterFrames = 2048;
     static constexpr int m_maxQueuedFrames = 8192;
     static constexpr size_t m_maxQueuedSamples = static_cast<size_t>(m_maxQueuedFrames * m_channelCount);
+    static constexpr int m_defaultFadeSamples = 250;  // Default fade duration for speech filter boundaries
 };

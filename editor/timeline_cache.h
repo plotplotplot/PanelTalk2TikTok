@@ -4,6 +4,7 @@
 #include "frame_handle.h"
 #include "memory_budget.h"
 #include "async_decoder.h"
+#include "editor_shared.h"
 
 #include <QObject>
 #include <QHash>
@@ -33,12 +34,18 @@ struct CacheEntryInfo {
     size_t memoryUsage = 0;
 };
 
+struct PlaybackFrameInfo {
+    FrameHandle frame;
+    qint64 insertedAt = 0;
+};
+
 // ============================================================================
 // ClipCache - Per-clip frame cache with LRU eviction
 // ============================================================================
 class ClipCache {
 public:
-    explicit ClipCache(const QString& path, int64_t duration);
+    ClipCache(const QString& path, int64_t duration, MemoryBudget* budget);
+    ~ClipCache();
     
     void insert(int64_t frameNumber, const FrameHandle& frame);
     FrameHandle get(int64_t frameNumber);
@@ -62,6 +69,7 @@ public:
 private:
     QString m_path;
     int64_t m_duration;
+    MemoryBudget* m_budget = nullptr;
     
     mutable QMutex m_mutex;
     QHash<int64_t, CachedFrame> m_frames;
@@ -98,15 +106,20 @@ public:
     // Configuration
     void setMaxMemory(size_t bytes);
     void setLookaheadFrames(int frames) { m_lookaheadFrames = frames; }
-    void setPlaybackState(PlaybackState state) { m_state = state; }
+    void setPlaybackState(PlaybackState state);
     void setDirection(Direction dir) { m_direction = dir; }
     void setPlaybackSpeed(double speed) { m_speed = speed; }
+    
+    // Export ranges for speech filter awareness (empty = all frames valid)
+    void setExportRanges(const QVector<ExportRangeSegment>& ranges);
+    void setRenderSyncMarkers(const QVector<RenderSyncMarker>& markers);
     
     // Playhead tracking
     void setPlayheadFrame(int64_t frame);
     int64_t playheadFrame() const { return m_playhead; }
     
     // Clip management
+    void registerClip(const TimelineClip& clip);
     void registerClip(const QString& id, const QString& path, int64_t startFrame, int64_t duration);
     void unregisterClip(const QString& id);
     void clearClips();
@@ -118,7 +131,10 @@ public:
     // Try to get frame from cache (synchronous)
     FrameHandle getCachedFrame(const QString& clipId, int64_t frameNumber);
     FrameHandle getBestCachedFrame(const QString& clipId, int64_t frameNumber);
+    FrameHandle getPlaybackFrame(const QString& clipId, int64_t frameNumber);
+    FrameHandle getBestPlaybackFrame(const QString& clipId, int64_t frameNumber);
     bool isFrameCached(const QString& clipId, int64_t frameNumber) const;
+    bool isPlaybackFrameBuffered(const QString& clipId, int64_t frameNumber) const;
     
     // Preload control
     void startPrefetching();
@@ -149,10 +165,7 @@ private slots:
 
 private:
     struct ClipInfo {
-        QString id;
-        QString path;
-        int64_t startFrame = 0;
-        int64_t duration = 0;
+        TimelineClip clip;
         bool isSingleFrame = false;
     };
 
@@ -160,10 +173,27 @@ private:
         QVector<std::function<void(FrameHandle)>> callbacks;
     };
 
+    class PlaybackBuffer {
+    public:
+        void clear();
+        void insert(int64_t frameNumber, const FrameHandle& frame);
+        FrameHandle get(int64_t frameNumber);
+        FrameHandle getBest(int64_t frameNumber);
+        bool contains(int64_t frameNumber) const;
+
+    private:
+        void trimLocked();
+
+        mutable QMutex m_mutex;
+        QHash<int64_t, PlaybackFrameInfo> m_frames;
+        static constexpr int kMaxFrames = 24;
+    };
+
     QString requestKey(const QString& clipId, int64_t frameNumber) const;
     int64_t normalizeFrameNumber(const QString& clipId, int64_t frameNumber) const;
     int64_t normalizeFrameNumber(const ClipInfo& info, int64_t frameNumber) const;
     void dropStaleRequestsForPlayhead(int64_t playheadFrame);
+    void scheduleImmediateLeadPrefetch(const ClipInfo& info, int64_t canonicalFrame);
     void schedulePredictiveLoads();
     int calculatePriority(int64_t frameNumber) const;
     ClipCache* getOrCreateClipCache(const QString& clipId);
@@ -175,6 +205,7 @@ private:
     mutable QMutex m_clipsMutex;
     QHash<QString, ClipInfo> m_clips;
     QHash<QString, ClipCache*> m_caches;
+    QHash<QString, PlaybackBuffer*> m_playbackBuffers;
     
     // Playhead state
     std::atomic<int64_t> m_playhead{0};
@@ -188,6 +219,12 @@ private:
     mutable QMutex m_pendingMutex;
     QHash<QString, PendingVisibleRequest> m_pendingVisibleRequests;
     QSet<QString> m_pendingPrefetchRequests;
+    QHash<QString, int64_t> m_latestVisibleTargets;
+    
+    // Export ranges for speech filter awareness
+    mutable QMutex m_exportRangesMutex;
+    QVector<ExportRangeSegment> m_exportRanges;
+    QVector<RenderSyncMarker> m_renderSyncMarkers;
     std::atomic<int> m_inflightPrefetches{0};
     std::atomic<bool> m_trimInProgress{false};
     

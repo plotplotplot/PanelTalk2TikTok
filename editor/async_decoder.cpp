@@ -4,9 +4,11 @@
 #include <QDebug>
 #include <QDateTime>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
 #include <QHash>
 #include <QImageReader>
+#include <QGuiApplication>
 #include <QThread>
 #include <QThreadStorage>
 
@@ -26,6 +28,7 @@ namespace editor {
 
 namespace {
 constexpr int64_t kMaxSequentialDecodeGap = 90;
+constexpr int64_t kPlaybackBatchFrameSlack = 2;
 
 qint64 decodeTraceMs() {
     static QElapsedTimer timer;
@@ -56,16 +59,17 @@ bool isStillImagePath(const QString& path) {
 }
 
 void decodeTrace(const QString& stage, const QString& detail = QString()) {
-    if (!debugDecodeEnabled()) {
+    if (debugDecodeLevel() < DebugLogLevel::Info) {
         return;
     }
     static QHash<QString, qint64> lastLogByStage;
     const qint64 now = decodeTraceMs();
-    if (stage.startsWith(QStringLiteral("AsyncDecoder::requestFrame")) ||
-        stage.startsWith(QStringLiteral("DecoderWorker::processRequest.begin")) ||
-        stage.startsWith(QStringLiteral("DecoderContext::decodeFrame.begin")) ||
-        stage.startsWith(QStringLiteral("DecoderContext::decodeFrame.seek")) ||
-        stage.startsWith(QStringLiteral("DecoderContext::decodeFrame.end"))) {
+    if (!debugDecodeVerboseEnabled() &&
+        (stage.startsWith(QStringLiteral("AsyncDecoder::requestFrame")) ||
+         stage.startsWith(QStringLiteral("DecoderWorker::processRequest.begin")) ||
+         stage.startsWith(QStringLiteral("DecoderContext::decodeFrame.begin")) ||
+         stage.startsWith(QStringLiteral("DecoderContext::decodeFrame.seek")) ||
+         stage.startsWith(QStringLiteral("DecoderContext::decodeFrame.end")))) {
         const qint64 last = lastLogByStage.value(stage, std::numeric_limits<qint64>::min());
         if (now - last < 250) {
             return;
@@ -263,7 +267,9 @@ bool DecoderContext::loadStillImage() {
 bool DecoderContext::initCodec() {
     AVStream* stream = m_formatCtx->streams[m_videoStreamIndex];
     const AVCodec* decoder = nullptr;
-    if (stream->codecpar->codec_id == AV_CODEC_ID_VP9 && m_streamHasAlphaTag) {
+    const bool requiresSoftwareAlphaPath =
+        stream->codecpar->codec_id == AV_CODEC_ID_VP9 && m_streamHasAlphaTag;
+    if (requiresSoftwareAlphaPath) {
         decoder = avcodec_find_decoder_by_name("libvpx-vp9");
         if (decoder) {
             qDebug() << "Using libvpx-vp9 for alpha-tagged VP9 stream:" << m_path;
@@ -292,15 +298,32 @@ bool DecoderContext::initCodec() {
         return false;
     }
 
-    // Timeline playback benefits more from deterministic frame-exact decoding
-    // than from codec-internal parallelism. Keeping each decoder context
-    // single-threaded also avoids hard-to-reproduce races in optimized builds.
-    m_codecCtx->thread_count = 1;
-    m_codecCtx->thread_type = 0;
-    
-    // Hardware decode is disabled for now.
-    // The current worker-thread startup path is not robust across driver stacks.
-    
+    // Professional editors typically use hardware decode for opaque playback
+    // streams, but keep software decode for alpha-tagged formats where
+    // hardware paths often drop or mangle transparency.
+    const bool headlessOffscreen =
+        qEnvironmentVariable("QT_QPA_PLATFORM") == QStringLiteral("offscreen");
+    const bool hardwareEnabled =
+        !headlessOffscreen &&
+        !m_streamHasAlphaTag &&
+        initHardwareAccel(decoder);
+    if (hardwareEnabled) {
+        // Let FFmpeg choose sensible threading for hardware-backed decode.
+        m_codecCtx->thread_count = 0;
+        m_codecCtx->thread_type = FF_THREAD_FRAME;
+    } else if (requiresSoftwareAlphaPath) {
+        // Alpha WebM preview needs software decode, but professional editors
+        // still run that path with codec-level parallelism for realtime use.
+        m_codecCtx->thread_count = qBound(2, QThread::idealThreadCount(), 8);
+        m_codecCtx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+        m_codecCtx->flags2 |= AV_CODEC_FLAG2_FAST;
+    } else {
+        // Timeline playback benefits from deterministic frame-exact decoding
+        // when we stay on the software path.
+        m_codecCtx->thread_count = 1;
+        m_codecCtx->thread_type = 0;
+    }
+
     // For alpha-tagged streams, request a pixel format that supports alpha.
     // This is necessary because some decoders (e.g., VP8/VP9) default to
     // non-alpha formats like yuv420p even when the stream contains alpha.
@@ -313,19 +336,18 @@ bool DecoderContext::initCodec() {
         qWarning() << "Failed to open codec:" << avErrToString(ret);
         return false;
     }
+
+    qDebug() << "Decoder path for" << m_path << ":" << (hardwareEnabled ? "hardware" : "software");
     
     return true;
 }
 
 bool DecoderContext::initHardwareAccel(const AVCodec* decoder) {
-    // Try CUDA first (NVIDIA), then VAAPI (Intel/AMD Linux), then VDPAU
+    // Professional playback stacks probe platform-appropriate hardware paths
+    // and avoid display-dependent backends in headless environments.
     static const AVHWDeviceType kPreferredDevices[] = {
         AV_HWDEVICE_TYPE_CUDA,
         AV_HWDEVICE_TYPE_VAAPI,
-        AV_HWDEVICE_TYPE_VDPAU,
-        AV_HWDEVICE_TYPE_DXVA2,
-        AV_HWDEVICE_TYPE_D3D11VA,
-        AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
     };
     
     for (AVHWDeviceType type : kPreferredDevices) {
@@ -346,8 +368,30 @@ bool DecoderContext::initHardwareAccel(const AVCodec* decoder) {
             continue;
         }
 
+        const char* deviceName = nullptr;
+#if defined(Q_OS_LINUX)
+        QByteArray devicePath;
+        if (type == AV_HWDEVICE_TYPE_VAAPI) {
+            static const char* kRenderNodes[] = {
+                "/dev/dri/renderD128",
+                "/dev/dri/renderD129",
+                "/dev/dri/renderD130",
+            };
+            for (const char* candidate : kRenderNodes) {
+                if (QFile::exists(QString::fromLatin1(candidate))) {
+                    devicePath = QByteArray(candidate);
+                    deviceName = devicePath.constData();
+                    break;
+                }
+            }
+            if (!deviceName) {
+                continue;
+            }
+        }
+#endif
+
         AVBufferRef* hwCtx = nullptr;
-        int ret = av_hwdevice_ctx_create(&hwCtx, type, nullptr, nullptr, 0);
+        int ret = av_hwdevice_ctx_create(&hwCtx, type, deviceName, nullptr, 0);
         if (ret >= 0) {
             m_codecCtx->hw_device_ctx = av_buffer_ref(hwCtx);
             m_hwDeviceCtx = hwCtx;
@@ -385,70 +429,14 @@ FrameHandle DecoderContext::decodeFrame(int64_t frameNumber) {
     
     updateAccessTime();
     
-    // For accurate seeking, we need to seek if we're too far ahead or behind
-    const int64_t frameDelta = frameNumber - m_lastDecodedFrame;
-    if (m_lastDecodedFrame < 0 || frameDelta < 0 || frameDelta > kMaxSequentialDecodeGap) {
-        decodeTrace(QStringLiteral("DecoderContext::decodeFrame.seek"),
-                    QStringLiteral("file=%1 target=%2 delta=%3")
-                        .arg(shortPath(m_path))
-                        .arg(frameNumber)
-                        .arg(frameDelta));
-        return seekAndDecode(frameNumber);
-    }
-    
-    // Sequential decode
-    AVFrame* frame = av_frame_alloc();
-    AVPacket* packet = av_packet_alloc();
+    const QVector<FrameHandle> frames = decodeThroughFrame(frameNumber);
     FrameHandle result;
-    
-    AVStream* stream = m_formatCtx->streams[m_videoStreamIndex];
-    
-    while (av_read_frame(m_formatCtx, packet) >= 0) {
-        if (packet->stream_index != m_videoStreamIndex) {
-            av_packet_unref(packet);
-            continue;
-        }
-        
-        int ret = avcodec_send_packet(m_codecCtx, packet);
-        av_packet_unref(packet);
-        
-        if (ret < 0) {
-            continue;
-        }
-        
-        while (ret >= 0) {
-            ret = avcodec_receive_frame(m_codecCtx, frame);
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                break;
-            }
-            if (ret < 0) {
-                break;
-            }
-            
-            // Calculate frame number from PTS
-            int64_t pts = frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
-            int64_t currentFrame = ptsToFrameNumber(pts, stream->time_base, m_info.fps);
-            if (currentFrame < 0) {
-                currentFrame = frameNumber;
-            }
-            
-            m_lastDecodedFrame = currentFrame;
-            
-            if (currentFrame >= frameNumber) {
-                result = convertToFrame(frame, currentFrame);
-                av_frame_unref(frame);
-                goto done;
-            }
-            
-            av_frame_unref(frame);
+    for (const FrameHandle& frame : frames) {
+        if (!frame.isNull() && frame.frameNumber() >= frameNumber) {
+            result = frame;
+            break;
         }
     }
-    
-    m_eof = true;
-    
-done:
-    av_frame_free(&frame);
-    av_packet_free(&packet);
     decodeTrace(QStringLiteral("DecoderContext::decodeFrame.end"),
                 QStringLiteral("file=%1 target=%2 null=%3 decoded=%4")
                     .arg(shortPath(m_path))
@@ -456,6 +444,30 @@ done:
                     .arg(result.isNull())
                     .arg(result.frameNumber()));
     return result;
+}
+
+QVector<FrameHandle> DecoderContext::decodeThroughFrame(int64_t targetFrame) {
+    if (m_isStillImage) {
+        updateAccessTime();
+        return {FrameHandle::createCpuFrame(m_stillImage, 0, m_path)};
+    }
+
+    if (m_eof) {
+        m_eof = false;
+    }
+
+    updateAccessTime();
+
+    const int64_t frameDelta = targetFrame - m_lastDecodedFrame;
+    const bool forceSeek = m_lastDecodedFrame < 0 || frameDelta < 0 || frameDelta > kMaxSequentialDecodeGap;
+    if (forceSeek) {
+        decodeTrace(QStringLiteral("DecoderContext::decodeFrame.seek"),
+                    QStringLiteral("file=%1 target=%2 delta=%3")
+                        .arg(shortPath(m_path))
+                        .arg(targetFrame)
+                        .arg(frameDelta));
+    }
+    return decodeForwardUntil(targetFrame, forceSeek);
 }
 
 FrameHandle DecoderContext::seekAndDecode(int64_t frameNumber) {
@@ -469,17 +481,39 @@ FrameHandle DecoderContext::seekAndDecode(int64_t frameNumber) {
                 QStringLiteral("file=%1 target=%2")
                     .arg(shortPath(m_path))
                     .arg(frameNumber));
-    if (!seekToKeyframe(frameNumber)) {
-        decodeTrace(QStringLiteral("DecoderContext::seekAndDecode.seek-failed"),
-                    QStringLiteral("file=%1 target=%2").arg(shortPath(m_path)).arg(frameNumber));
-        return FrameHandle();
+    const QVector<FrameHandle> frames = decodeForwardUntil(frameNumber, true);
+    FrameHandle result;
+    for (const FrameHandle& frame : frames) {
+        if (!frame.isNull() && frame.frameNumber() >= frameNumber) {
+            result = frame;
+            break;
+        }
     }
-    
-    // Decode forward to exact frame
+    decodeTrace(QStringLiteral("DecoderContext::seekAndDecode.end"),
+                QStringLiteral("file=%1 target=%2 null=%3 waitMs=%4 decoded=%5")
+                    .arg(shortPath(m_path))
+                    .arg(frameNumber)
+                    .arg(result.isNull())
+                    .arg(decodeTraceMs() - startedAt)
+                    .arg(result.frameNumber()));
+    return result;
+}
+
+QVector<FrameHandle> DecoderContext::decodeForwardUntil(int64_t targetFrame, bool forceSeek) {
+    QVector<FrameHandle> decodedFrames;
+    if (m_isStillImage) {
+        decodedFrames.push_back(FrameHandle::createCpuFrame(m_stillImage, 0, m_path));
+        return decodedFrames;
+    }
+
+    if (forceSeek && !seekToKeyframe(targetFrame)) {
+        decodeTrace(QStringLiteral("DecoderContext::seekAndDecode.seek-failed"),
+                    QStringLiteral("file=%1 target=%2").arg(shortPath(m_path)).arg(targetFrame));
+        return decodedFrames;
+    }
+
     AVFrame* frame = av_frame_alloc();
     AVPacket* packet = av_packet_alloc();
-    FrameHandle result;
-    
     AVStream* stream = m_formatCtx->streams[m_videoStreamIndex];
     
     while (av_read_frame(m_formatCtx, packet) >= 0) {
@@ -501,32 +535,24 @@ FrameHandle DecoderContext::seekAndDecode(int64_t frameNumber) {
             int64_t pts = frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
             int64_t currentFrame = ptsToFrameNumber(pts, stream->time_base, m_info.fps);
             if (currentFrame < 0) {
-                currentFrame = frameNumber;
+                currentFrame = targetFrame;
             }
             
             m_lastDecodedFrame = currentFrame;
-            
-            if (currentFrame >= frameNumber) {
-                result = convertToFrame(frame, currentFrame);
-                av_frame_unref(frame);
-                goto done;
-            }
+            decodedFrames.push_back(convertToFrame(frame, currentFrame));
             
             av_frame_unref(frame);
+            if (currentFrame >= targetFrame) {
+                goto done;
+            }
         }
     }
+    m_eof = true;
     
 done:
     av_frame_free(&frame);
     av_packet_free(&packet);
-    decodeTrace(QStringLiteral("DecoderContext::seekAndDecode.end"),
-                QStringLiteral("file=%1 target=%2 null=%3 waitMs=%4 decoded=%5")
-                    .arg(shortPath(m_path))
-                    .arg(frameNumber)
-                    .arg(result.isNull())
-                    .arg(decodeTraceMs() - startedAt)
-                    .arg(result.frameNumber()));
-    return result;
+    return decodedFrames;
 }
 
 bool DecoderContext::seekToKeyframe(int64_t targetFrame) {
@@ -732,17 +758,29 @@ void DecoderContext::updateAccessTime() {
 // ============================================================================
 
 bool DecodeQueue::enqueue(DecodeRequest req) {
-    std::function<void(FrameHandle)> droppedCallback;
+    QVector<std::function<void(FrameHandle)>> droppedCallbacks;
     QMutexLocker lock(&m_mutex);
     
     if (m_shutdown.load()) return false;
+
+    const int visibleReserve = qBound(0, debugVisibleQueueReserve(), kMaxSize - 1);
+    const int nonVisibleLimit = kMaxSize - visibleReserve;
+    if (req.kind != DecodeRequestKind::Visible && static_cast<int>(m_queue.size()) >= nonVisibleLimit) {
+        return false;
+    }
+
+    collectSupersededRequests(req, &droppedCallbacks);
     
     if (m_queue.size() >= kMaxSize) {
         // Try to drop a lower priority request
         bool dropped = false;
         for (int i = static_cast<int>(m_queue.size()) - 1; i >= 0; --i) {
-            if (m_queue[i].priority < req.priority) {
-                droppedCallback = std::move(m_queue[i].callback);
+            const bool kindFavored =
+                req.kind == DecodeRequestKind::Visible && m_queue[i].kind != DecodeRequestKind::Visible;
+            if (kindFavored || m_queue[i].priority < req.priority) {
+                if (m_queue[i].callback) {
+                    droppedCallbacks.push_back(std::move(m_queue[i].callback));
+                }
                 m_queue.erase(m_queue.begin() + i);
                 dropped = true;
                 break;
@@ -756,8 +794,10 @@ bool DecodeQueue::enqueue(DecodeRequest req) {
     insertByPriority(req);
     m_condition.wakeOne();
     lock.unlock();
-    if (droppedCallback) {
-        droppedCallback(FrameHandle());
+    for (const auto& droppedCallback : droppedCallbacks) {
+        if (droppedCallback) {
+            droppedCallback(FrameHandle());
+        }
     }
     return true;
 }
@@ -792,6 +832,28 @@ bool DecodeQueue::tryDequeue(DecodeRequest* out, int timeoutMs) {
     *out = std::move(m_queue.front());
     m_queue.pop_front();
     return true;
+}
+
+QVector<DecodeRequest> DecodeQueue::takeSameFileVisibleRequests(const QString& path,
+                                                                int64_t minimumFrameNumber,
+                                                                int maxRequests) {
+    QVector<DecodeRequest> requests;
+    if (maxRequests <= 0) {
+        return requests;
+    }
+
+    QMutexLocker lock(&m_mutex);
+    for (auto it = m_queue.begin(); it != m_queue.end() && requests.size() < maxRequests;) {
+        if (it->filePath != path ||
+            it->kind != DecodeRequestKind::Visible ||
+            it->frameNumber < minimumFrameNumber) {
+            ++it;
+            continue;
+        }
+        requests.push_back(std::move(*it));
+        it = m_queue.erase(it);
+    }
+    return requests;
 }
 
 void DecodeQueue::clear() {
@@ -864,6 +926,36 @@ void DecodeQueue::insertByPriority(const DecodeRequest& req) {
     m_queue.insert(m_queue.begin() + i, req);
 }
 
+void DecodeQueue::collectSupersededRequests(const DecodeRequest& req,
+                                            QVector<std::function<void(FrameHandle)>>* droppedCallbacks) {
+    if (!droppedCallbacks) {
+        return;
+    }
+
+    // During forward playback, newer same-file requests supersede older queued
+    // targets. Keeping the newest target lets the decoder stay close to the
+    // active frontier instead of spending queue time on already-obsolete work.
+    for (int i = static_cast<int>(m_queue.size()) - 1; i >= 0; --i) {
+        const DecodeRequest& queued = m_queue[i];
+        if (queued.filePath != req.filePath) {
+            continue;
+        }
+        if (queued.frameNumber >= req.frameNumber) {
+            continue;
+        }
+        if (queued.priority > req.priority) {
+            continue;
+        }
+        if (queued.kind == DecodeRequestKind::Visible && req.kind != DecodeRequestKind::Visible) {
+            continue;
+        }
+        if (queued.callback) {
+            droppedCallbacks->push_back(std::move(m_queue[i].callback));
+        }
+        m_queue.erase(m_queue.begin() + i);
+    }
+}
+
 // ============================================================================
 // DecoderWorker Implementation
 // ============================================================================
@@ -925,6 +1017,7 @@ void DecoderWorker::run() {
 }
 
 void DecoderWorker::processRequest(const DecodeRequest& req) {
+    static constexpr int kMaxVisibleBatchRequests = 6;
     const qint64 startedAt = decodeTraceMs();
     decodeTrace(QStringLiteral("DecoderWorker::processRequest.begin"),
                 QStringLiteral("seq=%1 file=%2 frame=%3 priority=%4 queue=%5 thread=%6")
@@ -943,25 +1036,50 @@ void DecoderWorker::processRequest(const DecodeRequest& req) {
         emit decodeError(req.filePath, "Failed to create decoder context");
         return;
     }
-    
+
+    if (req.kind == DecodeRequestKind::Visible) {
+        QVector<DecodeRequest> batch;
+        batch.push_back(req);
+        QVector<DecodeRequest> followups =
+            m_queue ? m_queue->takeSameFileVisibleRequests(req.filePath, req.frameNumber + 1, kMaxVisibleBatchRequests - 1)
+                    : QVector<DecodeRequest>();
+        batch += followups;
+        std::sort(batch.begin(), batch.end(),
+                  [](const DecodeRequest& a, const DecodeRequest& b) {
+                      if (a.frameNumber == b.frameNumber) {
+                          return a.sequenceId < b.sequenceId;
+                      }
+                      return a.frameNumber < b.frameNumber;
+                  });
+        decodeTrace(QStringLiteral("DecoderWorker::processRequest.batch"),
+                    QStringLiteral("file=%1 first=%2 last=%3 count=%4")
+                        .arg(shortPath(req.filePath))
+                        .arg(batch.first().frameNumber)
+                        .arg(batch.last().frameNumber)
+                        .arg(batch.size()));
+        processVisibleBatch(batch, ctx);
+        decodeTrace(QStringLiteral("DecoderWorker::processRequest.end"),
+                    QStringLiteral("seq=%1 file=%2 frame=%3 kind=visible-batch count=%4 waitMs=%5")
+                        .arg(req.sequenceId)
+                        .arg(shortPath(req.filePath))
+                        .arg(req.frameNumber)
+                        .arg(batch.size())
+                        .arg(decodeTraceMs() - startedAt));
+        return;
+    }
+
     FrameHandle frame = ctx->decodeFrame(req.frameNumber);
-    
+
     if (frame.isNull()) {
         m_dropCount++;
     } else {
         m_decodeCount++;
-        
-        // Track memory
-        if (m_budget) {
-            size_t mem = frame.memoryUsage();
-            m_budget->allocateCpu(mem, MemoryBudget::Priority::Normal);
-        }
     }
-    
+
     if (req.callback) {
         req.callback(frame);
     }
-    
+
     emit frameDecoded(frame);
     decodeTrace(QStringLiteral("DecoderWorker::processRequest.end"),
                 QStringLiteral("seq=%1 file=%2 frame=%3 null=%4 waitMs=%5")
@@ -970,6 +1088,87 @@ void DecoderWorker::processRequest(const DecodeRequest& req) {
                     .arg(req.frameNumber)
                     .arg(frame.isNull())
                     .arg(decodeTraceMs() - startedAt));
+}
+
+void DecoderWorker::processVisibleBatch(const QVector<DecodeRequest>& requests, DecoderContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+
+    int64_t highestTarget = -1;
+    for (const DecodeRequest& request : requests) {
+        if (!request.isExpired()) {
+            highestTarget = qMax(highestTarget, request.frameNumber);
+        }
+    }
+    if (highestTarget < 0) {
+        for (const DecodeRequest& request : requests) {
+            m_dropCount++;
+            if (request.callback) {
+                request.callback(FrameHandle());
+            }
+        }
+        return;
+    }
+
+    const QVector<FrameHandle> decodedFrames = ctx->decodeThroughFrame(highestTarget);
+    QHash<int64_t, FrameHandle> decodedByFrame;
+    QVector<int64_t> decodedFrameNumbers;
+    for (const FrameHandle& frame : decodedFrames) {
+        if (frame.isNull()) {
+            continue;
+        }
+        decodedByFrame.insert(frame.frameNumber(), frame);
+        decodedFrameNumbers.push_back(frame.frameNumber());
+        emit frameDecoded(frame);
+    }
+    std::sort(decodedFrameNumbers.begin(), decodedFrameNumbers.end());
+
+    for (const DecodeRequest& request : requests) {
+        if (request.isExpired()) {
+            m_dropCount++;
+            if (request.callback) {
+                request.callback(FrameHandle());
+            }
+            continue;
+        }
+
+        FrameHandle deliveredFrame = decodedByFrame.value(request.frameNumber);
+        if (deliveredFrame.isNull()) {
+            int64_t bestFrameNumber = std::numeric_limits<int64_t>::max();
+            int64_t bestDistance = std::numeric_limits<int64_t>::max();
+            for (int64_t decodedFrameNumber : decodedFrameNumbers) {
+                const int64_t distance = qAbs(decodedFrameNumber - request.frameNumber);
+                if (distance > kPlaybackBatchFrameSlack) {
+                    continue;
+                }
+                if (bestFrameNumber == std::numeric_limits<int64_t>::max() ||
+                    distance < bestDistance ||
+                    (distance == bestDistance && decodedFrameNumber > bestFrameNumber)) {
+                    bestFrameNumber = decodedFrameNumber;
+                    bestDistance = distance;
+                }
+            }
+            if (bestFrameNumber != std::numeric_limits<int64_t>::max()) {
+                deliveredFrame = decodedByFrame.value(bestFrameNumber);
+                decodeTrace(QStringLiteral("DecoderWorker::processVisibleBatch.nearest"),
+                            QStringLiteral("file=%1 requested=%2 delivered=%3 distance=%4")
+                                .arg(shortPath(request.filePath))
+                                .arg(request.frameNumber)
+                                .arg(bestFrameNumber)
+                                .arg(bestDistance));
+            }
+        }
+        if (deliveredFrame.isNull()) {
+            m_dropCount++;
+        } else {
+            m_decodeCount++;
+        }
+
+        if (request.callback) {
+            request.callback(deliveredFrame);
+        }
+    }
 }
 
 DecoderContext* DecoderWorker::getOrCreateContext(const QString& path) {
@@ -1036,6 +1235,8 @@ bool AsyncDecoder::initialize() {
     for (int i = 0; i < workerCount; ++i) {
         auto* queue = new DecodeQueue();
         auto* worker = new DecoderWorker(queue, m_budget);
+        connect(worker, &DecoderWorker::frameDecoded, this, &AsyncDecoder::frameReady, Qt::QueuedConnection);
+        connect(worker, &DecoderWorker::decodeError, this, &AsyncDecoder::error, Qt::QueuedConnection);
         m_queues.append(queue);
         worker->start();
         m_workers.append(worker);
@@ -1062,10 +1263,19 @@ void AsyncDecoder::shutdown() {
     m_queues.clear();
 }
 
-uint64_t AsyncDecoder::requestFrame(const QString& path, 
+uint64_t AsyncDecoder::requestFrame(const QString& path,
                                     int64_t frameNumber,
                                     int priority,
                                     int timeoutMs,
+                                    std::function<void(FrameHandle)> callback) {
+    return requestFrame(path, frameNumber, priority, timeoutMs, DecodeRequestKind::Visible, std::move(callback));
+}
+
+uint64_t AsyncDecoder::requestFrame(const QString& path,
+                                    int64_t frameNumber,
+                                    int priority,
+                                    int timeoutMs,
+                                    DecodeRequestKind kind,
                                     std::function<void(FrameHandle)> callback) {
     uint64_t seqId = m_nextSequenceId++;
     
@@ -1074,6 +1284,7 @@ uint64_t AsyncDecoder::requestFrame(const QString& path,
     req.filePath = path;
     req.frameNumber = frameNumber;
     req.priority = priority;
+    req.kind = kind;
     req.deadline = QDeadlineTimer(timeoutMs);
     req.callback = callback;
     req.submittedAt = QDateTime::currentMSecsSinceEpoch();
@@ -1081,24 +1292,27 @@ uint64_t AsyncDecoder::requestFrame(const QString& path,
     const int pendingBefore = totalPendingRequests();
 
     decodeTrace(QStringLiteral("AsyncDecoder::requestFrame"),
-                QStringLiteral("seq=%1 file=%2 frame=%3 priority=%4 timeoutMs=%5 pending=%6")
+                QStringLiteral("seq=%1 file=%2 frame=%3 priority=%4 kind=%5 timeoutMs=%6 pending=%7")
                     .arg(seqId)
                     .arg(shortPath(path))
                     .arg(frameNumber)
                     .arg(priority)
+                    .arg(static_cast<int>(kind))
                     .arg(timeoutMs)
                     .arg(pendingBefore));
     
     if (!queue || !queue->enqueue(req)) {
         // Queue full, return immediately with null
         decodeTrace(QStringLiteral("AsyncDecoder::requestFrame.queue-full"),
-                    QStringLiteral("seq=%1 file=%2 frame=%3")
+                    QStringLiteral("seq=%1 file=%2 frame=%3 kind=%4")
                         .arg(seqId)
                         .arg(shortPath(path))
-                        .arg(frameNumber));
+                        .arg(frameNumber)
+                        .arg(static_cast<int>(kind)));
         if (callback) {
             callback(FrameHandle());
         }
+        return 0;
     }
     
     emit queuePressureChanged(totalPendingRequests());

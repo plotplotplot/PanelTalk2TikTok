@@ -423,6 +423,63 @@ QImage applyClipGrade(const QImage& source, const TimelineClip& clip) {
     return graded.convertToFormat(QImage::Format_ARGB32_Premultiplied);
 }
 
+QString playbackProxyPathForClip(const TimelineClip& clip) {
+    if (!clip.proxyPath.isEmpty() && QFileInfo::exists(clip.proxyPath)) {
+        return clip.proxyPath;
+    }
+    if (clip.filePath.isEmpty() || !clipHasVisuals(clip)) {
+        return QString();
+    }
+
+    const QFileInfo sourceInfo(clip.filePath);
+    if (!sourceInfo.exists()) {
+        return QString();
+    }
+
+    const QString baseName = sourceInfo.completeBaseName();
+    const QDir sourceDir = sourceInfo.dir();
+    const QStringList candidateNames = {
+        baseName + QStringLiteral(".proxy.mov"),
+        baseName + QStringLiteral(".proxy.mp4"),
+        baseName + QStringLiteral(".proxy.mkv"),
+        baseName + QStringLiteral(".proxy.webm"),
+        baseName + QStringLiteral("_proxy.mov"),
+        baseName + QStringLiteral("_proxy.mp4"),
+        baseName + QStringLiteral("_proxy.mkv"),
+        baseName + QStringLiteral("_proxy.webm")
+    };
+
+    for (const QString& candidateName : candidateNames) {
+        const QString candidatePath = sourceDir.filePath(candidateName);
+        if (QFileInfo::exists(candidatePath)) {
+            return candidatePath;
+        }
+    }
+
+    const QDir proxiesDir(sourceDir.filePath(QStringLiteral("proxies")));
+    if (proxiesDir.exists()) {
+        const QStringList proxySuffixes = {
+            QStringLiteral(".mov"),
+            QStringLiteral(".mp4"),
+            QStringLiteral(".mkv"),
+            QStringLiteral(".webm")
+        };
+        for (const QString& suffix : proxySuffixes) {
+            const QString candidatePath = proxiesDir.filePath(baseName + suffix);
+            if (QFileInfo::exists(candidatePath)) {
+                return candidatePath;
+            }
+        }
+    }
+
+    return QString();
+}
+
+QString playbackMediaPathForClip(const TimelineClip& clip) {
+    const QString proxyPath = playbackProxyPathForClip(clip);
+    return proxyPath.isEmpty() ? clip.filePath : proxyPath;
+}
+
 QString transcriptPathForClipFile(const QString& filePath) {
     const QFileInfo info(filePath);
     return info.dir().filePath(info.completeBaseName() + QStringLiteral(".json"));

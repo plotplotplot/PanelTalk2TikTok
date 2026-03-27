@@ -43,6 +43,7 @@ struct TimelineClip {
 
     QString id;
     QString filePath;
+    QString proxyPath;
     QString label;
     ClipMediaType mediaType = ClipMediaType::Unknown;
     bool hasAudio = false;
@@ -66,6 +67,7 @@ struct TimelineClip {
     QVector<TransformKeyframe> transformKeyframes;
     TranscriptOverlaySettings transcriptOverlay;
     int fadeSamples = 250;  // Crossfade with previous audio clip (0 = no fade)
+    bool locked = false;    // When true, prevents temporal adjustments
 };
 
 struct TimelineTrack {
@@ -159,6 +161,8 @@ int64_t sourceFrameForClipAtTimelinePosition(const TimelineClip& clip,
 
 MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames = 120);
 QImage applyClipGrade(const QImage& source, const TimelineClip& clip);
+QString playbackProxyPathForClip(const TimelineClip& clip);
+QString playbackMediaPathForClip(const TimelineClip& clip);
 QString transcriptPathForClipFile(const QString& filePath);
 QVector<TranscriptSection> loadTranscriptSections(const QString& transcriptPath);
 QString wrappedTranscriptSectionText(const QString& text, int maxCharsPerLine, int maxLines);
