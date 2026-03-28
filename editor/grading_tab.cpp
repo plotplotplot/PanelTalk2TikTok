@@ -154,6 +154,7 @@ void GradingTab::refresh()
     }
 
     m_updating = false;
+    syncTableToPlayhead();
 }
 
 void GradingTab::applyGradeFromInspector(bool pushHistory)

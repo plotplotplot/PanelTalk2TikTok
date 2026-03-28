@@ -1,5 +1,6 @@
 #include "output_tab.h"
 
+#include <QFileDialog>
 #include <QSignalBlocker>
 
 OutputTab::OutputTab(const Widgets& widgets, const Dependencies& deps, QObject* parent)
@@ -111,6 +112,18 @@ void OutputTab::renderFromInspector()
     if (request.outputFormat.isEmpty()) {
         request.outputFormat = QStringLiteral("mp4");
     }
+
+    const QString defaultFileName = QStringLiteral("render.%1").arg(request.outputFormat);
+    const QString selectedPath = QFileDialog::getSaveFileName(
+        nullptr,
+        QStringLiteral("Render Output"),
+        defaultFileName,
+        QStringLiteral("Video Files (*.%1);;All Files (*)").arg(request.outputFormat));
+    if (selectedPath.isEmpty()) {
+        return;
+    }
+    request.outputPath = selectedPath;
+
     request.outputSize = QSize(
         m_widgets.outputWidthSpin ? m_widgets.outputWidthSpin->value() : 1080,
         m_widgets.outputHeightSpin ? m_widgets.outputHeightSpin->value() : 1920);

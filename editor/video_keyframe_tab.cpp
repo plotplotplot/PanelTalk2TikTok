@@ -516,6 +516,7 @@ void VideoKeyframeTab::refresh()
             .arg(keyframeSummary, sourcePath));
     m_widgets.keyframesInspectorDetailsLabel->setToolTip(sourcePath);
     m_updating = false;
+    syncTableToPlayhead();
 }
 
 void VideoKeyframeTab::applyKeyframeFromInspector(bool pushHistory)
