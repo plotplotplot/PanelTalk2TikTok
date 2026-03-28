@@ -3,6 +3,7 @@
 #include "clip_serialization.h"
 #include "editor_shared.h"
 
+#include <QApplication>
 #include <QAbstractItemView>
 #include <QColor>
 #include <QFile>
@@ -18,6 +19,14 @@ TranscriptTab::TranscriptTab(const Widgets& widgets, const Dependencies& deps, Q
     , m_widgets(widgets)
     , m_deps(deps)
 {
+    m_deferredSeekTimer.setSingleShot(true);
+    connect(&m_deferredSeekTimer, &QTimer::timeout, this, [this]() {
+        if (m_pendingSeekTimelineFrame < 0 || !m_deps.seekToTimelineFrame) {
+            return;
+        }
+        m_deps.seekToTimelineFrame(m_pendingSeekTimelineFrame);
+        m_pendingSeekTimelineFrame = -1;
+    });
 }
 
 void TranscriptTab::wire()
@@ -25,6 +34,8 @@ void TranscriptTab::wire()
     if (m_widgets.transcriptTable) {
         connect(m_widgets.transcriptTable, &QTableWidget::itemClicked,
                 this, &TranscriptTab::onTranscriptItemClicked);
+        connect(m_widgets.transcriptTable, &QTableWidget::itemDoubleClicked,
+                this, &TranscriptTab::onTranscriptItemDoubleClicked);
         connect(m_widgets.transcriptTable, &QTableWidget::itemChanged,
                 this, &TranscriptTab::applyTableEdit);
     }
@@ -344,7 +355,15 @@ void TranscriptTab::onTranscriptItemClicked(QTableWidgetItem* item)
     const int64_t timelineFrame = qMax<int64_t>(
         selectedClip->startFrame,
         selectedClip->startFrame + (startFrame - selectedClip->sourceInFrame));
-    m_deps.seekToTimelineFrame(timelineFrame);
+    m_pendingSeekTimelineFrame = timelineFrame;
+    m_deferredSeekTimer.start(QApplication::doubleClickInterval());
+}
+
+void TranscriptTab::onTranscriptItemDoubleClicked(QTableWidgetItem* item)
+{
+    Q_UNUSED(item);
+    m_deferredSeekTimer.stop();
+    m_pendingSeekTimelineFrame = -1;
 }
 
 void TranscriptTab::onFollowCurrentWordToggled(bool checked)

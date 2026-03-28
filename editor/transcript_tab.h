@@ -8,6 +8,7 @@
 #include <QDoubleSpinBox>
 #include <QFontComboBox>
 #include <QJsonDocument>
+#include <QTimer>
 #include <functional>
 
 #include "editor_shared.h"
@@ -73,6 +74,7 @@ signals:
 
 private slots:
     void onTranscriptItemClicked(QTableWidgetItem* item);
+    void onTranscriptItemDoubleClicked(QTableWidgetItem* item);
     void onFollowCurrentWordToggled(bool checked);
     void onOverlaySettingChanged();
     void onPrependMsChanged(int value);
@@ -107,4 +109,6 @@ private:
     int m_transcriptPostpendMs = 0;
     int m_speechFilterFadeSamples = 250;
     bool m_speechFilterEnabled = false;
+    QTimer m_deferredSeekTimer;
+    int64_t m_pendingSeekTimelineFrame = -1;
 };

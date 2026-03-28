@@ -24,6 +24,8 @@
 #include <QStandardPaths>
 #include <QStyle>
 #include <QTextCursor>
+#include <QTextStream>
+#include <QTemporaryFile>
 #include <QVBoxLayout>
 
 using namespace editor;
@@ -616,12 +618,6 @@ void EditorWindow::createProxyForClip(const QString &clipId)
                                  QStringLiteral("Proxy creation is currently available for video clips."));
         return;
     }
-    if (isImageSequencePath(clip->filePath))
-    {
-        QMessageBox::information(this, QStringLiteral("Create Proxy"),
-                                 QStringLiteral("Image-sequence clips do not need proxy creation."));
-        return;
-    }
 
     const QString ffmpegPath = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
     if (ffmpegPath.isEmpty())
@@ -631,7 +627,17 @@ void EditorWindow::createProxyForClip(const QString &clipId)
         return;
     }
 
-    const MediaProbeResult sourceProbe = probeMediaFile(clip->filePath, clip->durationFrames);
+    const bool imageSequenceProxy = isImageSequencePath(clip->filePath);
+    const QStringList sequenceFrames = imageSequenceProxy ? imageSequenceFramePaths(clip->filePath) : QStringList{};
+    if (imageSequenceProxy && sequenceFrames.isEmpty())
+    {
+        QMessageBox::warning(this, QStringLiteral("Create Proxy Failed"),
+                             QStringLiteral("No sequence frames were found for this clip."));
+        return;
+    }
+
+    const QString probePath = imageSequenceProxy ? sequenceFrames.constFirst() : clip->filePath;
+    const MediaProbeResult sourceProbe = probeMediaFile(probePath, clip->durationFrames);
     const QString existingProxyPath = playbackProxyPathForClip(*clip);
     const QString outputPath = defaultProxyOutputPath(*clip, &sourceProbe);
     const QString overwriteTarget = !existingProxyPath.isEmpty() ? existingProxyPath : outputPath;
@@ -685,12 +691,49 @@ void EditorWindow::createProxyForClip(const QString &clipId)
     process->setProcessChannelMode(QProcess::MergedChannels);
     process->setWorkingDirectory(QDir::currentPath());
 
+    std::unique_ptr<QTemporaryFile> sequenceListFile;
     QStringList arguments = {
         QStringLiteral("-y"),
-        QStringLiteral("-hide_banner"),
-        QStringLiteral("-i"), QFileInfo(clip->filePath).absoluteFilePath(),
-        QStringLiteral("-map"), QStringLiteral("0:v:0"),
-        QStringLiteral("-map"), QStringLiteral("0:a?")};
+        QStringLiteral("-hide_banner")};
+
+    if (imageSequenceProxy)
+    {
+        sequenceListFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath(QStringLiteral("editor_sequence_proxy_XXXXXX.txt")));
+        sequenceListFile->setAutoRemove(false);
+        if (!sequenceListFile->open())
+        {
+            QMessageBox::warning(this, QStringLiteral("Create Proxy Failed"),
+                                 QStringLiteral("Unable to create a temporary ffmpeg input list for the image sequence."));
+            return;
+        }
+
+        QTextStream stream(sequenceListFile.get());
+        for (const QString &framePath : sequenceFrames)
+        {
+            QString escapedFramePath = QFileInfo(framePath).absoluteFilePath();
+            escapedFramePath.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
+            stream << "file '" << escapedFramePath << "'\n";
+            stream << "duration " << QString::number(1.0 / static_cast<double>(kTimelineFps), 'f', 6) << '\n';
+        }
+        if (!sequenceFrames.isEmpty())
+        {
+            QString escapedFramePath = QFileInfo(sequenceFrames.constLast()).absoluteFilePath();
+            escapedFramePath.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
+            stream << "file '" << escapedFramePath << "'\n";
+        }
+        stream.flush();
+        sequenceListFile->flush();
+
+        arguments << QStringLiteral("-f") << QStringLiteral("concat")
+                  << QStringLiteral("-safe") << QStringLiteral("0")
+                  << QStringLiteral("-i") << sequenceListFile->fileName();
+    }
+    else
+    {
+        arguments << QStringLiteral("-i") << QFileInfo(clip->filePath).absoluteFilePath()
+                  << QStringLiteral("-map") << QStringLiteral("0:v:0")
+                  << QStringLiteral("-map") << QStringLiteral("0:a?");
+    }
     
     const bool alphaProxy = sourceProbe.hasAlpha;
     if (alphaProxy)
@@ -705,9 +748,12 @@ void EditorWindow::createProxyForClip(const QString &clipId)
                   << QStringLiteral("-q:v") << QStringLiteral("3")
                   << QStringLiteral("-pix_fmt") << QStringLiteral("yuvj420p");
     }
-    arguments << QStringLiteral("-c:a") << QStringLiteral("pcm_s16le")
-              << QStringLiteral("-b:a") << QStringLiteral("1536k")
-              << QFileInfo(outputPath).absoluteFilePath();
+    if (!imageSequenceProxy)
+    {
+        arguments << QStringLiteral("-c:a") << QStringLiteral("pcm_s16le")
+                  << QStringLiteral("-b:a") << QStringLiteral("1536k");
+    }
+    arguments << QFileInfo(outputPath).absoluteFilePath();
 
     const auto appendOutput = [output, autoScrollBox](const QString &text)
     {
@@ -727,11 +773,15 @@ void EditorWindow::createProxyForClip(const QString &clipId)
     connect(process, &QProcess::errorOccurred, dialog, [appendOutput](QProcess::ProcessError error)
             { appendOutput(QStringLiteral("\n[process error] %1\n").arg(static_cast<int>(error))); });
     connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), dialog,
-            [this, clipId, outputPath, existingProxyPath, appendOutput](int exitCode, QProcess::ExitStatus exitStatus)
+            [this, clipId, outputPath, existingProxyPath, appendOutput, sequenceListPath = sequenceListFile ? sequenceListFile->fileName() : QString()](int exitCode, QProcess::ExitStatus exitStatus)
             {
                 appendOutput(QStringLiteral("\n[process finished] exitCode=%1 status=%2\n")
                                  .arg(exitCode)
                                  .arg(exitStatus == QProcess::NormalExit ? QStringLiteral("normal") : QStringLiteral("crashed")));
+                if (!sequenceListPath.isEmpty())
+                {
+                    QFile::remove(sequenceListPath);
+                }
                 if (exitStatus != QProcess::NormalExit || exitCode != 0 || !QFileInfo::exists(outputPath))
                 {
                     return;
@@ -753,12 +803,16 @@ void EditorWindow::createProxyForClip(const QString &clipId)
                 }
             });
     connect(closeButton, &QPushButton::clicked, dialog, &QDialog::close);
-    connect(dialog, &QDialog::finished, dialog, [process](int)
+    connect(dialog, &QDialog::finished, dialog, [process, sequenceListPath = sequenceListFile ? sequenceListFile->fileName() : QString()](int)
             {
                 if (process->state() != QProcess::NotRunning)
                 {
                     process->kill();
                     process->waitForFinished(1000);
+                }
+                if (!sequenceListPath.isEmpty())
+                {
+                    QFile::remove(sequenceListPath);
                 }
             });
 

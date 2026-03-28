@@ -950,7 +950,7 @@ void TimelineWidget::updateHoverCursor(const QPoint& pos) {
 }
 
 bool TimelineWidget::clipHasProxyAvailable(const TimelineClip& clip) const {
-    if (clip.mediaType != ClipMediaType::Video || isImageSequencePath(clip.filePath)) {
+    if (clip.mediaType != ClipMediaType::Video) {
         return false;
     }
     return !playbackProxyPathForClip(clip).isEmpty();
@@ -1536,13 +1536,11 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
             detectedProxyPath.isEmpty() ? QStringLiteral("Create Proxy...")
                                         : QStringLiteral("Recreate Proxy..."));
         createProxyAction->setEnabled(
-            m_clips[clipIndex].mediaType == ClipMediaType::Video &&
-            !isImageSequencePath(m_clips[clipIndex].filePath));
+            m_clips[clipIndex].mediaType == ClipMediaType::Video);
         if (!detectedProxyPath.isEmpty()) {
             deleteProxyAction = menu.addAction(QStringLiteral("Delete Proxy"));
             deleteProxyAction->setEnabled(
-                m_clips[clipIndex].mediaType == ClipMediaType::Video &&
-                !isImageSequencePath(m_clips[clipIndex].filePath));
+                m_clips[clipIndex].mediaType == ClipMediaType::Video);
         }
         propertiesAction = menu.addAction(QStringLiteral("Properties"));
         menu.addSeparator();

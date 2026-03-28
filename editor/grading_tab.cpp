@@ -376,7 +376,23 @@ void GradingTab::onTableSelectionChanged()
 
     m_selectedKeyframeFrame = primaryFrame;
     m_selectedKeyframeFrames = selectedFrames;
-    refresh();
+
+    const TimelineClip* clip = m_deps.getSelectedClip();
+    if (clip && m_deps.clipHasVisuals(*clip)) {
+        GradingKeyframeDisplay displayed = evaluateDisplayedGrading(*clip, clip->startFrame + primaryFrame);
+        for (const TimelineClip::GradingKeyframe& keyframe : clip->gradingKeyframes) {
+            if (keyframe.frame == primaryFrame) {
+                displayed.frame = keyframe.frame;
+                displayed.brightness = keyframe.brightness;
+                displayed.contrast = keyframe.contrast;
+                displayed.saturation = keyframe.saturation;
+                displayed.opacity = keyframe.opacity;
+                displayed.linearInterpolation = keyframe.linearInterpolation;
+                break;
+            }
+        }
+        updateSpinBoxesFromKeyframe(displayed);
+    }
 
     if (m_deps.onKeyframeSelectionChanged) {
         m_deps.onKeyframeSelectionChanged();
@@ -385,8 +401,8 @@ void GradingTab::onTableSelectionChanged()
 
 void GradingTab::onTableItemChanged(QTableWidgetItem* changedItem)
 {
-    if (m_updating || !changedItem || !m_deps.onKeyframeItemChanged) {
-        if (m_deps.onKeyframeItemChanged) {
+    if (m_updating || !changedItem) {
+        if (m_deps.onKeyframeItemChanged && changedItem) {
             m_deps.onKeyframeItemChanged(changedItem);
         }
         return;
@@ -424,6 +440,16 @@ void GradingTab::onTableItemChanged(QTableWidgetItem* changedItem)
     const int64_t originalFrame = changedItem->data(Qt::UserRole).toLongLong();
 
     const bool updated = m_deps.updateClipById(selectedClip->id, [edited, originalFrame](TimelineClip& clip) {
+        TimelineClip::GradingKeyframe originalKeyframe;
+        bool foundOriginal = false;
+        for (const TimelineClip::GradingKeyframe& existing : clip.gradingKeyframes) {
+            if (existing.frame == originalFrame) {
+                originalKeyframe = existing;
+                foundOriginal = true;
+                break;
+            }
+        }
+
         bool replaced = false;
         for (TimelineClip::GradingKeyframe& existing : clip.gradingKeyframes) {
             if (existing.frame == originalFrame) {
@@ -435,6 +461,29 @@ void GradingTab::onTableItemChanged(QTableWidgetItem* changedItem)
         if (!replaced) {
             clip.gradingKeyframes.push_back(edited);
         }
+
+        // Grading always maintains a frame-0 base state. If the edited keyframe
+        // was the frame-0 key and the user moves it later in time, preserve the
+        // original grade as the new base key instead of silently snapping back.
+        if (foundOriginal && originalFrame == 0 && edited.frame > 0) {
+            bool hasBaseAtZero = false;
+            for (const TimelineClip::GradingKeyframe& existing : clip.gradingKeyframes) {
+                if (existing.frame == 0 && !(existing.frame == edited.frame &&
+                                             existing.brightness == edited.brightness &&
+                                             existing.contrast == edited.contrast &&
+                                             existing.saturation == edited.saturation &&
+                                             existing.opacity == edited.opacity &&
+                                             existing.linearInterpolation == edited.linearInterpolation)) {
+                    hasBaseAtZero = true;
+                    break;
+                }
+            }
+            if (!hasBaseAtZero) {
+                originalKeyframe.frame = 0;
+                clip.gradingKeyframes.push_back(originalKeyframe);
+            }
+        }
+
         normalizeClipGradingKeyframes(clip);
     });
 
@@ -446,6 +495,9 @@ void GradingTab::onTableItemChanged(QTableWidgetItem* changedItem)
     m_selectedKeyframeFrame = edited.frame;
     m_selectedKeyframeFrames = {edited.frame};
     m_deps.setPreviewTimelineClips();
+    if (m_deps.onKeyframeItemChanged) {
+        m_deps.onKeyframeItemChanged(changedItem);
+    }
     refresh();
     m_deps.scheduleSaveState();
     m_deps.pushHistorySnapshot();
@@ -652,7 +704,12 @@ void GradingTab::populateTable(const TimelineClip& clip)
             displayedFrame = evaluateClipGradingAtFrame(clip, clip.startFrame);
             displayedFrame.frame = 0;
         } else {
-            displayedFrame = clip.gradingKeyframes[row];
+            for (const TimelineClip::GradingKeyframe& keyframe : clip.gradingKeyframes) {
+                if (keyframe.frame == frame) {
+                    displayedFrame = keyframe;
+                    break;
+                }
+            }
         }
 
         const QStringList rowValues = {

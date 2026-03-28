@@ -17,6 +17,14 @@ VideoKeyframeTab::VideoKeyframeTab(const Widgets& widgets, const Dependencies& d
     , m_widgets(widgets)
     , m_deps(deps)
 {
+    m_deferredSeekTimer.setSingleShot(true);
+    connect(&m_deferredSeekTimer, &QTimer::timeout, this, [this]() {
+        if (m_pendingSeekTimelineFrame < 0 || !m_deps.seekToTimelineFrame) {
+            return;
+        }
+        m_deps.seekToTimelineFrame(m_pendingSeekTimelineFrame);
+        m_pendingSeekTimelineFrame = -1;
+    });
 }
 
 void VideoKeyframeTab::wire()
@@ -87,7 +95,7 @@ void VideoKeyframeTab::wire()
         connect(m_widgets.videoKeyframeTable, &QTableWidget::itemClicked,
                 this, &VideoKeyframeTab::onTableItemClicked);
         connect(m_widgets.videoKeyframeTable, &QTableWidget::itemDoubleClicked,
-                this, [this](QTableWidgetItem*) {});
+                this, &VideoKeyframeTab::onTableItemDoubleClicked);
         connect(m_widgets.videoKeyframeTable->horizontalHeader(), &QHeaderView::sectionClicked,
                 this, &VideoKeyframeTab::onTableHeaderClicked);
         m_widgets.videoKeyframeTable->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -1080,6 +1088,12 @@ void VideoKeyframeTab::onTableSelectionChanged()
     m_selectedKeyframeFrames = selectedFrames;
     refresh();
 
+    const TimelineClip* selectedClip = m_deps.getSelectedClip();
+    if (selectedClip && m_deps.seekToTimelineFrame) {
+        m_pendingSeekTimelineFrame = selectedClip->startFrame + primaryFrame;
+        m_deferredSeekTimer.start(QApplication::doubleClickInterval());
+    }
+
     if (m_deps.onKeyframeSelectionChanged) {
         m_deps.onKeyframeSelectionChanged();
     }
@@ -1087,8 +1101,8 @@ void VideoKeyframeTab::onTableSelectionChanged()
 
 void VideoKeyframeTab::onTableItemChanged(QTableWidgetItem* changedItem)
 {
-    if (m_updating || !changedItem || !m_deps.onKeyframeItemChanged) {
-        if (m_deps.onKeyframeItemChanged) {
+    if (m_updating || !changedItem) {
+        if (m_deps.onKeyframeItemChanged && changedItem) {
             m_deps.onKeyframeItemChanged(changedItem);
         }
         return;
@@ -1155,6 +1169,9 @@ void VideoKeyframeTab::onTableItemChanged(QTableWidgetItem* changedItem)
     m_selectedKeyframeFrame = stored.frame;
     m_selectedKeyframeFrames = {stored.frame};
     m_deps.setPreviewTimelineClips();
+    if (m_deps.onKeyframeItemChanged) {
+        m_deps.onKeyframeItemChanged(changedItem);
+    }
     refresh();
     m_deps.scheduleSaveState();
     m_deps.pushHistorySnapshot();
@@ -1165,6 +1182,13 @@ void VideoKeyframeTab::onTableItemClicked(QTableWidgetItem* item)
     if (m_updating || !item) return;
     if (item->column() != 6) return;
     item->setText(nextVideoInterpolationLabel(item->text()));
+}
+
+void VideoKeyframeTab::onTableItemDoubleClicked(QTableWidgetItem* item)
+{
+    Q_UNUSED(item);
+    m_deferredSeekTimer.stop();
+    m_pendingSeekTimelineFrame = -1;
 }
 
 void VideoKeyframeTab::onTableHeaderClicked(int section)

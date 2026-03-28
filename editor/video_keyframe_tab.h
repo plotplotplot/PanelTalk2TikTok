@@ -7,6 +7,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QPushButton>
+#include <QTimer>
 #include <functional>
 
 #include "editor_shared.h"
@@ -100,6 +101,7 @@ private slots:
     void onTableSelectionChanged();
     void onTableItemChanged(QTableWidgetItem* item);
     void onTableItemClicked(QTableWidgetItem* item);
+    void onTableItemDoubleClicked(QTableWidgetItem* item);
     void onTableHeaderClicked(int section);
     void onTableCustomContextMenu(const QPoint& pos);
 
@@ -141,4 +143,6 @@ private:
     bool m_syncingScaleControls = false;
     int64_t m_selectedKeyframeFrame = -1;
     QSet<int64_t> m_selectedKeyframeFrames;
+    QTimer m_deferredSeekTimer;
+    int64_t m_pendingSeekTimelineFrame = -1;
 };
