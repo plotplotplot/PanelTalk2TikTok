@@ -66,8 +66,11 @@ struct VideoStreamInfo {
     QSize frameSize;
     int64_t bitrate = 0;
     QString codecName;
+    QString decodePath;
+    QString requestedDecodeMode;
     bool hasAudio = false;
     bool hasAlpha = false;
+    bool hardwareAccelerated = false;
     bool isValid = false;
 };
 

@@ -5,6 +5,7 @@
 #include <QOpenGLBuffer>
 #include <QTimer>
 #include <QHash>
+#include <QJsonObject>
 #include <memory>
 #include <functional>
 
@@ -175,6 +176,8 @@ private:
     QHash<QString, PreviewOverlayInfo> m_overlayInfo;
     mutable QHash<QString, QVector<TranscriptSection>> m_transcriptSectionsCache;
     QHash<QString, TextureCacheEntry> m_textureCache;
+    QHash<QString, FrameHandle> m_lastPresentedFrames;
+    mutable QJsonObject m_lastFrameSelectionStats;
     QVector<QString> m_paintOrder;
     int m_bulkUpdateDepth = 0;
     bool m_pendingFrameRequest = false;

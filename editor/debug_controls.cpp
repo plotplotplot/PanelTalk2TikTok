@@ -12,13 +12,14 @@ constexpr DebugLogLevel kDefaultPlaybackLevel = DebugLogLevel::Off;
 constexpr DebugLogLevel kDefaultCacheLevel = DebugLogLevel::Off;
 constexpr DebugLogLevel kDefaultDecodeLevel = DebugLogLevel::Off;
 constexpr bool kDefaultLeadPrefetchEnabled = true;
-constexpr int kDefaultLeadPrefetchCount = 2;
-constexpr int kDefaultPrefetchMaxQueueDepth = 6;
-constexpr int kDefaultPrefetchMaxInflight = 2;
-constexpr int kDefaultPrefetchMaxPerTick = 2;
+constexpr int kDefaultLeadPrefetchCount = 4;
+constexpr int kDefaultPrefetchMaxQueueDepth = 12;
+constexpr int kDefaultPrefetchMaxInflight = 4;
+constexpr int kDefaultPrefetchMaxPerTick = 4;
 constexpr int kDefaultPrefetchSkipVisiblePendingThreshold = 2;
-constexpr int kDefaultVisibleQueueReserve = 8;
+constexpr int kDefaultVisibleQueueReserve = 12;
 constexpr int kDefaultPlaybackWindowAhead = 8;
+constexpr DecodePreference kDefaultDecodePreference = DecodePreference::Auto;
 
 bool envFlagEnabled(const char* name) {
     return qEnvironmentVariableIntValue(name) == 1;
@@ -46,6 +47,7 @@ std::atomic<int> g_debugPrefetchMaxPerTick{kDefaultPrefetchMaxPerTick};
 std::atomic<int> g_debugPrefetchSkipVisiblePendingThreshold{kDefaultPrefetchSkipVisiblePendingThreshold};
 std::atomic<int> g_debugVisibleQueueReserve{kDefaultVisibleQueueReserve};
 std::atomic<int> g_debugPlaybackWindowAhead{kDefaultPlaybackWindowAhead};
+std::atomic<int> g_decodePreference{static_cast<int>(kDefaultDecodePreference)};
 
 }
 
@@ -89,6 +91,39 @@ bool parseDebugLogLevel(const QString& text, DebugLogLevel* levelOut) {
     }
     if (normalized == QStringLiteral("verbose")) {
         *levelOut = DebugLogLevel::Verbose;
+        return true;
+    }
+    return false;
+}
+
+QString decodePreferenceToString(DecodePreference preference) {
+    switch (preference) {
+    case DecodePreference::Auto: return QStringLiteral("auto");
+    case DecodePreference::Hardware: return QStringLiteral("hardware");
+    case DecodePreference::Software: return QStringLiteral("software");
+    }
+    return QStringLiteral("auto");
+}
+
+bool parseDecodePreference(const QString& text, DecodePreference* preferenceOut) {
+    if (!preferenceOut) {
+        return false;
+    }
+    const QString normalized = text.trimmed().toLower();
+    if (normalized == QStringLiteral("auto")) {
+        *preferenceOut = DecodePreference::Auto;
+        return true;
+    }
+    if (normalized == QStringLiteral("hardware") ||
+        normalized == QStringLiteral("gpu") ||
+        normalized == QStringLiteral("prefer_hardware")) {
+        *preferenceOut = DecodePreference::Hardware;
+        return true;
+    }
+    if (normalized == QStringLiteral("software") ||
+        normalized == QStringLiteral("cpu") ||
+        normalized == QStringLiteral("software_only")) {
+        *preferenceOut = DecodePreference::Software;
         return true;
     }
     return false;
@@ -186,6 +221,10 @@ int debugPlaybackWindowAhead() {
     return g_debugPlaybackWindowAhead.load();
 }
 
+DecodePreference debugDecodePreference() {
+    return static_cast<DecodePreference>(g_decodePreference.load());
+}
+
 void setDebugPlaybackEnabled(bool enabled) {
     g_debugPlayback.store(static_cast<int>(enabled ? DebugLogLevel::Debug : DebugLogLevel::Off));
 }
@@ -242,6 +281,10 @@ void setDebugPlaybackWindowAhead(int ahead) {
     g_debugPlaybackWindowAhead.store(qBound(1, ahead, 24));
 }
 
+void setDebugDecodePreference(DecodePreference preference) {
+    g_decodePreference.store(static_cast<int>(preference));
+}
+
 QJsonObject debugControlsSnapshot() {
     return QJsonObject{
         {QStringLiteral("playback"), debugPlaybackEnabled()},
@@ -257,7 +300,8 @@ QJsonObject debugControlsSnapshot() {
         {QStringLiteral("prefetch_max_per_tick"), debugPrefetchMaxPerTick()},
         {QStringLiteral("prefetch_skip_visible_pending_threshold"), debugPrefetchSkipVisiblePendingThreshold()},
         {QStringLiteral("visible_queue_reserve"), debugVisibleQueueReserve()},
-        {QStringLiteral("playback_window_ahead"), debugPlaybackWindowAhead()}
+        {QStringLiteral("playback_window_ahead"), debugPlaybackWindowAhead()},
+        {QStringLiteral("decode_mode"), decodePreferenceToString(debugDecodePreference())}
     };
 }
 
@@ -336,6 +380,14 @@ bool setDebugOption(const QString& name, const QJsonValue& value) {
     }
     if (name == QStringLiteral("playback_window_ahead") && value.isDouble()) {
         setDebugPlaybackWindowAhead(value.toInt());
+        return true;
+    }
+    if (name == QStringLiteral("decode_mode") && value.isString()) {
+        DecodePreference preference = DecodePreference::Auto;
+        if (!parseDecodePreference(value.toString(), &preference)) {
+            return false;
+        }
+        setDebugDecodePreference(preference);
         return true;
     }
     return false;

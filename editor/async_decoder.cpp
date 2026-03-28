@@ -478,10 +478,12 @@ bool DecoderContext::initCodec() {
     // hardware paths often drop or mangle transparency.
     const bool headlessOffscreen =
         qEnvironmentVariable("QT_QPA_PLATFORM") == QStringLiteral("offscreen");
-    const bool hardwareEnabled =
+    const DecodePreference decodePreference = debugDecodePreference();
+    const bool allowHardware =
+        decodePreference != DecodePreference::Software &&
         !headlessOffscreen &&
-        !m_streamHasAlphaTag &&
-        initHardwareAccel(decoder);
+        !m_streamHasAlphaTag;
+    const bool hardwareEnabled = allowHardware && initHardwareAccel(decoder);
     if (hardwareEnabled) {
         // Let FFmpeg choose sensible threading for hardware-backed decode.
         m_codecCtx->thread_count = 0;
@@ -511,6 +513,11 @@ bool DecoderContext::initCodec() {
         qWarning() << "Failed to open codec:" << avErrToString(ret);
         return false;
     }
+
+    m_info.requestedDecodeMode = decodePreferenceToString(decodePreference);
+    m_info.hardwareAccelerated = hardwareEnabled;
+    m_info.decodePath = hardwareEnabled ? QStringLiteral("hardware")
+                                        : QStringLiteral("software");
 
     qDebug() << "Decoder path for" << m_path << ":" << (hardwareEnabled ? "hardware" : "software");
     
@@ -1380,7 +1387,7 @@ bool AsyncDecoder::initialize() {
 
     // Shard requests by file path so each file stays on one worker/context,
     // while different files can decode in parallel.
-    const int workerCount = qBound(1, QThread::idealThreadCount(), 4);
+    const int workerCount = qBound(2, QThread::idealThreadCount(), 6);
     
     for (int i = 0; i < workerCount; ++i) {
         auto* queue = new DecodeQueue();
@@ -1495,9 +1502,10 @@ void AsyncDecoder::cancelAll() {
 
 VideoStreamInfo AsyncDecoder::getVideoInfo(const QString& path) {
     QMutexLocker lock(&m_infoCacheMutex);
+    const QString requestedDecodeMode = decodePreferenceToString(debugDecodePreference());
     
     auto it = m_infoCache.find(path);
-    if (it != m_infoCache.end()) {
+    if (it != m_infoCache.end() && it.value().requestedDecodeMode == requestedDecodeMode) {
         return it.value();
     }
     
@@ -1505,6 +1513,7 @@ VideoStreamInfo AsyncDecoder::getVideoInfo(const QString& path) {
     DecoderContext ctx(path);
     if (ctx.initialize()) {
         VideoStreamInfo info = ctx.info();
+        info.requestedDecodeMode = requestedDecodeMode;
         m_infoCache[path] = info;
         return info;
     }

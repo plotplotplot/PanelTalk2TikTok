@@ -370,6 +370,9 @@ void PreviewWindow::setPlaybackState(bool playing) {
     if (m_playbackPipeline) {
         m_playbackPipeline->setPlaybackActive(playing);
     }
+    if (!playing) {
+        m_lastPresentedFrames.clear();
+    }
 }
 
 void PreviewWindow::setCurrentFrame(int64_t frame) {
@@ -426,6 +429,19 @@ void PreviewWindow::setTimelineClips(const QVector<TimelineClip>& clips) {
                   QStringLiteral("clips=%1 cache=%2").arg(clips.size()).arg(m_cache != nullptr));
     m_clips = clips;
     m_transcriptSectionsCache.clear();
+    QSet<QString> visualClipIds;
+    for (const auto& clip : clips) {
+        if (clipHasVisuals(clip)) {
+            visualClipIds.insert(clip.id);
+        }
+    }
+    for (auto it = m_lastPresentedFrames.begin(); it != m_lastPresentedFrames.end();) {
+        if (!visualClipIds.contains(it.key())) {
+            it = m_lastPresentedFrames.erase(it);
+        } else {
+            ++it;
+        }
+    }
     if (m_playbackPipeline) {
         m_playbackPipeline->setTimelineClips(clips);
     }
@@ -583,10 +599,7 @@ bool PreviewWindow::preparePlaybackAdvanceSample(int64_t targetSample) {
 
         hasActiveClip = true;
         const int64_t localFrame = sourceFrameForSample(clip, targetSample);
-        const bool usePlaybackPipeline =
-            m_playing &&
-            m_playbackPipeline &&
-            clip.mediaType != ClipMediaType::Image;
+        const bool usePlaybackPipeline = false;
         const bool ready = usePlaybackPipeline
                                ? m_playbackPipeline->isFrameBuffered(clip.id, localFrame)
                                : m_cache->isFrameCached(clip.id, localFrame);
@@ -667,6 +680,39 @@ QJsonObject PreviewWindow::profilingSnapshot() const {
             {QStringLiteral("pending_visible_requests"), m_playbackPipeline->pendingVisibleRequestCount()},
             {QStringLiteral("dropped_presentation_frames"), m_playbackPipeline->droppedPresentationFrameCount()}
         };
+    }
+
+    if (!m_lastFrameSelectionStats.isEmpty()) {
+        QJsonObject frameSelection = m_lastFrameSelectionStats;
+        if (m_decoder) {
+            QJsonArray enrichedClips;
+            const QJsonArray clips = frameSelection.value(QStringLiteral("clips")).toArray();
+            for (const QJsonValue& value : clips) {
+                if (!value.isObject()) {
+                    continue;
+                }
+                QJsonObject clipObject = value.toObject();
+                const QString clipId = clipObject.value(QStringLiteral("id")).toString();
+                auto clipIt = std::find_if(m_clips.begin(), m_clips.end(), [&clipId](const TimelineClip& clip) {
+                    return clip.id == clipId;
+                });
+                if (clipIt != m_clips.end()) {
+                    const QString decodePath = interactivePreviewMediaPathForClip(*clipIt);
+                    if (!decodePath.isEmpty()) {
+                        const VideoStreamInfo info = m_decoder->getVideoInfo(decodePath);
+                        if (info.isValid) {
+                            clipObject[QStringLiteral("decode_path")] = info.decodePath;
+                            clipObject[QStringLiteral("decode_mode_requested")] = info.requestedDecodeMode;
+                            clipObject[QStringLiteral("hardware_accelerated")] = info.hardwareAccelerated;
+                            clipObject[QStringLiteral("codec")] = info.codecName;
+                        }
+                    }
+                }
+                enrichedClips.append(clipObject);
+            }
+            frameSelection[QStringLiteral("clips")] = enrichedClips;
+        }
+        snapshot[QStringLiteral("frame_selection")] = frameSelection;
     }
 
     return snapshot;
@@ -1147,12 +1193,15 @@ void PreviewWindow::ensurePipeline() {
 
     m_decoder = std::make_unique<AsyncDecoder>(this);
     m_decoder->initialize();
+    if (MemoryBudget* budget = m_decoder->memoryBudget()) {
+        budget->setMaxCpuMemory(384 * 1024 * 1024);
+    }
 
     m_cache = std::make_unique<TimelineCache>(m_decoder.get(),
                                               m_decoder->memoryBudget(),
                                               this);
     m_playbackPipeline = std::make_unique<PlaybackFramePipeline>(m_decoder.get(), this);
-    m_cache->setMaxMemory(256 * 1024 * 1024);
+    m_cache->setMaxMemory(384 * 1024 * 1024);
     m_cache->setLookaheadFrames(18);
     m_cache->setPlaybackSpeed(1.0);
     m_cache->setPlaybackState(m_playing ?
@@ -1351,23 +1400,69 @@ void PreviewWindow::renderCompositedPreviewGL(const QRect& compositeRect,
                                bool& waitingForFrame) {
     m_overlayInfo.clear();
     m_paintOrder.clear();
+    int usedPlaybackPipelineCount = 0;
+    int presentationCount = 0;
+    int exactCount = 0;
+    int bestCount = 0;
+    int heldCount = 0;
+    int nullCount = 0;
+    QJsonArray clipSelections;
     for (const TimelineClip& clip : activeClips) {
         if (!clipHasVisuals(clip)) {
             continue;
         }
         const int64_t localFrame = sourceFrameForSample(clip, m_currentSample);
-        const bool usePlaybackPipeline =
-            m_playing &&
-            m_playbackPipeline &&
-            clip.mediaType != ClipMediaType::Image;
+        const bool usePlaybackPipeline = false;
+        QString selection = QStringLiteral("none");
         const FrameHandle exactFrame = usePlaybackPipeline
                                            ? m_playbackPipeline->getFrame(clip.id, localFrame)
                                            : (m_cache ? m_cache->getCachedFrame(clip.id, localFrame) : FrameHandle());
-        const FrameHandle frame = usePlaybackPipeline
-                                      ? m_playbackPipeline->getPresentationFrame(clip.id, localFrame)
-                                      : (exactFrame.isNull() && m_cache
-                                             ? m_cache->getBestCachedFrame(clip.id, localFrame)
-                                             : exactFrame);
+        FrameHandle frame;
+        if (usePlaybackPipeline) {
+            ++usedPlaybackPipelineCount;
+            frame = m_playbackPipeline->getPresentationFrame(clip.id, localFrame);
+            if (!frame.isNull()) {
+                ++presentationCount;
+                selection = QStringLiteral("presentation");
+            }
+        } else {
+            frame = exactFrame.isNull() && m_cache
+                        ? m_cache->getBestCachedFrame(clip.id, localFrame)
+                        : exactFrame;
+            if (!frame.isNull()) {
+                if (!exactFrame.isNull() && frame == exactFrame) {
+                    ++exactCount;
+                    selection = QStringLiteral("exact");
+                } else {
+                    ++bestCount;
+                    selection = QStringLiteral("best");
+                }
+            }
+        }
+        if (usePlaybackPipeline && frame.isNull()) {
+            frame = !exactFrame.isNull() ? exactFrame
+                                         : m_playbackPipeline->getBestFrame(clip.id, localFrame);
+            if (!frame.isNull()) {
+                if (!exactFrame.isNull() && frame == exactFrame) {
+                    ++exactCount;
+                    selection = QStringLiteral("exact");
+                } else {
+                    ++bestCount;
+                    selection = QStringLiteral("best");
+                }
+            }
+        }
+        if (usePlaybackPipeline) {
+            if (!frame.isNull()) {
+                m_lastPresentedFrames.insert(clip.id, frame);
+            } else {
+                frame = m_lastPresentedFrames.value(clip.id);
+                if (!frame.isNull()) {
+                    ++heldCount;
+                    selection = QStringLiteral("held");
+                }
+            }
+        }
         playbackFrameSelectionTrace(QStringLiteral("PreviewWindow::renderCompositedPreviewGL.select"),
                                     clip,
                                     localFrame,
@@ -1375,9 +1470,30 @@ void PreviewWindow::renderCompositedPreviewGL(const QRect& compositeRect,
                                     frame,
                                     m_currentFramePosition);
         if (frame.isNull()) {
+            ++nullCount;
+            selection = QStringLiteral("null");
             waitingForFrame = true;
+            clipSelections.append(QJsonObject{
+                {QStringLiteral("id"), clip.id},
+                {QStringLiteral("label"), clip.label},
+                {QStringLiteral("media_type"), clipMediaTypeLabel(clip.mediaType)},
+                {QStringLiteral("source_kind"), mediaSourceKindLabel(clip.sourceKind)},
+                {QStringLiteral("playback_pipeline"), usePlaybackPipeline},
+                {QStringLiteral("local_frame"), static_cast<qint64>(localFrame)},
+                {QStringLiteral("selection"), selection}
+            });
             continue;
         }
+        clipSelections.append(QJsonObject{
+            {QStringLiteral("id"), clip.id},
+            {QStringLiteral("label"), clip.label},
+            {QStringLiteral("media_type"), clipMediaTypeLabel(clip.mediaType)},
+            {QStringLiteral("source_kind"), mediaSourceKindLabel(clip.sourceKind)},
+            {QStringLiteral("playback_pipeline"), usePlaybackPipeline},
+            {QStringLiteral("local_frame"), static_cast<qint64>(localFrame)},
+            {QStringLiteral("frame_number"), static_cast<qint64>(frame.frameNumber())},
+            {QStringLiteral("selection"), selection}
+        });
 
         const QRectF bounds = renderFrameLayerGL(compositeRect, clip, frame);
         if (!bounds.isEmpty()) {
@@ -1402,6 +1518,17 @@ void PreviewWindow::renderCompositedPreviewGL(const QRect& compositeRect,
         }
         drewAnyFrame = true;
     }
+    m_lastFrameSelectionStats = QJsonObject{
+        {QStringLiteral("path"), QStringLiteral("gl")},
+        {QStringLiteral("active_visual_clips"), activeClips.size()},
+        {QStringLiteral("use_playback_pipeline_clips"), usedPlaybackPipelineCount},
+        {QStringLiteral("presentation"), presentationCount},
+        {QStringLiteral("exact"), exactCount},
+        {QStringLiteral("best"), bestCount},
+        {QStringLiteral("held"), heldCount},
+        {QStringLiteral("null"), nullCount},
+        {QStringLiteral("clips"), clipSelections}
+    };
 }
 
 void PreviewWindow::drawCompositedPreviewOverlay(QPainter* painter,
@@ -1560,10 +1687,7 @@ void PreviewWindow::requestFramesForCurrentPosition() {
 
     for (const TimelineClip* clip : activeClips) {
         const int64_t localFrame = sourceFrameForSample(*clip, m_currentSample);
-        const bool usePlaybackPipeline =
-            m_playing &&
-            m_playbackPipeline &&
-            clip->mediaType != ClipMediaType::Image;
+        const bool usePlaybackPipeline = false;
         const bool usePlaybackBuffer =
             m_playing &&
             !usePlaybackPipeline &&
@@ -1652,29 +1776,75 @@ void PreviewWindow::drawCompositedPreview(QPainter* painter, const QRect& safeRe
     painter->fillRect(compositeRect, Qt::black);
     bool drewAnyFrame = false;
     bool waitingForFrame = false;
+    int usedPlaybackPipelineCount = 0;
+    int presentationCount = 0;
+    int exactCount = 0;
+    int bestCount = 0;
+    int heldCount = 0;
+    int nullCount = 0;
+    QJsonArray clipSelections;
 
     for (const TimelineClip& clip : activeClips) {
         const int64_t localFrame = sourceFrameForSample(clip, m_currentSample);
-        const bool usePlaybackPipeline =
-            m_playing &&
-            m_playbackPipeline &&
-            clip.mediaType != ClipMediaType::Image;
+        const bool usePlaybackPipeline = false;
         const bool usePlaybackBuffer =
             m_playing &&
             !usePlaybackPipeline &&
             m_cache;
+        QString selection = QStringLiteral("none");
         const FrameHandle exactFrame = usePlaybackPipeline
                                            ? m_playbackPipeline->getFrame(clip.id, localFrame)
                                            : (usePlaybackBuffer
                                                   ? m_cache->getPlaybackFrame(clip.id, localFrame)
                                                   : (m_cache ? m_cache->getCachedFrame(clip.id, localFrame) : FrameHandle()));
-        const FrameHandle frame = usePlaybackPipeline
-                                      ? m_playbackPipeline->getPresentationFrame(clip.id, localFrame)
-                                      : (exactFrame.isNull() && m_cache
-                                             ? (usePlaybackBuffer
-                                                    ? m_cache->getBestPlaybackFrame(clip.id, localFrame)
-                                                    : m_cache->getBestCachedFrame(clip.id, localFrame))
-                                             : exactFrame);
+        FrameHandle frame;
+        if (usePlaybackPipeline) {
+            ++usedPlaybackPipelineCount;
+            frame = m_playbackPipeline->getPresentationFrame(clip.id, localFrame);
+            if (!frame.isNull()) {
+                ++presentationCount;
+                selection = QStringLiteral("presentation");
+            }
+        } else {
+            frame = exactFrame.isNull() && m_cache
+                        ? (usePlaybackBuffer
+                               ? m_cache->getBestPlaybackFrame(clip.id, localFrame)
+                               : m_cache->getBestCachedFrame(clip.id, localFrame))
+                        : exactFrame;
+            if (!frame.isNull()) {
+                if (!exactFrame.isNull() && frame == exactFrame) {
+                    ++exactCount;
+                    selection = QStringLiteral("exact");
+                } else {
+                    ++bestCount;
+                    selection = QStringLiteral("best");
+                }
+            }
+        }
+        if (usePlaybackPipeline && frame.isNull()) {
+            frame = !exactFrame.isNull() ? exactFrame
+                                         : m_playbackPipeline->getBestFrame(clip.id, localFrame);
+            if (!frame.isNull()) {
+                if (!exactFrame.isNull() && frame == exactFrame) {
+                    ++exactCount;
+                    selection = QStringLiteral("exact");
+                } else {
+                    ++bestCount;
+                    selection = QStringLiteral("best");
+                }
+            }
+        }
+        if (usePlaybackPipeline) {
+            if (!frame.isNull()) {
+                m_lastPresentedFrames.insert(clip.id, frame);
+            } else {
+                frame = m_lastPresentedFrames.value(clip.id);
+                if (!frame.isNull()) {
+                    ++heldCount;
+                    selection = QStringLiteral("held");
+                }
+            }
+        }
         playbackFrameSelectionTrace(QStringLiteral("PreviewWindow::drawCompositedPreview.select"),
                                     clip,
                                     localFrame,
@@ -1682,12 +1852,45 @@ void PreviewWindow::drawCompositedPreview(QPainter* painter, const QRect& safeRe
                                     frame,
                                     m_currentFramePosition);
         if (frame.isNull()) {
+            ++nullCount;
+            selection = QStringLiteral("null");
             waitingForFrame = true;
+            clipSelections.append(QJsonObject{
+                {QStringLiteral("id"), clip.id},
+                {QStringLiteral("label"), clip.label},
+                {QStringLiteral("media_type"), clipMediaTypeLabel(clip.mediaType)},
+                {QStringLiteral("source_kind"), mediaSourceKindLabel(clip.sourceKind)},
+                {QStringLiteral("playback_pipeline"), usePlaybackPipeline},
+                {QStringLiteral("local_frame"), static_cast<qint64>(localFrame)},
+                {QStringLiteral("selection"), selection}
+            });
             continue;
         }
+        clipSelections.append(QJsonObject{
+            {QStringLiteral("id"), clip.id},
+            {QStringLiteral("label"), clip.label},
+            {QStringLiteral("media_type"), clipMediaTypeLabel(clip.mediaType)},
+            {QStringLiteral("source_kind"), mediaSourceKindLabel(clip.sourceKind)},
+            {QStringLiteral("playback_pipeline"), usePlaybackPipeline},
+            {QStringLiteral("local_frame"), static_cast<qint64>(localFrame)},
+            {QStringLiteral("frame_number"), static_cast<qint64>(frame.frameNumber())},
+            {QStringLiteral("selection"), selection}
+        });
         drawFrameLayer(painter, compositeRect, clip, frame);
         drewAnyFrame = true;
     }
+
+    m_lastFrameSelectionStats = QJsonObject{
+        {QStringLiteral("path"), QStringLiteral("cpu")},
+        {QStringLiteral("active_visual_clips"), activeClips.size()},
+        {QStringLiteral("use_playback_pipeline_clips"), usedPlaybackPipelineCount},
+        {QStringLiteral("presentation"), presentationCount},
+        {QStringLiteral("exact"), exactCount},
+        {QStringLiteral("best"), bestCount},
+        {QStringLiteral("held"), heldCount},
+        {QStringLiteral("null"), nullCount},
+        {QStringLiteral("clips"), clipSelections}
+    };
 
     if (!drewAnyFrame) {
         const TimelineClip& primaryClip = activeClips.constFirst();

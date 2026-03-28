@@ -14,6 +14,12 @@ enum class DebugLogLevel : int {
     Verbose = 4,
 };
 
+enum class DecodePreference : int {
+    Auto = 0,
+    Hardware = 1,
+    Software = 2,
+};
+
 DebugLogLevel debugPlaybackLevel();
 DebugLogLevel debugCacheLevel();
 DebugLogLevel debugDecodeLevel();
@@ -39,6 +45,7 @@ int debugPrefetchMaxPerTick();
 int debugPrefetchSkipVisiblePendingThreshold();
 int debugVisibleQueueReserve();
 int debugPlaybackWindowAhead();
+DecodePreference debugDecodePreference();
 
 void setDebugPlaybackEnabled(bool enabled);
 void setDebugCacheEnabled(bool enabled);
@@ -54,6 +61,7 @@ void setDebugPrefetchMaxPerTick(int perTick);
 void setDebugPrefetchSkipVisiblePendingThreshold(int threshold);
 void setDebugVisibleQueueReserve(int reserve);
 void setDebugPlaybackWindowAhead(int ahead);
+void setDebugDecodePreference(DecodePreference preference);
 
 QJsonObject debugControlsSnapshot();
 bool setDebugControl(const QString& name, bool enabled);
@@ -61,5 +69,7 @@ bool setDebugControlLevel(const QString& name, DebugLogLevel level);
 bool setDebugOption(const QString& name, const QJsonValue& value);
 QString debugLogLevelToString(DebugLogLevel level);
 bool parseDebugLogLevel(const QString& text, DebugLogLevel* levelOut);
+QString decodePreferenceToString(DecodePreference preference);
+bool parseDecodePreference(const QString& text, DecodePreference* preferenceOut);
 
 } // namespace editor

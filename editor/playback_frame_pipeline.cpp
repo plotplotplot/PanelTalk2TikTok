@@ -13,6 +13,8 @@ namespace editor {
 namespace {
 constexpr int64_t kVisibleDecodeKeepWindow = 8;
 constexpr int64_t kObsoleteVisibleFrameSlack = 2;
+constexpr int64_t kMaxPresentationPastFrameDelta = 6;
+constexpr int64_t kMaxPresentationFutureFrameDelta = 1;
 
 qint64 playbackPipelineTraceMs() {
     static QElapsedTimer timer;
@@ -107,7 +109,7 @@ FrameHandle PlaybackFramePipeline::PlaybackBuffer::getPresentation(int64_t frame
         }
 
         const qint64 futureDistance = it.key() - frameNumber;
-        if (futureDistance > 1) {
+        if (futureDistance > kMaxPresentationFutureFrameDelta) {
             continue;
         }
         if (futureDistance < bestFutureDistance) {
@@ -116,7 +118,8 @@ FrameHandle PlaybackFramePipeline::PlaybackBuffer::getPresentation(int64_t frame
         }
     }
 
-    if (bestPast != m_frames.end()) {
+    if (bestPast != m_frames.end() &&
+        (frameNumber - bestPastFrame) <= kMaxPresentationPastFrameDelta) {
         return bestPast.value().frame;
     }
     return bestFuture == m_frames.end() ? FrameHandle() : bestFuture.value().frame;
@@ -306,16 +309,9 @@ void PlaybackFramePipeline::onFrameReady(FrameHandle frame) {
         return;
     }
 
-    QMutexLocker lock(&m_clipsMutex);
-    for (auto it = m_clips.cbegin(); it != m_clips.cend(); ++it) {
-        if (it.value().playbackPath != sourcePath || it.value().isSingleFrame) {
-            continue;
-        }
-        auto bufferIt = m_buffers.find(it.key());
-        if (bufferIt != m_buffers.end() && bufferIt.value()) {
-            bufferIt.value()->insert(normalizeFrameNumber(it.value(), frame.frameNumber()), frame);
-        }
-    }
+    // Request-specific callbacks own insertion into playback buffers.
+    // Avoid globally inserting every decoded frame for a matching file path,
+    // which pollutes the presentation buffer with obsolete completions.
     emit frameAvailable();
 }
 
@@ -417,7 +413,12 @@ void PlaybackFramePipeline::schedulePlaybackWindow(const ClipInfo& info,
                                                 self->m_pendingPrefetchRequests.remove(key);
                                             }
                                         }
-                                        if (!frame.isNull()) {
+                                        const int64_t playheadFrame = self->m_playheadFrame.load();
+                                        const bool obsoleteForPresentation =
+                                            !frame.isNull() &&
+                                            targetFrame < qMax<int64_t>(0, playheadFrame - kObsoleteVisibleFrameSlack);
+
+                                        if (!frame.isNull() && !obsoleteForPresentation) {
                                             QMutexLocker lock(&self->m_clipsMutex);
                                             auto it = self->m_buffers.find(clipId);
                                             if (it != self->m_buffers.end() && it.value()) {
@@ -427,16 +428,20 @@ void PlaybackFramePipeline::schedulePlaybackWindow(const ClipInfo& info,
 
                                         if (debugCacheWarnOnlyEnabled() &&
                                             kind == DecodeRequestKind::Visible &&
-                                            (frame.isNull() || playbackPipelineTraceMs() - requestedAt > 33)) {
+                                            (frame.isNull() ||
+                                             obsoleteForPresentation ||
+                                             playbackPipelineTraceMs() - requestedAt > 33)) {
                                             qDebug().noquote() << QStringLiteral("[CACHE][WARN] %1 PlaybackFramePipeline::visible-complete | clip=%2 frame=%3 null=%4 waitMs=%5")
                                                                       .arg(playbackPipelineTraceMs(), 6)
                                                                       .arg(clipId)
                                                                       .arg(targetFrame)
-                                                                      .arg(frame.isNull() ? 1 : 0)
+                                                                      .arg(frame.isNull() || obsoleteForPresentation ? 1 : 0)
                                                                       .arg(playbackPipelineTraceMs() - requestedAt);
                                         }
 
-                                        if (onFrameReady && (!frame.isNull() || kind == DecodeRequestKind::Visible)) {
+                                        if (onFrameReady &&
+                                            ((!frame.isNull() && !obsoleteForPresentation) ||
+                                             kind == DecodeRequestKind::Visible)) {
                                             onFrameReady();
                                         }
                                     }, Qt::QueuedConnection);
