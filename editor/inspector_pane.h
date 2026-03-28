@@ -81,6 +81,7 @@ public:
     QLabel *clipPlaybackSourceLabel() const { return m_clipPlaybackSourceLabel; }
     QLabel *clipOriginalInfoLabel() const { return m_clipOriginalInfoLabel; }
     QLabel *clipProxyInfoLabel() const { return m_clipProxyInfoLabel; }
+    QDoubleSpinBox *clipPlaybackRateSpin() const { return m_clipPlaybackRateSpin; }
     QTableWidget *profileSummaryTable() const { return m_profileSummaryTable; }
     QPushButton *profileBenchmarkButton() const { return m_profileBenchmarkButton; }
 
@@ -161,6 +162,7 @@ private:
     QLabel *m_clipPlaybackSourceLabel = nullptr;
     QLabel *m_clipOriginalInfoLabel = nullptr;
     QLabel *m_clipProxyInfoLabel = nullptr;
+    QDoubleSpinBox *m_clipPlaybackRateSpin = nullptr;
     QTableWidget *m_profileSummaryTable = nullptr;
     QPushButton *m_profileBenchmarkButton = nullptr;
     QCheckBox *m_transcriptOverlayEnabledCheckBox = nullptr;

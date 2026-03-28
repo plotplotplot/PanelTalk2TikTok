@@ -385,12 +385,18 @@ QWidget *InspectorPane::buildClipTab()
 {
     auto *page = new QWidget;
     auto *layout = new QVBoxLayout(page);
+    auto *form = new QFormLayout;
 
     m_clipInspectorClipLabel = new QLabel(QStringLiteral("No clip selected"), page);
     m_clipProxyUsageLabel = new QLabel(QStringLiteral("Playback Source: None"), page);
     m_clipPlaybackSourceLabel = new QLabel(QStringLiteral("Proxy In Use: No"), page);
     m_clipOriginalInfoLabel = new QLabel(QStringLiteral("Original\nNo clip selected."), page);
     m_clipProxyInfoLabel = new QLabel(QStringLiteral("Proxy\nNo proxy configured."), page);
+    m_clipPlaybackRateSpin = new QDoubleSpinBox(page);
+    m_clipPlaybackRateSpin->setDecimals(3);
+    m_clipPlaybackRateSpin->setRange(0.001, 4.0);
+    m_clipPlaybackRateSpin->setSingleStep(0.001);
+    m_clipPlaybackRateSpin->setValue(1.0);
     auto *audioSectionLabel = new QLabel(QStringLiteral("Audio"), page);
     audioSectionLabel->setStyleSheet(QStringLiteral("font-weight: 600; color: #8fa3b8;"));
     m_audioInspectorClipLabel = new QLabel(QStringLiteral("No audio clip selected"), page);
@@ -407,6 +413,8 @@ QWidget *InspectorPane::buildClipTab()
     layout->addWidget(m_clipInspectorClipLabel);
     layout->addWidget(m_clipProxyUsageLabel);
     layout->addWidget(m_clipPlaybackSourceLabel);
+    form->addRow(QStringLiteral("Playback Speed"), m_clipPlaybackRateSpin);
+    layout->addLayout(form);
     layout->addWidget(m_clipOriginalInfoLabel);
     layout->addWidget(m_clipProxyInfoLabel);
     layout->addWidget(audioSectionLabel);

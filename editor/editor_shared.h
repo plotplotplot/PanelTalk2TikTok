@@ -70,6 +70,7 @@ struct TimelineClip {
     int64_t startSubframeSamples = 0;
     int64_t durationFrames = 90;
     int trackIndex = 0;
+    qreal playbackRate = 1.0;
     QColor color;
     qreal brightness = 0.0;
     qreal contrast = 1.0;

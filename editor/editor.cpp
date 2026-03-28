@@ -85,6 +85,7 @@ EditorWindow::EditorWindow(quint16 controlPort)
     m_clipPlaybackSourceLabel = m_inspectorPane->clipPlaybackSourceLabel();
     m_clipOriginalInfoLabel = m_inspectorPane->clipOriginalInfoLabel();
     m_clipProxyInfoLabel = m_inspectorPane->clipProxyInfoLabel();
+    m_clipPlaybackRateSpin = m_inspectorPane->clipPlaybackRateSpin();
     m_transcriptOverlayEnabledCheckBox = m_inspectorPane->transcriptOverlayEnabledCheckBox();
     m_transcriptMaxLinesSpin = m_inspectorPane->transcriptMaxLinesSpin();
     m_transcriptMaxCharsSpin = m_inspectorPane->transcriptMaxCharsSpin();
@@ -271,6 +272,31 @@ EditorWindow::EditorWindow(quint16 controlPort)
     connect(m_speechFilterFadeSamplesSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this, refreshSpeechFilterRouting](int value) {
         m_speechFilterFadeSamples = qMax(0, value);
         refreshSpeechFilterRouting(true);
+    });
+    connect(m_clipPlaybackRateSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        if (!m_timeline || !m_clipPlaybackRateSpin) {
+            return;
+        }
+        const TimelineClip *clip = m_timeline->selectedClip();
+        if (!clip || !clipHasVisuals(*clip)) {
+            return;
+        }
+        const qreal playbackRate = qBound<qreal>(0.001, value, 4.0);
+        if (qFuzzyCompare(clip->playbackRate, playbackRate)) {
+            return;
+        }
+        if (!m_timeline->updateClipById(clip->id, [playbackRate](TimelineClip &editableClip) {
+                editableClip.playbackRate = playbackRate;
+                normalizeClipTiming(editableClip);
+            })) {
+            return;
+        }
+        if (m_preview) {
+            m_preview->setTimelineClips(m_timeline->clips());
+        }
+        m_inspectorPane->refresh();
+        scheduleSaveState();
+        pushHistorySnapshot();
     });
 
     // Instantiate and wire up tab modules
@@ -1584,6 +1610,11 @@ void EditorWindow::refreshClipInspector()
         m_clipPlaybackSourceLabel->setText(QStringLiteral("Playback Source: None"));
         m_clipOriginalInfoLabel->setText(QStringLiteral("Original\nNo clip selected."));
         m_clipProxyInfoLabel->setText(QStringLiteral("Proxy\nNo proxy configured."));
+        if (m_clipPlaybackRateSpin) {
+            QSignalBlocker block(m_clipPlaybackRateSpin);
+            m_clipPlaybackRateSpin->setValue(1.0);
+            m_clipPlaybackRateSpin->setEnabled(false);
+        }
         return;
     }
 
@@ -1606,6 +1637,15 @@ void EditorWindow::refreshClipInspector()
         .arg(playbackPath != clip->filePath ? QStringLiteral("Yes") : QStringLiteral("No")));
     m_clipPlaybackSourceLabel->setText(QStringLiteral("Playback Source\n%1")
         .arg(QDir::toNativeSeparators(playbackPath)));
+    if (m_clipPlaybackRateSpin) {
+        QSignalBlocker block(m_clipPlaybackRateSpin);
+        m_clipPlaybackRateSpin->setValue(clip->playbackRate);
+        m_clipPlaybackRateSpin->setEnabled(clipHasVisuals(*clip));
+        m_clipPlaybackRateSpin->setToolTip(
+            clip->hasAudio
+                ? QStringLiteral("Visual retime control. Audio playback is not time-stretched.")
+                : QStringLiteral("Playback speed multiplier for this clip."));
+    }
     m_clipOriginalInfoLabel->setText(QStringLiteral("Original\n%1")
         .arg(clipFileInfoSummary(clip->filePath, &originalProbe)));
     

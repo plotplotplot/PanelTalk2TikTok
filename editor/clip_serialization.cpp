@@ -24,6 +24,7 @@ QJsonObject clipToJson(const TimelineClip &clip)
         obj[QStringLiteral("startSubframeSamples")] = static_cast<qint64>(clip.startSubframeSamples);
         obj[QStringLiteral("durationFrames")] = static_cast<qint64>(clip.durationFrames);
         obj[QStringLiteral("trackIndex")] = clip.trackIndex;
+        obj[QStringLiteral("playbackRate")] = clip.playbackRate;
         obj[QStringLiteral("color")] = clip.color.name(QColor::HexArgb);
         obj[QStringLiteral("brightness")] = clip.brightness;
         obj[QStringLiteral("contrast")] = clip.contrast;
@@ -99,6 +100,7 @@ TimelineClip clipFromJson(const QJsonObject &obj)
         clip.startSubframeSamples = obj.value(QStringLiteral("startSubframeSamples")).toVariant().toLongLong();
         clip.durationFrames = obj.value(QStringLiteral("durationFrames")).toVariant().toLongLong();
         clip.trackIndex = obj.value(QStringLiteral("trackIndex")).toInt(-1);
+        clip.playbackRate = obj.value(QStringLiteral("playbackRate")).toDouble(1.0);
         if (clip.durationFrames == 0)
             clip.durationFrames = 120;
         if (clip.mediaType == ClipMediaType::Unknown && !clip.filePath.isEmpty())

@@ -192,6 +192,7 @@ private:
     QLabel *m_clipPlaybackSourceLabel = nullptr;
     QLabel *m_clipOriginalInfoLabel = nullptr;
     QLabel *m_clipProxyInfoLabel = nullptr;
+    QDoubleSpinBox *m_clipPlaybackRateSpin = nullptr;
     QTableWidget *m_profileSummaryTable = nullptr;
     QPushButton *m_profileBenchmarkButton = nullptr;
 

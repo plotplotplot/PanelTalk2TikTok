@@ -1670,10 +1670,29 @@ void PreviewWindow::renderCompositedPreviewGL(const QRect& compositeRect,
     int bestCount = 0;
     int heldCount = 0;
     int nullCount = 0;
+    int skippedZeroOpacityCount = 0;
     QJsonArray clipSelections;
     for (const TimelineClip& clip : activeClips) {
         if (!clipHasVisuals(clip)) {
             continue;
+        }
+        if (!m_bypassGrading) {
+            const TimelineClip::GradingKeyframe grade =
+                evaluateClipGradingAtPosition(clip, m_currentFramePosition);
+            if (grade.opacity <= 0.0001) {
+                ++skippedZeroOpacityCount;
+                clipSelections.append(QJsonObject{
+                    {QStringLiteral("id"), clip.id},
+                    {QStringLiteral("label"), clip.label},
+                    {QStringLiteral("media_type"), clipMediaTypeLabel(clip.mediaType)},
+                    {QStringLiteral("source_kind"), mediaSourceKindLabel(clip.sourceKind)},
+                    {QStringLiteral("playback_pipeline"), false},
+                    {QStringLiteral("local_frame"), static_cast<qint64>(sourceFrameForSample(clip, m_currentSample))},
+                    {QStringLiteral("selection"), QStringLiteral("skipped_zero_opacity")},
+                    {QStringLiteral("frame_storage"), QStringLiteral("none")}
+                });
+                continue;
+            }
         }
         const int64_t localFrame = sourceFrameForSample(clip, m_currentSample);
         const bool usePlaybackPipeline = false;
@@ -1798,6 +1817,7 @@ void PreviewWindow::renderCompositedPreviewGL(const QRect& compositeRect,
         {QStringLiteral("best"), bestCount},
         {QStringLiteral("held"), heldCount},
         {QStringLiteral("null"), nullCount},
+        {QStringLiteral("skipped_zero_opacity"), skippedZeroOpacityCount},
         {QStringLiteral("clips"), clipSelections}
     };
 }
@@ -1926,6 +1946,17 @@ void PreviewWindow::requestFramesForCurrentPosition() {
             continue;
         }
         if (isSampleWithinClip(clip, m_currentSample)) {
+            if (!m_bypassGrading) {
+                const TimelineClip::GradingKeyframe grade =
+                    evaluateClipGradingAtPosition(clip, m_currentFramePosition);
+                if (grade.opacity <= 0.0001) {
+                    playbackTrace(QStringLiteral("PreviewWindow::requestFramesForCurrentPosition.skip"),
+                                  QStringLiteral("reason=zero-opacity clip=%1 frame=%2")
+                                      .arg(clip.id)
+                                      .arg(m_currentFramePosition, 0, 'f', 3));
+                    continue;
+                }
+            }
             activeClips.push_back(&clip);
         }
     }

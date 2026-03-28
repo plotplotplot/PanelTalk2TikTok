@@ -244,6 +244,7 @@ void normalizeSubframeTiming(int64_t& frame, int64_t& subframeSamples) {
 void normalizeClipTiming(TimelineClip& clip) {
     normalizeSubframeTiming(clip.startFrame, clip.startSubframeSamples);
     normalizeSubframeTiming(clip.sourceInFrame, clip.sourceInSubframeSamples);
+    clip.playbackRate = qBound<qreal>(0.001, clip.playbackRate, 1000.0);
 }
 
 QString transformInterpolationLabel(bool linearInterpolation) {
@@ -556,9 +557,11 @@ int64_t sourceFrameForClipAtTimelinePosition(const TimelineClip& clip,
         qMax<int64_t>(0, static_cast<int64_t>(std::floor(localTimelineFramePosition)));
     const int64_t adjustedLocalFrame =
         adjustedClipLocalFrameAtTimelineFrame(clip, steppedLocalTimelineFrame, markers);
+    const qreal sourceFrameOffset =
+        std::floor(static_cast<qreal>(adjustedLocalFrame) * qMax<qreal>(0.001, clip.playbackRate));
     return qMax<int64_t>(0,
                          qMin<int64_t>(qMax<int64_t>(0, clip.sourceDurationFrames - 1),
-                                       clip.sourceInFrame + adjustedLocalFrame));
+                                       clip.sourceInFrame + static_cast<int64_t>(sourceFrameOffset)));
 }
 
 MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames) {

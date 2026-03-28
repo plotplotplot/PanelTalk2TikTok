@@ -159,12 +159,15 @@ bool TimelineWidget::splitSelectedClipAtFrame(int64_t frame) {
         if (leftDuration <= 0 || rightDuration <= 0) {
             return false;
         }
+        const qreal playbackRate = qBound<qreal>(0.001, clip.playbackRate, 4.0);
+        const int64_t consumedSourceFrames =
+            static_cast<int64_t>(std::floor(static_cast<qreal>(leftDuration) * playbackRate));
 
         const bool isImage = clip.mediaType == ClipMediaType::Image;
         TimelineClip rightClip = clip;
         rightClip.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
         rightClip.startFrame = frame;
-        rightClip.sourceInFrame = isImage ? 0 : (clip.sourceInFrame + leftDuration);
+        rightClip.sourceInFrame = isImage ? 0 : (clip.sourceInFrame + consumedSourceFrames);
         rightClip.startSubframeSamples = 0;
         rightClip.sourceInSubframeSamples = 0;
         rightClip.durationFrames = rightDuration;
@@ -1329,7 +1332,10 @@ void TimelineWidget::mouseMoveEvent(QMouseEvent* event) {
                 clip.sourceDurationFrames = clip.durationFrames;
                 clip.transformKeyframes = m_dragOriginalTransformKeyframes;
             } else {
-                clip.sourceInFrame = m_dragOriginalSourceInFrame + trimDelta;
+                const qreal playbackRate = qBound<qreal>(0.001, clip.playbackRate, 4.0);
+                const int64_t consumedSourceFrames =
+                    static_cast<int64_t>(std::floor(static_cast<qreal>(trimDelta) * playbackRate));
+                clip.sourceInFrame = m_dragOriginalSourceInFrame + consumedSourceFrames;
                 clip.durationFrames = m_dragOriginalDurationFrames - trimDelta;
                 clip.transformKeyframes.clear();
                 for (const TimelineClip::TransformKeyframe& keyframe : m_dragOriginalTransformKeyframes) {
@@ -1349,7 +1355,9 @@ void TimelineWidget::mouseMoveEvent(QMouseEvent* event) {
                 ? std::numeric_limits<int64_t>::max()
                 : m_dragOriginalStartFrame +
                       qMax<int64_t>(kMinClipFrames,
-                                    mediaDurationFrames(QFileInfo(clip.filePath)) - m_dragOriginalSourceInFrame);
+                                    static_cast<int64_t>(std::ceil(
+                                        static_cast<qreal>(mediaDurationFrames(QFileInfo(clip.filePath)) - m_dragOriginalSourceInFrame) /
+                                        qBound<qreal>(0.001, clip.playbackRate, 4.0))));
             bool snapped = false;
             int64_t snappedBoundaryFrame = -1;
             const int64_t boundedPointerFrame = isImage
