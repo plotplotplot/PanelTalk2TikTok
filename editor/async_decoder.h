@@ -17,6 +17,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -95,6 +96,7 @@ public:
     // Decode specific frame (blocking)
     FrameHandle decodeFrame(int64_t frameNumber);
     QVector<FrameHandle> decodeThroughFrame(int64_t targetFrame);
+    bool supportsSequenceBatchDecode() const { return m_isImageSequence && m_sequenceUsesWebp; }
     
     // Precise seek then decode
     FrameHandle seekAndDecode(int64_t frameNumber);
@@ -116,6 +118,9 @@ private:
     bool seekToKeyframe(int64_t targetFrame);
     bool loadStillImage();
     bool loadImageSequence();
+    QImage loadCachedSequenceFrameImage(int64_t frameNumber);
+    void cacheSequenceFrameImage(int64_t frameNumber, const QImage& image);
+    void trimSequenceFrameCache();
     QVector<FrameHandle> decodeForwardUntil(int64_t targetFrame, bool forceSeek);
     FrameHandle convertToFrame(AVFrame* avFrame, int64_t frameNumber);
     QImage convertAVFrameToImage(AVFrame* frame);
@@ -139,8 +144,13 @@ private:
     bool m_reportedAlphaMismatch = false;
     bool m_isStillImage = false;
     bool m_isImageSequence = false;
+    bool m_sequenceUsesWebp = false;
     QImage m_stillImage;
     QStringList m_sequenceFramePaths;
+    QHash<int64_t, QImage> m_sequenceFrameCache;
+    QHash<int64_t, quint64> m_sequenceFrameCacheUseOrder;
+    size_t m_sequenceFrameCacheBytes = 0;
+    quint64 m_sequenceFrameUseCounter = 0;
     SwsContext* m_swsCtx = nullptr;
     AVFrame* m_convertFrame = nullptr;
     int m_swsSourceFormat = -1;
@@ -208,8 +218,9 @@ private:
     void setupTrimCallback();
     void trimCaches();
     int totalPendingRequests() const;
-    int laneIndexForPath(const QString& path) const;
-    LaneState* laneForPath(const QString& path) const;
+    int laneIndexForRequest(const QString& path, int64_t frameNumber) const;
+    LaneState* laneForRequest(const QString& path, int64_t frameNumber) const;
+    std::vector<LaneState*> lanesForPath(const QString& path) const;
     void startLane(LaneState* lane);
     void stopLane(LaneState* lane);
     void runLane(LaneState* lane);

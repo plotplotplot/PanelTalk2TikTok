@@ -12,13 +12,13 @@ constexpr DebugLogLevel kDefaultPlaybackLevel = DebugLogLevel::Off;
 constexpr DebugLogLevel kDefaultCacheLevel = DebugLogLevel::Off;
 constexpr DebugLogLevel kDefaultDecodeLevel = DebugLogLevel::Off;
 constexpr bool kDefaultLeadPrefetchEnabled = true;
-constexpr int kDefaultLeadPrefetchCount = 4;
-constexpr int kDefaultPrefetchMaxQueueDepth = 12;
-constexpr int kDefaultPrefetchMaxInflight = 4;
-constexpr int kDefaultPrefetchMaxPerTick = 4;
+constexpr int kDefaultLeadPrefetchCount = 8;
+constexpr int kDefaultPrefetchMaxQueueDepth = 24;
+constexpr int kDefaultPrefetchMaxInflight = 8;
+constexpr int kDefaultPrefetchMaxPerTick = 8;
 constexpr int kDefaultPrefetchSkipVisiblePendingThreshold = 2;
-constexpr int kDefaultVisibleQueueReserve = 12;
-constexpr int kDefaultPlaybackWindowAhead = 8;
+constexpr int kDefaultVisibleQueueReserve = 24;
+constexpr int kDefaultPlaybackWindowAhead = 16;
 constexpr DecodePreference kDefaultDecodePreference = DecodePreference::Auto;
 
 bool envFlagEnabled(const char* name) {

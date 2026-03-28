@@ -66,6 +66,7 @@ public:
     void upsertKeyframeAtPlayhead();
     void removeSelectedKeyframes();
     void duplicateSelectedKeyframes(int frameDelta);
+    void duplicateSelectedKeyframesToFrame(int64_t targetFrame);
     bool insertInterpolatedKeyframeBetween(int64_t earlierFrame, int64_t laterFrame);
     void syncTableToPlayhead();
     void setSelectedKeyframeFrame(int64_t frame);

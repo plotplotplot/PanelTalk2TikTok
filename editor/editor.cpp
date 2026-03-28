@@ -12,12 +12,16 @@
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QKeyEvent>
+#include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QProcess>
+#include <QProgressBar>
 #include <QProgressDialog>
+#include <QGridLayout>
+#include <QPixmap>
 #include <QSaveFile>
 #include <QShortcut>
 #include <QSignalBlocker>
@@ -86,6 +90,15 @@ EditorWindow::EditorWindow(quint16 controlPort)
     m_clipOriginalInfoLabel = m_inspectorPane->clipOriginalInfoLabel();
     m_clipProxyInfoLabel = m_inspectorPane->clipProxyInfoLabel();
     m_clipPlaybackRateSpin = m_inspectorPane->clipPlaybackRateSpin();
+    m_trackInspectorLabel = m_inspectorPane->trackInspectorLabel();
+    m_trackInspectorDetailsLabel = m_inspectorPane->trackInspectorDetailsLabel();
+    m_trackNameEdit = m_inspectorPane->trackNameEdit();
+    m_trackHeightSpin = m_inspectorPane->trackHeightSpin();
+    m_trackVideoEnabledCheckBox = m_inspectorPane->trackVideoEnabledCheckBox();
+    m_trackAudioEnabledCheckBox = m_inspectorPane->trackAudioEnabledCheckBox();
+    m_trackCrossfadeSecondsSpin = m_inspectorPane->trackCrossfadeSecondsSpin();
+    m_trackCrossfadeButton = m_inspectorPane->trackCrossfadeButton();
+    m_previewHideOutsideOutputCheckBox = m_inspectorPane->previewHideOutsideOutputCheckBox();
     m_transcriptOverlayEnabledCheckBox = m_inspectorPane->transcriptOverlayEnabledCheckBox();
     m_transcriptMaxLinesSpin = m_inspectorPane->transcriptMaxLinesSpin();
     m_transcriptMaxCharsSpin = m_inspectorPane->transcriptMaxCharsSpin();
@@ -298,6 +311,87 @@ EditorWindow::EditorWindow(quint16 controlPort)
         scheduleSaveState();
         pushHistorySnapshot();
     });
+    connect(m_trackNameEdit, &QLineEdit::editingFinished, this, [this]() {
+        if (!m_timeline || !m_trackNameEdit) {
+            return;
+        }
+        const int trackIndex = m_timeline->selectedTrackIndex();
+        const TimelineTrack* track = m_timeline->selectedTrack();
+        if (trackIndex < 0 || !track) {
+            return;
+        }
+        const QString nextName = m_trackNameEdit->text().trimmed().isEmpty()
+                                     ? QStringLiteral("Track %1").arg(trackIndex + 1)
+                                     : m_trackNameEdit->text().trimmed();
+        if (track->name == nextName) {
+            return;
+        }
+        if (!m_timeline->updateTrackByIndex(trackIndex, [nextName](TimelineTrack& editableTrack) {
+                editableTrack.name = nextName;
+            })) {
+            return;
+        }
+        refreshClipInspector();
+    });
+    connect(m_trackHeightSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+        if (!m_timeline || !m_trackHeightSpin) {
+            return;
+        }
+        const int trackIndex = m_timeline->selectedTrackIndex();
+        const TimelineTrack* track = m_timeline->selectedTrack();
+        if (trackIndex < 0 || !track || track->height == value) {
+            return;
+        }
+        if (!m_timeline->updateTrackByIndex(trackIndex, [value](TimelineTrack& editableTrack) {
+                editableTrack.height = value;
+            })) {
+            return;
+        }
+        refreshClipInspector();
+    });
+    connect(m_trackVideoEnabledCheckBox, &QCheckBox::toggled, this, [this](bool checked) {
+        if (!m_timeline || !m_trackVideoEnabledCheckBox) {
+            return;
+        }
+        const int trackIndex = m_timeline->selectedTrackIndex();
+        if (trackIndex < 0) {
+            return;
+        }
+        if (m_timeline->updateTrackVisualEnabled(trackIndex, checked)) {
+            refreshClipInspector();
+        }
+    });
+    connect(m_trackAudioEnabledCheckBox, &QCheckBox::toggled, this, [this](bool checked) {
+        if (!m_timeline || !m_trackAudioEnabledCheckBox) {
+            return;
+        }
+        const int trackIndex = m_timeline->selectedTrackIndex();
+        if (trackIndex < 0) {
+            return;
+        }
+        if (m_timeline->updateTrackAudioEnabled(trackIndex, checked)) {
+            refreshClipInspector();
+        }
+    });
+    connect(m_trackCrossfadeButton, &QPushButton::clicked, this, [this]() {
+        if (!m_timeline || !m_trackCrossfadeButton || !m_trackCrossfadeSecondsSpin) {
+            return;
+        }
+        const int trackIndex = m_timeline->selectedTrackIndex();
+        if (trackIndex < 0) {
+            return;
+        }
+        if (m_timeline->crossfadeTrack(trackIndex, m_trackCrossfadeSecondsSpin->value())) {
+            refreshClipInspector();
+        }
+    });
+    connect(m_previewHideOutsideOutputCheckBox, &QCheckBox::toggled, this, [this](bool checked) {
+        if (m_preview) {
+            m_preview->setHideOutsideOutputWindow(checked);
+        }
+        scheduleSaveState();
+        pushHistorySnapshot();
+    });
 
     // Instantiate and wire up tab modules
     m_outputTab = std::make_unique<OutputTab>(
@@ -318,6 +412,11 @@ EditorWindow::EditorWindow(quint16 controlPort)
             [this]() { return m_timeline ? m_timeline->clips() : QVector<TimelineClip>{}; },
             [this]() { return m_timeline ? m_timeline->renderSyncMarkers() : QVector<RenderSyncMarker>{}; },
             [this](const RenderRequest& request) { renderTimelineFromOutputRequest(request); },
+            [this]() { return m_lastRenderOutputPath; },
+            [this](const QString& path) {
+                m_lastRenderOutputPath = path;
+                scheduleSaveState();
+            },
             [this]() { scheduleSaveState(); },
             [this]() { pushHistorySnapshot(); }});
     m_outputTab->wire();
@@ -1277,7 +1376,9 @@ void EditorWindow::applyStateJson(const QJsonObject &root)
     const int outputWidth = qMax(16, root.value(QStringLiteral("outputWidth")).toInt(1080));
     const int outputHeight = qMax(16, root.value(QStringLiteral("outputHeight")).toInt(1920));
     const QString outputFormat = root.value(QStringLiteral("outputFormat")).toString(QStringLiteral("mp4"));
+    const QString lastRenderOutputPath = root.value(QStringLiteral("lastRenderOutputPath")).toString();
     const bool renderUseProxies = root.value(QStringLiteral("renderUseProxies")).toBool(false);
+    const bool previewHideOutsideOutput = root.value(QStringLiteral("previewHideOutsideOutput")).toBool(false);
     const bool speechFilterEnabled = root.value(QStringLiteral("speechFilterEnabled")).toBool(false);
     const int transcriptPrependMs = root.value(QStringLiteral("transcriptPrependMs")).toInt(0);
     const int transcriptPostpendMs = root.value(QStringLiteral("transcriptPostpendMs")).toInt(0);
@@ -1366,9 +1467,14 @@ void EditorWindow::applyStateJson(const QJsonObject &root)
         const int formatIndex = m_outputFormatCombo->findData(outputFormat);
         if (formatIndex >= 0) m_outputFormatCombo->setCurrentIndex(formatIndex);
     }
+    m_lastRenderOutputPath = lastRenderOutputPath;
     if (m_renderUseProxiesCheckBox) {
         QSignalBlocker block(m_renderUseProxiesCheckBox);
         m_renderUseProxiesCheckBox->setChecked(renderUseProxies);
+    }
+    if (m_previewHideOutsideOutputCheckBox) {
+        QSignalBlocker block(m_previewHideOutsideOutputCheckBox);
+        m_previewHideOutsideOutputCheckBox->setChecked(previewHideOutsideOutput);
     }
     if (m_speechFilterEnabledCheckBox) { QSignalBlocker block(m_speechFilterEnabledCheckBox); m_speechFilterEnabledCheckBox->setChecked(speechFilterEnabled); }
     
@@ -1393,6 +1499,7 @@ void EditorWindow::applyStateJson(const QJsonObject &root)
     
     if (m_preview) {
         m_preview->setOutputSize(QSize(outputWidth, outputHeight));
+        m_preview->setHideOutsideOutputWindow(previewHideOutsideOutput);
     }
 
     m_timeline->setTracks(loadedTracks);
@@ -1604,8 +1711,40 @@ void EditorWindow::refreshSyncInspector()
 void EditorWindow::refreshClipInspector()
 {
     const TimelineClip *clip = m_timeline ? m_timeline->selectedClip() : nullptr;
+    const TimelineTrack *track = m_timeline ? m_timeline->selectedTrack() : nullptr;
+    const int selectedTrackIndex = m_timeline ? m_timeline->selectedTrackIndex() : -1;
+
+    auto disableTrackControls = [this]() {
+        if (m_trackNameEdit) {
+            QSignalBlocker blocker(m_trackNameEdit);
+            m_trackNameEdit->setText(QString());
+            m_trackNameEdit->setEnabled(false);
+        }
+        if (m_trackHeightSpin) {
+            QSignalBlocker blocker(m_trackHeightSpin);
+            m_trackHeightSpin->setValue(44);
+            m_trackHeightSpin->setEnabled(false);
+        }
+        if (m_trackVideoEnabledCheckBox) {
+            QSignalBlocker blocker(m_trackVideoEnabledCheckBox);
+            m_trackVideoEnabledCheckBox->setChecked(false);
+            m_trackVideoEnabledCheckBox->setEnabled(false);
+        }
+        if (m_trackAudioEnabledCheckBox) {
+            QSignalBlocker blocker(m_trackAudioEnabledCheckBox);
+            m_trackAudioEnabledCheckBox->setChecked(false);
+            m_trackAudioEnabledCheckBox->setEnabled(false);
+        }
+        if (m_trackCrossfadeSecondsSpin) {
+            m_trackCrossfadeSecondsSpin->setEnabled(false);
+        }
+        if (m_trackCrossfadeButton) {
+            m_trackCrossfadeButton->setEnabled(false);
+        }
+    };
+
     if (!clip) {
-        m_clipInspectorClipLabel->setText(QStringLiteral("No clip selected"));
+        m_clipInspectorClipLabel->setText(track ? QStringLiteral("No clip selected") : QStringLiteral("No clip or track selected"));
         m_clipProxyUsageLabel->setText(QStringLiteral("Proxy In Use: No"));
         m_clipPlaybackSourceLabel->setText(QStringLiteral("Playback Source: None"));
         m_clipOriginalInfoLabel->setText(QStringLiteral("Original\nNo clip selected."));
@@ -1615,49 +1754,117 @@ void EditorWindow::refreshClipInspector()
             m_clipPlaybackRateSpin->setValue(1.0);
             m_clipPlaybackRateSpin->setEnabled(false);
         }
+    } else {
+        const QString proxyPath = playbackProxyPathForClip(*clip);
+        const QString playbackPath = playbackMediaPathForClip(*clip);
+        
+        MediaProbeResult originalProbe;
+        originalProbe.mediaType = clip->mediaType;
+        originalProbe.sourceKind = clip->sourceKind;
+        originalProbe.hasAudio = clip->hasAudio;
+        originalProbe.hasVideo = clipHasVisuals(*clip);
+        originalProbe.durationFrames = clip->sourceDurationFrames > 0 ? clip->sourceDurationFrames : clip->durationFrames;
+        
+        m_clipInspectorClipLabel->setText(QStringLiteral("%1\n%2")
+            .arg(clip->label,
+                 QStringLiteral("%1 | %2")
+                     .arg(clipMediaTypeLabel(clip->mediaType),
+                          mediaSourceKindLabel(clip->sourceKind))));
+        m_clipProxyUsageLabel->setText(QStringLiteral("Proxy In Use: %1")
+            .arg(playbackPath != clip->filePath ? QStringLiteral("Yes") : QStringLiteral("No")));
+        m_clipPlaybackSourceLabel->setText(QStringLiteral("Playback Source\n%1")
+            .arg(QDir::toNativeSeparators(playbackPath)));
+        if (m_clipPlaybackRateSpin) {
+            QSignalBlocker block(m_clipPlaybackRateSpin);
+            m_clipPlaybackRateSpin->setValue(clip->playbackRate);
+            m_clipPlaybackRateSpin->setEnabled(clipHasVisuals(*clip));
+            m_clipPlaybackRateSpin->setToolTip(
+                clip->hasAudio
+                    ? QStringLiteral("Visual retime control. Audio playback is not time-stretched.")
+                    : QStringLiteral("Playback speed multiplier for this clip."));
+        }
+        m_clipOriginalInfoLabel->setText(QStringLiteral("Original\n%1")
+            .arg(clipFileInfoSummary(clip->filePath, &originalProbe)));
+        
+        if (proxyPath.isEmpty()) {
+            const QString configuredProxyPath = clip->proxyPath.isEmpty()
+                ? defaultProxyOutputPath(*clip)
+                : clip->proxyPath;
+            m_clipProxyInfoLabel->setText(QStringLiteral("Proxy\nConfigured: No\nPath: %1")
+                .arg(QDir::toNativeSeparators(configuredProxyPath)));
+        } else {
+            m_clipProxyInfoLabel->setText(QStringLiteral("Proxy\n%1")
+                .arg(clipFileInfoSummary(proxyPath)));
+        }
+    }
+
+    if (!track || selectedTrackIndex < 0 || clip) {
+        if (m_trackInspectorLabel) {
+            m_trackInspectorLabel->setText(QStringLiteral("No track selected"));
+        }
+        if (m_trackInspectorDetailsLabel) {
+            m_trackInspectorDetailsLabel->setText(QStringLiteral("Select a track header to edit track-wide properties."));
+        }
+        disableTrackControls();
         return;
     }
 
-    const QString proxyPath = playbackProxyPathForClip(*clip);
-    const QString playbackPath = playbackMediaPathForClip(*clip);
-    
-    MediaProbeResult originalProbe;
-    originalProbe.mediaType = clip->mediaType;
-    originalProbe.sourceKind = clip->sourceKind;
-    originalProbe.hasAudio = clip->hasAudio;
-    originalProbe.hasVideo = clipHasVisuals(*clip);
-    originalProbe.durationFrames = clip->sourceDurationFrames > 0 ? clip->sourceDurationFrames : clip->durationFrames;
-    
-    m_clipInspectorClipLabel->setText(QStringLiteral("%1\n%2")
-        .arg(clip->label,
-             QStringLiteral("%1 | %2")
-                 .arg(clipMediaTypeLabel(clip->mediaType),
-                      mediaSourceKindLabel(clip->sourceKind))));
-    m_clipProxyUsageLabel->setText(QStringLiteral("Proxy In Use: %1")
-        .arg(playbackPath != clip->filePath ? QStringLiteral("Yes") : QStringLiteral("No")));
-    m_clipPlaybackSourceLabel->setText(QStringLiteral("Playback Source\n%1")
-        .arg(QDir::toNativeSeparators(playbackPath)));
-    if (m_clipPlaybackRateSpin) {
-        QSignalBlocker block(m_clipPlaybackRateSpin);
-        m_clipPlaybackRateSpin->setValue(clip->playbackRate);
-        m_clipPlaybackRateSpin->setEnabled(clipHasVisuals(*clip));
-        m_clipPlaybackRateSpin->setToolTip(
-            clip->hasAudio
-                ? QStringLiteral("Visual retime control. Audio playback is not time-stretched.")
-                : QStringLiteral("Playback speed multiplier for this clip."));
+    int clipCount = 0;
+    int visualCount = 0;
+    int audioCount = 0;
+    bool allVisualEnabled = true;
+    bool allAudioEnabled = true;
+    for (const TimelineClip& timelineClip : m_timeline->clips()) {
+        if (timelineClip.trackIndex != selectedTrackIndex) {
+            continue;
+        }
+        ++clipCount;
+        if (clipHasVisuals(timelineClip)) {
+            ++visualCount;
+            allVisualEnabled = allVisualEnabled && timelineClip.videoEnabled;
+        }
+        if (timelineClip.hasAudio) {
+            ++audioCount;
+            allAudioEnabled = allAudioEnabled && timelineClip.audioEnabled;
+        }
     }
-    m_clipOriginalInfoLabel->setText(QStringLiteral("Original\n%1")
-        .arg(clipFileInfoSummary(clip->filePath, &originalProbe)));
-    
-    if (proxyPath.isEmpty()) {
-        const QString configuredProxyPath = clip->proxyPath.isEmpty()
-            ? defaultProxyOutputPath(*clip)
-            : clip->proxyPath;
-        m_clipProxyInfoLabel->setText(QStringLiteral("Proxy\nConfigured: No\nPath: %1")
-            .arg(QDir::toNativeSeparators(configuredProxyPath)));
-    } else {
-        m_clipProxyInfoLabel->setText(QStringLiteral("Proxy\n%1")
-            .arg(clipFileInfoSummary(proxyPath)));
+
+    if (m_trackInspectorLabel) {
+        m_trackInspectorLabel->setText(QStringLiteral("Track %1\n%2")
+                                           .arg(selectedTrackIndex + 1)
+                                           .arg(track->name));
+    }
+    if (m_trackInspectorDetailsLabel) {
+        m_trackInspectorDetailsLabel->setText(QStringLiteral("%1 clips | %2 visual | %3 audio")
+                                                  .arg(clipCount)
+                                                  .arg(visualCount)
+                                                  .arg(audioCount));
+    }
+    if (m_trackNameEdit) {
+        QSignalBlocker blocker(m_trackNameEdit);
+        m_trackNameEdit->setText(track->name);
+        m_trackNameEdit->setEnabled(true);
+    }
+    if (m_trackHeightSpin) {
+        QSignalBlocker blocker(m_trackHeightSpin);
+        m_trackHeightSpin->setValue(track->height);
+        m_trackHeightSpin->setEnabled(true);
+    }
+    if (m_trackVideoEnabledCheckBox) {
+        QSignalBlocker blocker(m_trackVideoEnabledCheckBox);
+        m_trackVideoEnabledCheckBox->setChecked(visualCount > 0 ? allVisualEnabled : false);
+        m_trackVideoEnabledCheckBox->setEnabled(visualCount > 0);
+    }
+    if (m_trackAudioEnabledCheckBox) {
+        QSignalBlocker blocker(m_trackAudioEnabledCheckBox);
+        m_trackAudioEnabledCheckBox->setChecked(audioCount > 0 ? allAudioEnabled : false);
+        m_trackAudioEnabledCheckBox->setEnabled(audioCount > 0);
+    }
+    if (m_trackCrossfadeSecondsSpin) {
+        m_trackCrossfadeSecondsSpin->setEnabled(clipCount > 1);
+    }
+    if (m_trackCrossfadeButton) {
+        m_trackCrossfadeButton->setEnabled(clipCount > 1);
     }
 }
 
@@ -1707,22 +1914,56 @@ void EditorWindow::renderTimelineFromOutputRequest(const RenderRequest &request)
         totalFramesToRender = qMax<int64_t>(1, effectiveRequest.exportEndFrame - effectiveRequest.exportStartFrame + 1);
     }
 
-    QProgressDialog progressDialog(QStringLiteral("Preparing render..."),
-                                   QStringLiteral("Cancel"),
-                                   0,
-                                   static_cast<int>(qMin<int64_t>(totalFramesToRender, std::numeric_limits<int>::max())),
-                                   this);
+    QDialog progressDialog(this);
     progressDialog.setWindowTitle(QStringLiteral("Render Export"));
     progressDialog.setWindowModality(Qt::ApplicationModal);
-    progressDialog.setAutoClose(false);
-    progressDialog.setAutoReset(false);
-    progressDialog.setMinimumWidth(460);
+    progressDialog.setMinimumWidth(560);
     progressDialog.setStyleSheet(QStringLiteral(
-        "QProgressDialog { background: #f6f3ee; }"
+        "QDialog { background: #f6f3ee; }"
         "QLabel { color: #1f2430; font-size: 13px; }"
         "QProgressBar { border: 1px solid #c9c2b8; border-radius: 6px; text-align: center; background: #ffffff; min-height: 20px; }"
         "QProgressBar::chunk { background: #2f7d67; border-radius: 5px; }"
         "QPushButton { min-width: 96px; padding: 6px 14px; }"));
+    auto *progressLayout = new QVBoxLayout(&progressDialog);
+    progressLayout->setContentsMargins(16, 16, 16, 16);
+    progressLayout->setSpacing(10);
+
+    auto *renderStatusLabel = new QLabel(QStringLiteral("Preparing render..."), &progressDialog);
+    renderStatusLabel->setWordWrap(true);
+    renderStatusLabel->setAlignment(Qt::AlignCenter);
+    progressLayout->addWidget(renderStatusLabel);
+
+    auto *showRenderPreviewCheckBox = new QCheckBox(QStringLiteral("Show Visual Preview"), &progressDialog);
+    showRenderPreviewCheckBox->setChecked(true);
+    progressLayout->addWidget(showRenderPreviewCheckBox, 0, Qt::AlignLeft);
+
+    auto *renderPreviewLabel = new QLabel(&progressDialog);
+    renderPreviewLabel->setAlignment(Qt::AlignCenter);
+    renderPreviewLabel->setMinimumSize(360, 202);
+    renderPreviewLabel->setStyleSheet(QStringLiteral(
+        "QLabel { background: #11151c; color: #d9e1ea; border: 1px solid #c9c2b8; border-radius: 6px; }"));
+    renderPreviewLabel->setText(QStringLiteral("Waiting for first rendered frame..."));
+    progressLayout->addWidget(renderPreviewLabel);
+
+    auto *renderProgressBar = new QProgressBar(&progressDialog);
+    renderProgressBar->setRange(0, static_cast<int>(qMin<int64_t>(totalFramesToRender, std::numeric_limits<int>::max())));
+    renderProgressBar->setValue(0);
+    progressLayout->addWidget(renderProgressBar);
+
+    auto *buttonRow = new QHBoxLayout;
+    buttonRow->addStretch(1);
+    auto *cancelRenderButton = new QPushButton(QStringLiteral("Cancel"), &progressDialog);
+    buttonRow->addWidget(cancelRenderButton);
+    progressLayout->addLayout(buttonRow);
+
+    bool renderCancelled = false;
+    QObject::connect(cancelRenderButton, &QPushButton::clicked, &progressDialog, [&renderCancelled, cancelRenderButton]() {
+        renderCancelled = true;
+        cancelRenderButton->setEnabled(false);
+    });
+    QObject::connect(showRenderPreviewCheckBox, &QCheckBox::toggled, &progressDialog, [renderPreviewLabel](bool checked) {
+        renderPreviewLabel->setVisible(checked);
+    });
     progressDialog.show();
 
     const QString outputPath = effectiveRequest.outputPath;
@@ -1780,12 +2021,29 @@ void EditorWindow::renderTimelineFromOutputRequest(const RenderRequest &request)
             {QStringLiteral("eta_text"), formatEta(progress.estimatedRemainingMs)},
             {QStringLiteral("fps"), fps},
             {QStringLiteral("render_stage_ms"), progress.renderStageMs},
+            {QStringLiteral("render_decode_stage_ms"), progress.renderDecodeStageMs},
+            {QStringLiteral("render_texture_stage_ms"), progress.renderTextureStageMs},
+            {QStringLiteral("render_composite_stage_ms"), progress.renderCompositeStageMs},
+            {QStringLiteral("render_nv12_stage_ms"), progress.renderNv12StageMs},
             {QStringLiteral("gpu_readback_ms"), progress.gpuReadbackMs},
             {QStringLiteral("overlay_stage_ms"), progress.overlayStageMs},
             {QStringLiteral("convert_stage_ms"), progress.convertStageMs},
             {QStringLiteral("encode_stage_ms"), progress.encodeStageMs},
             {QStringLiteral("audio_stage_ms"), progress.audioStageMs},
+            {QStringLiteral("max_frame_render_stage_ms"), progress.maxFrameRenderStageMs},
+            {QStringLiteral("max_frame_decode_stage_ms"), progress.maxFrameDecodeStageMs},
+            {QStringLiteral("max_frame_texture_stage_ms"), progress.maxFrameTextureStageMs},
+            {QStringLiteral("max_frame_readback_stage_ms"), progress.maxFrameReadbackStageMs},
+            {QStringLiteral("max_frame_convert_stage_ms"), progress.maxFrameConvertStageMs},
+            {QStringLiteral("skipped_clips"), progress.skippedClips},
+            {QStringLiteral("skipped_clip_reason_counts"), progress.skippedClipReasonCounts},
+            {QStringLiteral("render_stage_table"), progress.renderStageTable},
+            {QStringLiteral("worst_frame_table"), progress.worstFrameTable},
             {QStringLiteral("render_stage_per_frame_ms"), static_cast<double>(progress.renderStageMs) / static_cast<double>(completedFrames)},
+            {QStringLiteral("render_decode_stage_per_frame_ms"), static_cast<double>(progress.renderDecodeStageMs) / static_cast<double>(completedFrames)},
+            {QStringLiteral("render_texture_stage_per_frame_ms"), static_cast<double>(progress.renderTextureStageMs) / static_cast<double>(completedFrames)},
+            {QStringLiteral("render_composite_stage_per_frame_ms"), static_cast<double>(progress.renderCompositeStageMs) / static_cast<double>(completedFrames)},
+            {QStringLiteral("render_nv12_stage_per_frame_ms"), static_cast<double>(progress.renderNv12StageMs) / static_cast<double>(completedFrames)},
             {QStringLiteral("gpu_readback_per_frame_ms"), static_cast<double>(progress.gpuReadbackMs) / static_cast<double>(completedFrames)},
             {QStringLiteral("overlay_stage_per_frame_ms"), static_cast<double>(progress.overlayStageMs) / static_cast<double>(completedFrames)},
             {QStringLiteral("convert_stage_per_frame_ms"), static_cast<double>(progress.convertStageMs) / static_cast<double>(completedFrames)},
@@ -1816,12 +2074,29 @@ void EditorWindow::renderTimelineFromOutputRequest(const RenderRequest &request)
             {QStringLiteral("eta_text"), formatEta(0)},
             {QStringLiteral("fps"), fps},
             {QStringLiteral("render_stage_ms"), result.renderStageMs},
+            {QStringLiteral("render_decode_stage_ms"), result.renderDecodeStageMs},
+            {QStringLiteral("render_texture_stage_ms"), result.renderTextureStageMs},
+            {QStringLiteral("render_composite_stage_ms"), result.renderCompositeStageMs},
+            {QStringLiteral("render_nv12_stage_ms"), result.renderNv12StageMs},
             {QStringLiteral("gpu_readback_ms"), result.gpuReadbackMs},
             {QStringLiteral("overlay_stage_ms"), result.overlayStageMs},
             {QStringLiteral("convert_stage_ms"), result.convertStageMs},
             {QStringLiteral("encode_stage_ms"), result.encodeStageMs},
             {QStringLiteral("audio_stage_ms"), result.audioStageMs},
+            {QStringLiteral("max_frame_render_stage_ms"), result.maxFrameRenderStageMs},
+            {QStringLiteral("max_frame_decode_stage_ms"), result.maxFrameDecodeStageMs},
+            {QStringLiteral("max_frame_texture_stage_ms"), result.maxFrameTextureStageMs},
+            {QStringLiteral("max_frame_readback_stage_ms"), result.maxFrameReadbackStageMs},
+            {QStringLiteral("max_frame_convert_stage_ms"), result.maxFrameConvertStageMs},
+            {QStringLiteral("skipped_clips"), result.skippedClips},
+            {QStringLiteral("skipped_clip_reason_counts"), result.skippedClipReasonCounts},
+            {QStringLiteral("render_stage_table"), result.renderStageTable},
+            {QStringLiteral("worst_frame_table"), result.worstFrameTable},
             {QStringLiteral("render_stage_per_frame_ms"), static_cast<double>(result.renderStageMs) / static_cast<double>(completedFrames)},
+            {QStringLiteral("render_decode_stage_per_frame_ms"), static_cast<double>(result.renderDecodeStageMs) / static_cast<double>(completedFrames)},
+            {QStringLiteral("render_texture_stage_per_frame_ms"), static_cast<double>(result.renderTextureStageMs) / static_cast<double>(completedFrames)},
+            {QStringLiteral("render_composite_stage_per_frame_ms"), static_cast<double>(result.renderCompositeStageMs) / static_cast<double>(completedFrames)},
+            {QStringLiteral("render_nv12_stage_per_frame_ms"), static_cast<double>(result.renderNv12StageMs) / static_cast<double>(completedFrames)},
             {QStringLiteral("gpu_readback_per_frame_ms"), static_cast<double>(result.gpuReadbackMs) / static_cast<double>(completedFrames)},
             {QStringLiteral("overlay_stage_per_frame_ms"), static_cast<double>(result.overlayStageMs) / static_cast<double>(completedFrames)},
             {QStringLiteral("convert_stage_per_frame_ms"), static_cast<double>(result.convertStageMs) / static_cast<double>(completedFrames)},
@@ -1838,10 +2113,10 @@ void EditorWindow::renderTimelineFromOutputRequest(const RenderRequest &request)
 
         const RenderResult result = renderTimelineToFile(
         effectiveRequest,
-            [this, &progressDialog, formatEta, stageSummary, renderProfileFromProgress, outputPath](const RenderProgress &progress)
+            [this, &progressDialog, renderStatusLabel, renderProgressBar, renderPreviewLabel, showRenderPreviewCheckBox, &renderCancelled, formatEta, stageSummary, renderProfileFromProgress, outputPath](const RenderProgress &progress)
         {
-            progressDialog.setMaximum(qMax(1, static_cast<int>(qMin<int64_t>(progress.totalFrames, std::numeric_limits<int>::max()))));
-            progressDialog.setValue(static_cast<int>(qMin<int64_t>(progress.framesCompleted, std::numeric_limits<int>::max())));
+            renderProgressBar->setMaximum(qMax(1, static_cast<int>(qMin<int64_t>(progress.totalFrames, std::numeric_limits<int>::max()))));
+            renderProgressBar->setValue(static_cast<int>(qMin<int64_t>(progress.framesCompleted, std::numeric_limits<int>::max())));
             const QString rendererMode = progress.usingGpu ? QStringLiteral("GPU render") : QStringLiteral("CPU render");
             const QString encoderMode = progress.usingHardwareEncode
                                             ? QStringLiteral("Hardware encode")
@@ -1852,12 +2127,37 @@ void EditorWindow::renderTimelineFromOutputRequest(const RenderRequest &request)
             m_liveRenderProfile = renderProfileFromProgress(progress);
             m_liveRenderProfile[QStringLiteral("output_path")] = QDir::toNativeSeparators(outputPath);
             refreshProfileInspector();
-            progressDialog.setLabelText(
+            const QString metricsTable = QStringLiteral(
+                "<table cellspacing='0' cellpadding='2' style='margin: 0 auto;'>"
+                "<tr>"
+                "<td align='right'><b>Render</b></td><td>%1</td>"
+                "<td align='right'><b>Decode</b></td><td>%2</td>"
+                "<td align='right'><b>Texture</b></td><td>%3</td>"
+                "</tr>"
+                "<tr>"
+                "<td align='right'><b>Composite</b></td><td>%4</td>"
+                "<td align='right'><b>GPU NV12</b></td><td>%5</td>"
+                "<td align='right'><b>Readback</b></td><td>%6</td>"
+                "</tr>"
+                "<tr>"
+                "<td align='right'><b>Convert</b></td><td>%7</td>"
+                "<td align='right'><b>Encode</b></td><td>%8</td>"
+                "<td></td><td></td>"
+                "</tr>"
+                "</table>")
+                .arg(stageSummary(progress.renderStageMs, progress.framesCompleted))
+                .arg(stageSummary(progress.renderDecodeStageMs, progress.framesCompleted))
+                .arg(stageSummary(progress.renderTextureStageMs, progress.framesCompleted))
+                .arg(stageSummary(progress.renderCompositeStageMs, progress.framesCompleted))
+                .arg(stageSummary(progress.renderNv12StageMs, progress.framesCompleted))
+                .arg(stageSummary(progress.gpuReadbackMs, progress.framesCompleted))
+                .arg(stageSummary(progress.convertStageMs, progress.framesCompleted))
+                .arg(stageSummary(progress.encodeStageMs, progress.framesCompleted));
+            renderStatusLabel->setText(
                 QStringLiteral("<b>Rendering frame %1 of %2</b><br>"
                                "Segment %3/%4: %5-%6<br>"
                                "%7 | %8 (%9)<br>"
-                               "ETA: %10<br>"
-                               "Render %11 | Readback %12 | Convert %13 | Encode %14")
+                               "ETA: %10<br>%11")
                     .arg(progress.framesCompleted + 1)
                     .arg(qMax<int64_t>(1, progress.totalFrames))
                     .arg(progress.segmentIndex)
@@ -1868,14 +2168,21 @@ void EditorWindow::renderTimelineFromOutputRequest(const RenderRequest &request)
                     .arg(encoderMode)
                     .arg(encoderLabel)
                     .arg(formatEta(progress.estimatedRemainingMs))
-                    .arg(stageSummary(progress.renderStageMs, progress.framesCompleted))
-                    .arg(stageSummary(progress.gpuReadbackMs, progress.framesCompleted))
-                    .arg(stageSummary(progress.convertStageMs, progress.framesCompleted))
-                    .arg(stageSummary(progress.encodeStageMs, progress.framesCompleted)));
+                    .arg(metricsTable));
+            if (showRenderPreviewCheckBox->isChecked() && !progress.previewFrame.isNull())
+            {
+                const QPixmap pixmap = QPixmap::fromImage(progress.previewFrame).scaled(
+                    renderPreviewLabel->size(),
+                    Qt::KeepAspectRatio,
+                    Qt::SmoothTransformation);
+                renderPreviewLabel->setPixmap(pixmap);
+                renderPreviewLabel->setText(QString());
+            }
             QCoreApplication::processEvents();
-            return !progressDialog.wasCanceled();
+            return !renderCancelled;
         });
-    progressDialog.setValue(progressDialog.maximum());
+    renderProgressBar->setValue(renderProgressBar->maximum());
+    progressDialog.close();
     m_renderInProgress = false;
     m_lastRenderProfile = renderProfileFromResult(result);
     m_liveRenderProfile = QJsonObject{};

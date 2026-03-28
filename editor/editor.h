@@ -26,6 +26,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QLineEdit>
 #include <QListWidget>
 #include <QMainWindow>
 #include <QPushButton>
@@ -193,6 +194,15 @@ private:
     QLabel *m_clipOriginalInfoLabel = nullptr;
     QLabel *m_clipProxyInfoLabel = nullptr;
     QDoubleSpinBox *m_clipPlaybackRateSpin = nullptr;
+    QLabel *m_trackInspectorLabel = nullptr;
+    QLabel *m_trackInspectorDetailsLabel = nullptr;
+    QLineEdit *m_trackNameEdit = nullptr;
+    QSpinBox *m_trackHeightSpin = nullptr;
+    QCheckBox *m_trackVideoEnabledCheckBox = nullptr;
+    QCheckBox *m_trackAudioEnabledCheckBox = nullptr;
+    QDoubleSpinBox *m_trackCrossfadeSecondsSpin = nullptr;
+    QPushButton *m_trackCrossfadeButton = nullptr;
+    QCheckBox *m_previewHideOutsideOutputCheckBox = nullptr;
     QTableWidget *m_profileSummaryTable = nullptr;
     QPushButton *m_profileBenchmarkButton = nullptr;
 
@@ -257,6 +267,7 @@ private:
     QPushButton *m_addVideoKeyframeButton = nullptr;
     QPushButton *m_removeVideoKeyframeButton = nullptr;
     QPushButton *m_renderButton = nullptr;
+    QString m_lastRenderOutputPath;
 
     std::unique_ptr<ControlServer> m_controlServer;
     std::unique_ptr<AudioEngine> m_audioEngine;

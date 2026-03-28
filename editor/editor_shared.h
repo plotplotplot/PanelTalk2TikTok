@@ -71,6 +71,8 @@ struct TimelineClip {
     int64_t durationFrames = 90;
     int trackIndex = 0;
     qreal playbackRate = 1.0;
+    bool videoEnabled = true;
+    bool audioEnabled = true;
     QColor color;
     qreal brightness = 0.0;
     qreal contrast = 1.0;
@@ -162,6 +164,8 @@ QString renderSyncActionLabel(RenderSyncAction action);
 
 bool clipHasVisuals(const TimelineClip& clip);
 bool clipIsAudioOnly(const TimelineClip& clip);
+bool clipVisualPlaybackEnabled(const TimelineClip& clip);
+bool clipAudioPlaybackEnabled(const TimelineClip& clip);
 
 int64_t frameToSamples(int64_t frame);
 qreal samplesToFramePosition(int64_t samples);

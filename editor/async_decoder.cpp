@@ -33,6 +33,10 @@ namespace editor {
 namespace {
 constexpr int64_t kMaxSequentialDecodeGap = 90;
 constexpr int64_t kPlaybackBatchFrameSlack = 2;
+constexpr size_t kMaxSequenceFrameCacheBytes = 192 * 1024 * 1024;
+constexpr int kMaxSequenceFrameCacheEntries = 24;
+constexpr int kWebpSequenceBatchAhead = 6;
+constexpr int64_t kImageSequenceLaneShardSize = 8;
 
 #if defined(__SANITIZE_ADDRESS__)
 constexpr bool kAsanBuild = true;
@@ -105,6 +109,9 @@ QImage loadSingleImageFile(const QString& framePath) {
     reader.setAutoTransform(true);
     QImage image = reader.read();
     if (!image.isNull()) {
+        if (image.format() != QImage::Format_ARGB32_Premultiplied) {
+            image = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        }
         return image;
     }
 
@@ -220,6 +227,9 @@ QImage loadSingleImageFile(const QString& framePath) {
     }
     avcodec_free_context(&codecCtx);
     avformat_close_input(&formatCtx);
+    if (!decodedImage.isNull() && decodedImage.format() != QImage::Format_ARGB32_Premultiplied) {
+        decodedImage = decodedImage.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    }
     return decodedImage;
 }
 
@@ -349,6 +359,11 @@ void DecoderContext::shutdown() {
     m_swsSourceFormat = AV_PIX_FMT_NONE;
     m_swsSourceSize = QSize();
     m_convertFrameSize = QSize();
+    m_sequenceFramePaths.clear();
+    m_sequenceFrameCache.clear();
+    m_sequenceFrameCacheUseOrder.clear();
+    m_sequenceFrameCacheBytes = 0;
+    m_sequenceFrameUseCounter = 0;
 }
 
 bool DecoderContext::initialize() {
@@ -436,10 +451,6 @@ bool DecoderContext::loadStillImage() {
         return false;
     }
 
-    if (image.format() != QImage::Format_ARGB32_Premultiplied) {
-        image = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
-    }
-
     m_isStillImage = true;
     m_stillImage = image;
     m_info.path = m_path;
@@ -465,13 +476,11 @@ bool DecoderContext::loadImageSequence() {
         qWarning() << "Failed to load first image sequence frame:" << m_path;
         return false;
     }
-    if (image.format() != QImage::Format_ARGB32_Premultiplied) {
-        image = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
-    }
-
     m_isImageSequence = true;
     m_sequenceFramePaths = framePaths;
+    m_sequenceUsesWebp = QFileInfo(framePaths.constFirst()).suffix().compare(QStringLiteral("webp"), Qt::CaseInsensitive) == 0;
     m_stillImage = image;
+    cacheSequenceFrameImage(0, image);
     m_info.path = m_path;
     m_info.durationFrames = framePaths.size();
     m_info.fps = 30.0;
@@ -482,6 +491,75 @@ bool DecoderContext::loadImageSequence() {
     m_lastDecodedFrame = 0;
     m_eof = false;
     return true;
+}
+
+QImage DecoderContext::loadCachedSequenceFrameImage(int64_t frameNumber) {
+    if (m_sequenceFramePaths.isEmpty()) {
+        return QImage();
+    }
+
+    const int64_t boundedFrame =
+        qBound<int64_t>(0, frameNumber, static_cast<int64_t>(m_sequenceFramePaths.size() - 1));
+    auto cached = m_sequenceFrameCache.find(boundedFrame);
+    if (cached != m_sequenceFrameCache.end()) {
+        m_sequenceFrameCacheUseOrder[boundedFrame] = ++m_sequenceFrameUseCounter;
+        return cached.value();
+    }
+
+    QImage image = loadSequenceFrameImage(m_sequenceFramePaths, boundedFrame);
+    if (image.isNull()) {
+        return QImage();
+    }
+
+    if (m_sequenceUsesWebp) {
+        cacheSequenceFrameImage(boundedFrame, image);
+    }
+    return image;
+}
+
+void DecoderContext::cacheSequenceFrameImage(int64_t frameNumber, const QImage& image) {
+    if (!m_sequenceUsesWebp || image.isNull()) {
+        return;
+    }
+
+    const size_t imageBytes = image.sizeInBytes();
+    if (imageBytes == 0 || imageBytes > kMaxSequenceFrameCacheBytes) {
+        return;
+    }
+
+    auto existing = m_sequenceFrameCache.find(frameNumber);
+    if (existing != m_sequenceFrameCache.end()) {
+        m_sequenceFrameCacheBytes -= existing.value().sizeInBytes();
+    }
+
+    m_sequenceFrameCache.insert(frameNumber, image);
+    m_sequenceFrameCacheUseOrder.insert(frameNumber, ++m_sequenceFrameUseCounter);
+    m_sequenceFrameCacheBytes += imageBytes;
+    trimSequenceFrameCache();
+}
+
+void DecoderContext::trimSequenceFrameCache() {
+    while (m_sequenceFrameCache.size() > kMaxSequenceFrameCacheEntries ||
+           m_sequenceFrameCacheBytes > kMaxSequenceFrameCacheBytes) {
+        int64_t oldestFrame = -1;
+        quint64 oldestUse = std::numeric_limits<quint64>::max();
+        for (auto it = m_sequenceFrameCacheUseOrder.cbegin(); it != m_sequenceFrameCacheUseOrder.cend(); ++it) {
+            if (it.value() < oldestUse) {
+                oldestUse = it.value();
+                oldestFrame = it.key();
+            }
+        }
+        if (oldestFrame < 0) {
+            break;
+        }
+
+        auto cacheIt = m_sequenceFrameCache.find(oldestFrame);
+        if (cacheIt != m_sequenceFrameCache.end()) {
+            m_sequenceFrameCacheBytes -= cacheIt.value().sizeInBytes();
+            m_sequenceFrameCache.erase(cacheIt);
+        }
+        m_sequenceFrameCacheUseOrder.remove(oldestFrame);
+    }
 }
 
 bool DecoderContext::initCodec() {
@@ -661,12 +739,9 @@ bool DecoderContext::initHardwareAccel(const AVCodec* decoder) {
 FrameHandle DecoderContext::decodeFrame(int64_t frameNumber) {
     if (m_isImageSequence) {
         updateAccessTime();
-        QImage image = loadSequenceFrameImage(m_sequenceFramePaths, frameNumber);
+        QImage image = loadCachedSequenceFrameImage(frameNumber);
         if (image.isNull()) {
             return FrameHandle();
-        }
-        if (image.format() != QImage::Format_ARGB32_Premultiplied) {
-            image = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
         }
         m_lastDecodedFrame = qBound<int64_t>(0, frameNumber, static_cast<int64_t>(m_sequenceFramePaths.size() - 1));
         return FrameHandle::createCpuFrame(image, m_lastDecodedFrame, m_path);
@@ -693,8 +768,24 @@ FrameHandle DecoderContext::decodeFrame(int64_t frameNumber) {
 
 QVector<FrameHandle> DecoderContext::decodeThroughFrame(int64_t targetFrame) {
     if (m_isImageSequence) {
-        FrameHandle frame = decodeFrame(targetFrame);
-        return frame.isNull() ? QVector<FrameHandle>() : QVector<FrameHandle>{frame};
+        updateAccessTime();
+        QVector<FrameHandle> frames;
+        const int64_t maxFrame =
+            static_cast<int64_t>(m_sequenceFramePaths.size() - 1);
+        const int64_t boundedTarget = qBound<int64_t>(0, targetFrame, maxFrame);
+        const int64_t endFrame = m_sequenceUsesWebp
+                                     ? qMin<int64_t>(maxFrame, boundedTarget + kWebpSequenceBatchAhead)
+                                     : boundedTarget;
+        frames.reserve(static_cast<int>(endFrame - boundedTarget + 1));
+        for (int64_t frameNumber = boundedTarget; frameNumber <= endFrame; ++frameNumber) {
+            QImage image = loadCachedSequenceFrameImage(frameNumber);
+            if (image.isNull()) {
+                continue;
+            }
+            frames.push_back(FrameHandle::createCpuFrame(image, frameNumber, m_path));
+        }
+        m_lastDecodedFrame = boundedTarget;
+        return frames;
     }
     if (m_isStillImage) {
         updateAccessTime();
@@ -1099,7 +1190,7 @@ uint64_t AsyncDecoder::requestFrame(const QString& path,
                                     int timeoutMs,
                                     DecodeRequestKind kind,
                                     std::function<void(FrameHandle)> callback) {
-    LaneState* lane = laneForPath(path);
+    LaneState* lane = laneForRequest(path, frameNumber);
     if (!lane || m_shuttingDown) {
         if (callback) {
             callback(FrameHandle());
@@ -1212,13 +1303,16 @@ uint64_t AsyncDecoder::requestFrame(const QString& path,
 }
 
 void AsyncDecoder::cancelForFile(const QString& path) {
-    LaneState* lane = laneForPath(path);
-    if (!lane) {
+    const std::vector<LaneState*> lanes = lanesForPath(path);
+    if (lanes.empty()) {
         return;
     }
 
     QVector<std::function<void(FrameHandle)>> callbacks;
-    {
+    for (LaneState* lane : lanes) {
+        if (!lane) {
+            continue;
+        }
         std::unique_lock<std::mutex> lock(lane->mutex);
         auto stateIt = lane->fileStates.find(path);
         if (stateIt == lane->fileStates.end()) {
@@ -1248,13 +1342,16 @@ void AsyncDecoder::cancelForFile(const QString& path) {
 }
 
 void AsyncDecoder::cancelForFileBefore(const QString& path, int64_t frameNumber) {
-    LaneState* lane = laneForPath(path);
-    if (!lane) {
+    const std::vector<LaneState*> lanes = lanesForPath(path);
+    if (lanes.empty()) {
         return;
     }
 
     QVector<std::function<void(FrameHandle)>> callbacks;
-    {
+    for (LaneState* lane : lanes) {
+        if (!lane) {
+            continue;
+        }
         std::unique_lock<std::mutex> lock(lane->mutex);
         auto stateIt = lane->fileStates.find(path);
         if (stateIt == lane->fileStates.end()) {
@@ -1352,19 +1449,45 @@ int AsyncDecoder::totalPendingRequests() const {
     return total;
 }
 
-int AsyncDecoder::laneIndexForPath(const QString& path) const {
+int AsyncDecoder::laneIndexForRequest(const QString& path, int64_t frameNumber) const {
     if (m_lanes.empty()) {
         return -1;
     }
-    return static_cast<int>(qHash(path) % static_cast<uint>(m_lanes.size()));
+    const uint laneCount = static_cast<uint>(m_lanes.size());
+    const uint baseHash = qHash(path);
+    if (!isImageSequencePath(path) || laneCount == 1) {
+        return static_cast<int>(baseHash % laneCount);
+    }
+
+    const int64_t shard = qMax<int64_t>(0, frameNumber) / kImageSequenceLaneShardSize;
+    return static_cast<int>((baseHash + static_cast<uint>(shard)) % laneCount);
 }
 
-AsyncDecoder::LaneState* AsyncDecoder::laneForPath(const QString& path) const {
-    const int index = laneIndexForPath(path);
+AsyncDecoder::LaneState* AsyncDecoder::laneForRequest(const QString& path, int64_t frameNumber) const {
+    const int index = laneIndexForRequest(path, frameNumber);
     if (index < 0 || index >= m_lanes.size()) {
         return nullptr;
     }
     return m_lanes[index].get();
+}
+
+std::vector<AsyncDecoder::LaneState*> AsyncDecoder::lanesForPath(const QString& path) const {
+    std::vector<LaneState*> lanes;
+    if (m_lanes.empty()) {
+        return lanes;
+    }
+    if (!isImageSequencePath(path)) {
+        if (LaneState* lane = laneForRequest(path, 0)) {
+            lanes.push_back(lane);
+        }
+        return lanes;
+    }
+
+    lanes.reserve(m_lanes.size());
+    for (const auto& lane : m_lanes) {
+        lanes.push_back(lane.get());
+    }
+    return lanes;
 }
 
 void AsyncDecoder::startLane(LaneState* lane) {
@@ -1428,6 +1551,7 @@ void AsyncDecoder::runLane(LaneState* lane) {
                         .arg(reinterpret_cast<quintptr>(QThread::currentThreadId()), 0, 16));
 
         FrameHandle frame;
+        QVector<FrameHandle> decodedFrames;
         QString errorMessage;
         const bool cancelled =
             request.generation != state->generation.load() ||
@@ -1442,7 +1566,21 @@ void AsyncDecoder::runLane(LaneState* lane) {
                 }
             }
             if (state->context) {
-                frame = state->context->decodeFrame(request.frameNumber);
+                if (state->context->supportsSequenceBatchDecode() &&
+                    request.kind != DecodeRequestKind::Preload) {
+                    decodedFrames = state->context->decodeThroughFrame(request.frameNumber);
+                    for (const FrameHandle& decodedFrame : decodedFrames) {
+                        if (!decodedFrame.isNull() && decodedFrame.frameNumber() == request.frameNumber) {
+                            frame = decodedFrame;
+                            break;
+                        }
+                    }
+                    if (frame.isNull() && !decodedFrames.isEmpty()) {
+                        frame = decodedFrames.constFirst();
+                    }
+                } else {
+                    frame = state->context->decodeFrame(request.frameNumber);
+                }
             }
         }
 
@@ -1454,8 +1592,14 @@ void AsyncDecoder::runLane(LaneState* lane) {
 
         invokeRequestCallback(std::move(request.callback), frame);
         QMetaObject::invokeMethod(this,
-                                  [this, frame, path = request.filePath, errorMessage]() {
-                                      emit frameReady(frame);
+                                  [this, frame, decodedFrames, path = request.filePath, errorMessage]() {
+                                      if (!decodedFrames.isEmpty()) {
+                                          for (const FrameHandle& decodedFrame : decodedFrames) {
+                                              emit frameReady(decodedFrame);
+                                          }
+                                      } else {
+                                          emit frameReady(frame);
+                                      }
                                       if (!errorMessage.isEmpty()) {
                                           emit error(path, errorMessage);
                                       }

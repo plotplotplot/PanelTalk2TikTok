@@ -210,6 +210,14 @@ bool clipIsAudioOnly(const TimelineClip& clip) {
     return clip.mediaType == ClipMediaType::Audio;
 }
 
+bool clipVisualPlaybackEnabled(const TimelineClip& clip) {
+    return clipHasVisuals(clip) && clip.videoEnabled;
+}
+
+bool clipAudioPlaybackEnabled(const TimelineClip& clip) {
+    return clip.hasAudio && clip.audioEnabled;
+}
+
 int64_t frameToSamples(int64_t frame) {
     return qMax<int64_t>(0, frame * kSamplesPerFrame);
 }

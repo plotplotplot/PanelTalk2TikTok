@@ -11,6 +11,7 @@ class QCheckBox;
 class QFontComboBox;
 class QTableWidget;
 class QPushButton;
+class QLineEdit;
 
 class InspectorPane final : public QWidget
 {
@@ -82,6 +83,15 @@ public:
     QLabel *clipOriginalInfoLabel() const { return m_clipOriginalInfoLabel; }
     QLabel *clipProxyInfoLabel() const { return m_clipProxyInfoLabel; }
     QDoubleSpinBox *clipPlaybackRateSpin() const { return m_clipPlaybackRateSpin; }
+    QLabel *trackInspectorLabel() const { return m_trackInspectorLabel; }
+    QLabel *trackInspectorDetailsLabel() const { return m_trackInspectorDetailsLabel; }
+    QLineEdit *trackNameEdit() const { return m_trackNameEdit; }
+    QSpinBox *trackHeightSpin() const { return m_trackHeightSpin; }
+    QCheckBox *trackVideoEnabledCheckBox() const { return m_trackVideoEnabledCheckBox; }
+    QCheckBox *trackAudioEnabledCheckBox() const { return m_trackAudioEnabledCheckBox; }
+    QDoubleSpinBox *trackCrossfadeSecondsSpin() const { return m_trackCrossfadeSecondsSpin; }
+    QPushButton *trackCrossfadeButton() const { return m_trackCrossfadeButton; }
+    QCheckBox *previewHideOutsideOutputCheckBox() const { return m_previewHideOutsideOutputCheckBox; }
     QTableWidget *profileSummaryTable() const { return m_profileSummaryTable; }
     QPushButton *profileBenchmarkButton() const { return m_profileBenchmarkButton; }
 
@@ -112,6 +122,7 @@ private:
     QWidget *buildTranscriptTab();
     QWidget *buildClipTab();
     QWidget *buildOutputTab();
+    QWidget *buildPreviewTab();
     QWidget *buildProfileTab();
 
 private:
@@ -163,6 +174,15 @@ private:
     QLabel *m_clipOriginalInfoLabel = nullptr;
     QLabel *m_clipProxyInfoLabel = nullptr;
     QDoubleSpinBox *m_clipPlaybackRateSpin = nullptr;
+    QLabel *m_trackInspectorLabel = nullptr;
+    QLabel *m_trackInspectorDetailsLabel = nullptr;
+    QLineEdit *m_trackNameEdit = nullptr;
+    QSpinBox *m_trackHeightSpin = nullptr;
+    QCheckBox *m_trackVideoEnabledCheckBox = nullptr;
+    QCheckBox *m_trackAudioEnabledCheckBox = nullptr;
+    QDoubleSpinBox *m_trackCrossfadeSecondsSpin = nullptr;
+    QPushButton *m_trackCrossfadeButton = nullptr;
+    QCheckBox *m_previewHideOutsideOutputCheckBox = nullptr;
     QTableWidget *m_profileSummaryTable = nullptr;
     QPushButton *m_profileBenchmarkButton = nullptr;
     QCheckBox *m_transcriptOverlayEnabledCheckBox = nullptr;

@@ -210,7 +210,7 @@ public:
     bool hasPlayableAudio() const {
         std::lock_guard<std::mutex> lock(m_stateMutex);
         for (const TimelineClip& clip : m_timelineClips) {
-            if (clip.hasAudio) {
+            if (clipAudioPlaybackEnabled(clip)) {
                 return true;
             }
         }
@@ -276,7 +276,7 @@ private:
 
     void scheduleDecodesLocked(const QVector<TimelineClip>& clips) {
         for (const TimelineClip& clip : clips) {
-            if (!clip.hasAudio || clip.filePath.isEmpty()) {
+            if (!clipAudioPlaybackEnabled(clip) || clip.filePath.isEmpty()) {
                 continue;
             }
             if (m_audioCache.contains(clip.filePath) || m_pendingDecodeSet.contains(clip.filePath)) {
@@ -499,7 +499,7 @@ private:
         std::fill(output, output + frames * m_channelCount, 0.0f);
 
         for (const TimelineClip& clip : context.clips) {
-            if (!clip.hasAudio) {
+            if (!clipAudioPlaybackEnabled(clip)) {
                 continue;
             }
             const AudioClipCacheEntry audio = clipCacheForPathCopy(clip.filePath);

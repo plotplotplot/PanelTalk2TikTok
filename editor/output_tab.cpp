@@ -1,6 +1,8 @@
 #include "output_tab.h"
 
 #include <QFileDialog>
+#include <QFileInfo>
+#include <QMessageBox>
 #include <QSignalBlocker>
 
 OutputTab::OutputTab(const Widgets& widgets, const Dependencies& deps, QObject* parent)
@@ -114,15 +116,59 @@ void OutputTab::renderFromInspector()
     }
 
     const QString defaultFileName = QStringLiteral("render.%1").arg(request.outputFormat);
-    const QString selectedPath = QFileDialog::getSaveFileName(
-        nullptr,
-        QStringLiteral("Render Output"),
-        defaultFileName,
-        QStringLiteral("Video Files (*.%1);;All Files (*)").arg(request.outputFormat));
+    QString defaultPath = defaultFileName;
+    QString rememberedPath;
+    if (m_deps.lastRenderOutputPath) {
+        const QString previousPath = m_deps.lastRenderOutputPath();
+        if (!previousPath.isEmpty()) {
+            QFileInfo previousInfo(previousPath);
+            const QString completeBaseName = previousInfo.completeBaseName().isEmpty()
+                                                 ? QStringLiteral("render")
+                                                 : previousInfo.completeBaseName();
+            defaultPath = previousInfo.dir().filePath(QStringLiteral("%1.%2").arg(completeBaseName, request.outputFormat));
+            rememberedPath = defaultPath;
+        }
+    }
+
+    QString selectedPath = rememberedPath;
     if (selectedPath.isEmpty()) {
-        return;
+        selectedPath = QFileDialog::getSaveFileName(
+            nullptr,
+            QStringLiteral("Render Output"),
+            defaultPath,
+            QStringLiteral("Video Files (*.%1);;All Files (*)").arg(request.outputFormat));
+        if (selectedPath.isEmpty()) {
+            return;
+        }
+    } else if (QFileInfo::exists(selectedPath)) {
+        QMessageBox prompt;
+        prompt.setIcon(QMessageBox::Question);
+        prompt.setWindowTitle(QStringLiteral("Render Output"));
+        prompt.setText(QStringLiteral("Use the previous render target?"));
+        prompt.setInformativeText(QDir::toNativeSeparators(selectedPath));
+        QPushButton* overwriteButton = prompt.addButton(QStringLiteral("Overwrite"), QMessageBox::AcceptRole);
+        QPushButton* chooseNewButton = prompt.addButton(QStringLiteral("Choose New..."), QMessageBox::ActionRole);
+        prompt.addButton(QMessageBox::Cancel);
+        prompt.setDefaultButton(overwriteButton);
+        prompt.exec();
+
+        if (prompt.clickedButton() == chooseNewButton) {
+            selectedPath = QFileDialog::getSaveFileName(
+                nullptr,
+                QStringLiteral("Render Output"),
+                defaultPath,
+                QStringLiteral("Video Files (*.%1);;All Files (*)").arg(request.outputFormat));
+            if (selectedPath.isEmpty()) {
+                return;
+            }
+        } else if (prompt.clickedButton() != overwriteButton) {
+            return;
+        }
     }
     request.outputPath = selectedPath;
+    if (m_deps.setLastRenderOutputPath) {
+        m_deps.setLastRenderOutputPath(selectedPath);
+    }
 
     request.outputSize = QSize(
         m_widgets.outputWidthSpin ? m_widgets.outputWidthSpin->value() : 1080,

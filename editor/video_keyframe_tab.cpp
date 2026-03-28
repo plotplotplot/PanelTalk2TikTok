@@ -745,6 +745,76 @@ void VideoKeyframeTab::duplicateSelectedKeyframes(int frameDelta)
     m_deps.pushHistorySnapshot();
 }
 
+void VideoKeyframeTab::duplicateSelectedKeyframesToFrame(int64_t targetFrame)
+{
+    if (!m_deps.getSelectedClip()) {
+        return;
+    }
+
+    const TimelineClip* selectedClip = m_deps.getSelectedClip();
+    if (!selectedClip || !m_deps.clipHasVisuals(*selectedClip)) {
+        return;
+    }
+
+    const QList<int64_t> selectedFrames = selectedKeyframeFramesForClip(*selectedClip);
+    if (selectedFrames.isEmpty()) {
+        return;
+    }
+
+    const int64_t maxFrame = qMax<int64_t>(0, selectedClip->durationFrames - 1);
+    const int64_t boundedTarget = qBound<int64_t>(0, targetFrame, maxFrame);
+    QSet<int64_t> sourceFrames;
+    for (int64_t frame : selectedFrames) {
+        sourceFrames.insert(frame);
+    }
+
+    const bool updated = m_deps.updateClipById(selectedClip->id,
+                                               [boundedTarget, sourceFrames](TimelineClip& clip) {
+        bool changed = false;
+        const QVector<TimelineClip::TransformKeyframe> originalKeyframes = clip.transformKeyframes;
+
+        for (const TimelineClip::TransformKeyframe& keyframe : originalKeyframes) {
+            if (!sourceFrames.contains(keyframe.frame)) {
+                continue;
+            }
+
+            TimelineClip::TransformKeyframe duplicate = keyframe;
+            duplicate.frame = boundedTarget;
+
+            bool replaced = false;
+            for (TimelineClip::TransformKeyframe& existing : clip.transformKeyframes) {
+                if (existing.frame == boundedTarget) {
+                    existing = duplicate;
+                    replaced = true;
+                    changed = true;
+                    break;
+                }
+            }
+
+            if (!replaced) {
+                clip.transformKeyframes.push_back(duplicate);
+                changed = true;
+            }
+            break;
+        }
+
+        if (changed) {
+            normalizeClipTransformKeyframes(clip);
+        }
+    });
+
+    if (!updated) {
+        return;
+    }
+
+    m_selectedKeyframeFrames = {boundedTarget};
+    m_selectedKeyframeFrame = boundedTarget;
+    m_deps.setPreviewTimelineClips();
+    m_deps.refreshInspector();
+    m_deps.scheduleSaveState();
+    m_deps.pushHistorySnapshot();
+}
+
 bool VideoKeyframeTab::insertInterpolatedKeyframeBetween(int64_t earlierFrame, int64_t laterFrame)
 {
     if (!m_deps.getSelectedClip() || earlierFrame < 0 || laterFrame < 0 || laterFrame <= earlierFrame) {
@@ -1243,12 +1313,23 @@ void VideoKeyframeTab::onTableCustomContextMenu(const QPoint& pos)
     QAction* addBelowAction = menu.addAction(QStringLiteral("Add Keyframe Below"));
     addBelowAction->setEnabled(nextFrame >= 0);
     QAction* copyToNextFrameAction = menu.addAction(QStringLiteral("Copy to Next Frame"));
+    QAction* copyToCurrentPlayheadAction = menu.addAction(QStringLiteral("Copy to Current Playhead"));
     const TimelineClip* selectedClip = m_deps.getSelectedClip();
+    const int64_t currentPlayheadFrame =
+        selectedClip
+            ? qBound<int64_t>(0,
+                              m_deps.getCurrentTimelineFrame() - selectedClip->startFrame,
+                              qMax<int64_t>(0, selectedClip->durationFrames - 1))
+            : -1;
     const bool canCopyToNextFrame = selectedClip &&
                                     m_deps.clipHasVisuals(*selectedClip) &&
                                     anchorFrame >= 0 &&
                                     anchorFrame < qMax<int64_t>(0, selectedClip->durationFrames - 1);
     copyToNextFrameAction->setEnabled(canCopyToNextFrame);
+    copyToCurrentPlayheadAction->setEnabled(selectedClip &&
+                                            m_deps.clipHasVisuals(*selectedClip) &&
+                                            currentPlayheadFrame >= 0 &&
+                                            currentPlayheadFrame != anchorFrame);
     menu.addSeparator();
     QAction* deleteAction = menu.addAction(deletableRowCount == 1
                                                ? QStringLiteral("Delete Row")
@@ -1264,6 +1345,10 @@ void VideoKeyframeTab::onTableCustomContextMenu(const QPoint& pos)
         m_selectedKeyframeFrame = anchorFrame;
         m_selectedKeyframeFrames = {anchorFrame};
         duplicateSelectedKeyframes(1);
+    } else if (chosen == copyToCurrentPlayheadAction && copyToCurrentPlayheadAction->isEnabled()) {
+        m_selectedKeyframeFrame = anchorFrame;
+        m_selectedKeyframeFrames = {anchorFrame};
+        duplicateSelectedKeyframesToFrame(currentPlayheadFrame);
     } else if (chosen == deleteAction && deleteAction->isEnabled()) {
         removeSelectedKeyframes();
     }

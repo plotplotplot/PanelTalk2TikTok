@@ -43,6 +43,7 @@ public:
     void setAudioMuted(bool muted);
     void setAudioVolume(qreal volume);
     void setOutputSize(const QSize& size);
+    void setHideOutsideOutputWindow(bool hide);
     void setBypassGrading(bool bypass);
     bool bypassGrading() const;
     bool audioMuted() const;
@@ -175,6 +176,7 @@ private:
     qint64 m_lastRepaintScheduleMs = 0;
     QString m_selectedClipId;
     QSize m_outputSize = QSize(1080, 1920);
+    bool m_hideOutsideOutputWindow = false;
     qreal m_previewZoom = 1.0;
     QPointF m_previewPanOffset;
     QHash<QString, PreviewOverlayInfo> m_overlayInfo;

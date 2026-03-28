@@ -1,10 +1,133 @@
 #include "timeline_widget.h"
 
+#include <QApplication>
+#include <QClipboard>
 #include <QHash>
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+
+namespace {
+
+void upsertGradingKeyframe(QVector<TimelineClip::GradingKeyframe>& keyframes,
+                           const TimelineClip::GradingKeyframe& keyframe) {
+    for (TimelineClip::GradingKeyframe& existing : keyframes) {
+        if (existing.frame == keyframe.frame) {
+            existing = keyframe;
+            return;
+        }
+    }
+    keyframes.push_back(keyframe);
+}
+
+void applyVisualCrossfade(TimelineClip& clip, bool fadeIn, int64_t fadeFrames) {
+    if (!clipHasVisuals(clip) || clip.durationFrames <= 1 || fadeFrames <= 0) {
+        return;
+    }
+
+    const int64_t localStartFrame = fadeIn ? 0 : qMax<int64_t>(0, clip.durationFrames - fadeFrames);
+    const int64_t localEndFrame = fadeIn ? qMin<int64_t>(clip.durationFrames - 1, fadeFrames) : clip.durationFrames - 1;
+    if (localStartFrame >= localEndFrame) {
+        return;
+    }
+
+    const TimelineClip::GradingKeyframe startState =
+        evaluateClipGradingAtPosition(clip, static_cast<qreal>(clip.startFrame + localStartFrame));
+    const TimelineClip::GradingKeyframe endState =
+        evaluateClipGradingAtPosition(clip, static_cast<qreal>(clip.startFrame + localEndFrame));
+
+    TimelineClip::GradingKeyframe startKeyframe = startState;
+    startKeyframe.frame = localStartFrame;
+    startKeyframe.opacity = fadeIn ? 0.0 : qBound(0.0, startState.opacity, 1.0);
+    startKeyframe.linearInterpolation = true;
+
+    TimelineClip::GradingKeyframe endKeyframe = endState;
+    endKeyframe.frame = localEndFrame;
+    endKeyframe.opacity = fadeIn ? qBound(0.0, endState.opacity, 1.0) : 0.0;
+    endKeyframe.linearInterpolation = true;
+
+    upsertGradingKeyframe(clip.gradingKeyframes, startKeyframe);
+    upsertGradingKeyframe(clip.gradingKeyframes, endKeyframe);
+    normalizeClipGradingKeyframes(clip);
+}
+
+void drawEyeIcon(QPainter& painter, const QRect& rect, bool enabled, bool interactive) {
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    const QColor stroke = interactive
+                              ? (enabled ? QColor(QStringLiteral("#eef4fa"))
+                                         : QColor(QStringLiteral("#7f8a99")))
+                              : QColor(QStringLiteral("#556170"));
+    painter.setPen(QPen(stroke, 1.7));
+    painter.setBrush(Qt::NoBrush);
+
+    QPainterPath path;
+    path.moveTo(rect.left() + rect.width() * 0.10, rect.center().y());
+    path.quadTo(rect.center().x(), rect.top() + rect.height() * 0.08,
+                rect.right() - rect.width() * 0.10, rect.center().y());
+    path.quadTo(rect.center().x(), rect.bottom() - rect.height() * 0.08,
+                rect.left() + rect.width() * 0.10, rect.center().y());
+    painter.drawPath(path);
+    painter.setBrush(stroke);
+    painter.drawEllipse(QRectF(rect.center().x() - rect.width() * 0.10,
+                               rect.center().y() - rect.height() * 0.10,
+                               rect.width() * 0.20,
+                               rect.height() * 0.20));
+    if (!enabled) {
+        painter.setPen(QPen(QColor(QStringLiteral("#ff8c82")), 2.0));
+        painter.drawLine(rect.left() + 2, rect.bottom() - 2, rect.right() - 2, rect.top() + 2);
+    }
+    painter.restore();
+}
+
+void drawSpeakerIcon(QPainter& painter, const QRect& rect, bool enabled, bool interactive) {
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    const QColor stroke = interactive
+                              ? (enabled ? QColor(QStringLiteral("#eef4fa"))
+                                         : QColor(QStringLiteral("#7f8a99")))
+                              : QColor(QStringLiteral("#556170"));
+    painter.setPen(QPen(stroke, 1.7));
+    painter.setBrush(Qt::NoBrush);
+
+    QPainterPath speaker;
+    speaker.moveTo(rect.left() + rect.width() * 0.18, rect.center().y() - rect.height() * 0.18);
+    speaker.lineTo(rect.left() + rect.width() * 0.36, rect.center().y() - rect.height() * 0.18);
+    speaker.lineTo(rect.left() + rect.width() * 0.55, rect.top() + rect.height() * 0.18);
+    speaker.lineTo(rect.left() + rect.width() * 0.55, rect.bottom() - rect.height() * 0.18);
+    speaker.lineTo(rect.left() + rect.width() * 0.36, rect.center().y() + rect.height() * 0.18);
+    speaker.lineTo(rect.left() + rect.width() * 0.18, rect.center().y() + rect.height() * 0.18);
+    speaker.closeSubpath();
+    painter.drawPath(speaker);
+    if (enabled) {
+        painter.drawArc(QRect(rect.left() + rect.width() * 0.45,
+                              rect.top() + rect.height() * 0.18,
+                              rect.width() * 0.28,
+                              rect.height() * 0.64),
+                        -40 * 16,
+                        80 * 16);
+        painter.drawArc(QRect(rect.left() + rect.width() * 0.52,
+                              rect.top() + rect.height() * 0.06,
+                              rect.width() * 0.34,
+                              rect.height() * 0.88),
+                        -40 * 16,
+                        80 * 16);
+    } else {
+        painter.setPen(QPen(QColor(QStringLiteral("#ff8c82")), 2.0));
+        painter.drawLine(rect.left() + rect.width() * 0.62,
+                         rect.top() + rect.height() * 0.24,
+                         rect.right() - 2,
+                         rect.bottom() - rect.height() * 0.22);
+        painter.drawLine(rect.right() - 2,
+                         rect.top() + rect.height() * 0.24,
+                         rect.left() + rect.width() * 0.62,
+                         rect.bottom() - rect.height() * 0.22);
+    }
+    painter.restore();
+}
+
+}
 
 TimelineWidget::TimelineWidget(QWidget* parent) : QWidget(parent) {
     setAcceptDrops(true);
@@ -44,6 +167,9 @@ void TimelineWidget::setClips(const QVector<TimelineClip>& clips) {
     if (!selectedClip()) {
         m_selectedClipId.clear();
     }
+    if (m_selectedTrackIndex >= trackCount()) {
+        m_selectedTrackIndex = -1;
+    }
     bool hoveredClipStillExists = m_hoveredClipId.isEmpty();
     if (!hoveredClipStillExists) {
         for (const TimelineClip& clip : m_clips) {
@@ -78,11 +204,39 @@ const TimelineClip* TimelineWidget::selectedClip() const {
     return nullptr;
 }
 
+const TimelineTrack* TimelineWidget::selectedTrack() const {
+    if (m_selectedTrackIndex < 0 || m_selectedTrackIndex >= m_tracks.size()) {
+        return nullptr;
+    }
+    return &m_tracks[m_selectedTrackIndex];
+}
+
 void TimelineWidget::setSelectedClipId(const QString& clipId) {
     if (m_selectedClipId == clipId) {
         return;
     }
     m_selectedClipId = clipId;
+    if (!clipId.isEmpty()) {
+        for (const TimelineClip& clip : m_clips) {
+            if (clip.id == clipId) {
+                m_selectedTrackIndex = clip.trackIndex;
+                break;
+            }
+        }
+    }
+    if (selectionChanged) {
+        selectionChanged();
+    }
+    update();
+}
+
+void TimelineWidget::setSelectedTrackIndex(int trackIndex) {
+    const int normalizedTrackIndex = (trackIndex >= 0 && trackIndex < trackCount()) ? trackIndex : -1;
+    if (m_selectedTrackIndex == normalizedTrackIndex && m_selectedClipId.isEmpty()) {
+        return;
+    }
+    m_selectedTrackIndex = normalizedTrackIndex;
+    m_selectedClipId.clear();
     if (selectionChanged) {
         selectionChanged();
     }
@@ -99,6 +253,32 @@ bool TimelineWidget::updateClipById(const QString& clipId, const std::function<v
         }
     }
     return false;
+}
+
+bool TimelineWidget::updateTrackByIndex(int trackIndex, const std::function<void(TimelineTrack&)>& updater) {
+    if (trackIndex < 0) {
+        return false;
+    }
+    ensureTrackCount(trackIndex + 1);
+    updater(m_tracks[trackIndex]);
+    if (clipsChanged) {
+        clipsChanged();
+    }
+    updateMinimumTimelineHeight();
+    update();
+    return true;
+}
+
+bool TimelineWidget::updateTrackVisualEnabled(int trackIndex, bool enabled) {
+    return setTrackVisualEnabled(trackIndex, enabled);
+}
+
+bool TimelineWidget::updateTrackAudioEnabled(int trackIndex, bool enabled) {
+    return setTrackAudioEnabled(trackIndex, enabled);
+}
+
+bool TimelineWidget::crossfadeTrack(int trackIndex, double seconds) {
+    return applyCrossfadeToTrack(trackIndex, seconds);
 }
 
 bool TimelineWidget::deleteSelectedClip() {
@@ -529,6 +709,122 @@ bool TimelineWidget::nudgeSelectedClip(int direction) {
     return false;
 }
 
+bool TimelineWidget::renameTrack(int trackIndex) {
+    if (trackIndex < 0) {
+        return false;
+    }
+
+    const QString currentName =
+        (trackIndex >= 0 && trackIndex < m_tracks.size()) ? m_tracks[trackIndex].name : defaultTrackName(trackIndex);
+    bool accepted = false;
+    const QString nextName = QInputDialog::getText(this,
+                                                   QStringLiteral("Rename Track"),
+                                                   QStringLiteral("Track name"),
+                                                   QLineEdit::Normal,
+                                                   currentName,
+                                                   &accepted);
+    if (!accepted) {
+        return false;
+    }
+
+    ensureTrackCount(trackIndex + 1);
+    m_tracks[trackIndex].name = nextName.trimmed().isEmpty() ? defaultTrackName(trackIndex) : nextName.trimmed();
+    if (clipsChanged) {
+        clipsChanged();
+    }
+    update();
+    return true;
+}
+
+bool TimelineWidget::applyCrossfadeToTrack(int trackIndex, double seconds) {
+    if (trackIndex < 0 || seconds <= 0.0) {
+        return false;
+    }
+
+    QVector<int> clipIndices;
+    for (int i = 0; i < m_clips.size(); ++i) {
+        if (m_clips[i].trackIndex == trackIndex) {
+            clipIndices.push_back(i);
+        }
+    }
+
+    if (clipIndices.size() < 2) {
+        QMessageBox::information(this,
+                                 QStringLiteral("Crossfade Consecutive Clips"),
+                                 QStringLiteral("This track needs at least two clips to apply a crossfade."));
+        return false;
+    }
+
+    for (const int clipIndex : clipIndices) {
+        if (m_clips[clipIndex].locked) {
+            QMessageBox::warning(this,
+                                 QStringLiteral("Crossfade Consecutive Clips"),
+                                 QStringLiteral("Unlock all clips on this track before applying a crossfade."));
+            return false;
+        }
+    }
+
+    std::sort(clipIndices.begin(), clipIndices.end(), [&](int a, int b) {
+        const int64_t startSamplesA = clipTimelineStartSamples(m_clips[a]);
+        const int64_t startSamplesB = clipTimelineStartSamples(m_clips[b]);
+        if (startSamplesA == startSamplesB) {
+            return m_clips[a].label < m_clips[b].label;
+        }
+        return startSamplesA < startSamplesB;
+    });
+
+    const int fadeSamples = qMax(1, qRound(seconds * static_cast<double>(kAudioSampleRate)));
+    const int64_t fadeFrames = qMax<int64_t>(1, qRound64(seconds * static_cast<double>(kTimelineFps)));
+    bool changed = false;
+
+    for (int i = 0; i + 1 < clipIndices.size(); ++i) {
+        TimelineClip& leftClip = m_clips[clipIndices[i]];
+        TimelineClip& rightClip = m_clips[clipIndices[i + 1]];
+
+        const int64_t leftStartSamples = clipTimelineStartSamples(leftClip);
+        const int64_t leftEndSamples = leftStartSamples + (leftClip.durationFrames * kSamplesPerFrame);
+        const int64_t targetRightStartSamples = qMax<int64_t>(0, leftEndSamples - fadeSamples);
+        if (clipTimelineStartSamples(rightClip) != targetRightStartSamples) {
+            rightClip.startFrame = targetRightStartSamples / kSamplesPerFrame;
+            rightClip.startSubframeSamples = targetRightStartSamples % kSamplesPerFrame;
+            normalizeClipTiming(rightClip);
+            changed = true;
+        }
+
+        if (leftClip.hasAudio || leftClip.mediaType == ClipMediaType::Audio) {
+            if (leftClip.fadeSamples != fadeSamples) {
+                leftClip.fadeSamples = fadeSamples;
+                changed = true;
+            }
+        }
+        if (rightClip.hasAudio || rightClip.mediaType == ClipMediaType::Audio) {
+            if (rightClip.fadeSamples != fadeSamples) {
+                rightClip.fadeSamples = fadeSamples;
+                changed = true;
+            }
+        }
+
+        const bool leftHasVisuals = clipHasVisuals(leftClip);
+        const bool rightHasVisuals = clipHasVisuals(rightClip);
+        applyVisualCrossfade(leftClip, false, fadeFrames);
+        applyVisualCrossfade(rightClip, true, fadeFrames);
+        if (leftHasVisuals || rightHasVisuals) {
+            changed = true;
+        }
+    }
+
+    if (!changed) {
+        return false;
+    }
+
+    sortClips();
+    if (clipsChanged) {
+        clipsChanged();
+    }
+    update();
+    return true;
+}
+
 int TimelineWidget::trackCount() const {
     int maxTrack = -1;
     for (const TimelineClip& clip : m_clips) {
@@ -761,6 +1057,11 @@ QRect TimelineWidget::trackRect() const {
                  draw.height() - ((ruler.bottom() - draw.top() + 1) + kTimelineTrackGap));
 }
 
+QRect TimelineWidget::trackSidebarRect() const {
+    const QRect tracks = trackRect();
+    return QRect(tracks.left(), tracks.top(), kTimelineLabelWidth, tracks.height());
+}
+
 QRect TimelineWidget::timelineContentRect() const {
     const QRect tracks = trackRect();
     return QRect(tracks.left() + kTimelineLabelWidth + kTimelineLabelGap,
@@ -796,10 +1097,35 @@ QRect TimelineWidget::exportHandleRect(int segmentIndex, bool startHandle) const
 }
 
 QRect TimelineWidget::trackLabelRect(int trackIndex) const {
-    return QRect(trackRect().left() + 6,
-                 trackTop(trackIndex) + qMax(0, (trackHeight(trackIndex) - kTimelineClipHeight) / 2),
-                 kTimelineLabelWidth - 12,
-                 kTimelineClipHeight);
+    return QRect(trackSidebarRect().left() + 4,
+                 trackTop(trackIndex) + 2,
+                 kTimelineLabelWidth - 8,
+                 qMax(kTimelineClipHeight + 8, trackHeight(trackIndex) - 4));
+}
+
+QRect TimelineWidget::trackNameRect(int trackIndex) const {
+    const QRect header = trackLabelRect(trackIndex);
+    const QRect audioRect = trackAudioToggleRect(trackIndex);
+    return QRect(header.left() + 10,
+                 header.top(),
+                 qMax(24, audioRect.left() - header.left() - 18),
+                 header.height());
+}
+
+QRect TimelineWidget::trackVisualToggleRect(int trackIndex) const {
+    const QRect header = trackLabelRect(trackIndex);
+    return QRect(header.right() - 56,
+                 header.center().y() - 11,
+                 20,
+                 22);
+}
+
+QRect TimelineWidget::trackAudioToggleRect(int trackIndex) const {
+    const QRect header = trackLabelRect(trackIndex);
+    return QRect(header.right() - 28,
+                 header.center().y() - 11,
+                 20,
+                 22);
 }
 
 QRect TimelineWidget::clipRectFor(const TimelineClip& clip) const {
@@ -843,6 +1169,86 @@ const RenderSyncMarker* TimelineWidget::renderSyncMarkerAtPos(const QPoint& pos,
         *clipIndexOut = -1;
     }
     return nullptr;
+}
+
+bool TimelineWidget::trackHasVisualClips(int trackIndex) const {
+    for (const TimelineClip& clip : m_clips) {
+        if (clip.trackIndex == trackIndex && clipHasVisuals(clip)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TimelineWidget::trackHasAudioClips(int trackIndex) const {
+    for (const TimelineClip& clip : m_clips) {
+        if (clip.trackIndex == trackIndex && clip.hasAudio) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TimelineWidget::trackVisualEnabled(int trackIndex) const {
+    bool sawVisual = false;
+    for (const TimelineClip& clip : m_clips) {
+        if (clip.trackIndex != trackIndex || !clipHasVisuals(clip)) {
+            continue;
+        }
+        sawVisual = true;
+        if (!clip.videoEnabled) {
+            return false;
+        }
+    }
+    return sawVisual;
+}
+
+bool TimelineWidget::trackAudioEnabled(int trackIndex) const {
+    bool sawAudio = false;
+    for (const TimelineClip& clip : m_clips) {
+        if (clip.trackIndex != trackIndex || !clip.hasAudio) {
+            continue;
+        }
+        sawAudio = true;
+        if (!clip.audioEnabled) {
+            return false;
+        }
+    }
+    return sawAudio;
+}
+
+bool TimelineWidget::setTrackVisualEnabled(int trackIndex, bool enabled) {
+    bool changed = false;
+    for (TimelineClip& clip : m_clips) {
+        if (clip.trackIndex == trackIndex && clipHasVisuals(clip) && clip.videoEnabled != enabled) {
+            clip.videoEnabled = enabled;
+            changed = true;
+        }
+    }
+    if (changed && clipsChanged) {
+        clipsChanged();
+    }
+    if (changed) {
+        update();
+    }
+    return changed;
+}
+
+bool TimelineWidget::setTrackAudioEnabled(int trackIndex, bool enabled) {
+    bool changed = false;
+    for (TimelineClip& clip : m_clips) {
+        if (clip.trackIndex == trackIndex && clip.hasAudio && clip.audioEnabled != enabled) {
+            clip.audioEnabled = enabled;
+            changed = true;
+        }
+    }
+    if (changed && clipsChanged) {
+        clipsChanged();
+    }
+    if (changed) {
+        update();
+    }
+    return changed;
 }
 
 void TimelineWidget::openRenderSyncMarkerMenu(const QPoint& globalPos, const QString& clipId) {
@@ -1128,23 +1534,25 @@ void TimelineWidget::mouseDoubleClickEvent(QMouseEvent* event) {
     if (event->button() == Qt::LeftButton) {
         const int trackHit = trackIndexAt(event->position().toPoint());
         if (trackHit >= 0) {
-            const QString currentName =
-                (trackHit >= 0 && trackHit < m_tracks.size()) ? m_tracks[trackHit].name : defaultTrackName(trackHit);
-            bool accepted = false;
-            const QString nextName = QInputDialog::getText(
-                this,
-                QStringLiteral("Rename Track"),
-                QStringLiteral("Track name"),
-                QLineEdit::Normal,
-                currentName,
-                &accepted);
-            if (accepted) {
-                ensureTrackCount(trackHit + 1);
-                m_tracks[trackHit].name = nextName.trimmed().isEmpty() ? defaultTrackName(trackHit) : nextName.trimmed();
-                if (clipsChanged) {
-                    clipsChanged();
+            QMenu menu(this);
+            QAction* renameAction = menu.addAction(QStringLiteral("Rename"));
+            QAction* crossfadeAction = menu.addAction(QStringLiteral("Crossfade Consecutive Clips..."));
+            QAction* chosen = menu.exec(event->globalPosition().toPoint());
+            if (chosen == renameAction) {
+                renameTrack(trackHit);
+            } else if (chosen == crossfadeAction) {
+                bool accepted = false;
+                const double seconds = QInputDialog::getDouble(this,
+                                                               QStringLiteral("Crossfade Consecutive Clips"),
+                                                               QStringLiteral("Crossfade duration (seconds)"),
+                                                               0.50,
+                                                               0.01,
+                                                               30.00,
+                                                               2,
+                                                               &accepted);
+                if (accepted) {
+                    applyCrossfadeToTrack(trackHit, seconds);
                 }
-                update();
             }
             event->accept();
             return;
@@ -1196,6 +1604,19 @@ void TimelineWidget::mousePressEvent(QMouseEvent* event) {
         }
         const int trackHit = trackIndexAt(event->position().toPoint());
         if (trackHit >= 0) {
+            if (trackVisualToggleRect(trackHit).contains(event->position().toPoint()) &&
+                trackHasVisualClips(trackHit)) {
+                setTrackVisualEnabled(trackHit, !trackVisualEnabled(trackHit));
+                event->accept();
+                return;
+            }
+            if (trackAudioToggleRect(trackHit).contains(event->position().toPoint()) &&
+                trackHasAudioClips(trackHit)) {
+                setTrackAudioEnabled(trackHit, !trackAudioEnabled(trackHit));
+                event->accept();
+                return;
+            }
+            setSelectedTrackIndex(trackHit);
             m_draggedTrackIndex = trackHit;
             m_trackDropIndex = trackHit;
             update();
@@ -1519,6 +1940,7 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
     QAction* nudgeLeftAction = nullptr;
     QAction* nudgeRightAction = nullptr;
     QAction* deleteAction = nullptr;
+    QAction* copyClipNameAction = nullptr;
     QAction* gradingAction = nullptr;
     QAction* resetGradingAction = nullptr;
     QAction* propertiesAction = nullptr;
@@ -1536,6 +1958,7 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
             audioOnly ? QStringLiteral("Nudge +25ms\tAlt+Right") : QStringLiteral("Nudge +1 Frame\tAlt+Right"));
         menu.addSeparator();
         deleteAction = menu.addAction(QStringLiteral("Delete"));
+        copyClipNameAction = menu.addAction(QStringLiteral("Copy Clip Name"));
         gradingAction = menu.addAction(QStringLiteral("Grading..."));
         resetGradingAction = menu.addAction(QStringLiteral("Reset Grading"));
         transcribeAction = menu.addAction(QStringLiteral("Transcribe"));
@@ -1652,6 +2075,15 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
         if (clipIndex >= 0) {
             setSelectedClipId(m_clips[clipIndex].id);
             deleteSelectedClip();
+        }
+        return;
+    }
+
+    if (selected == copyClipNameAction) {
+        if (clipIndex >= 0) {
+            if (QClipboard* clipboard = QApplication::clipboard()) {
+                clipboard->setText(m_clips[clipIndex].label);
+            }
         }
         return;
     }
@@ -1824,6 +2256,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
     const QRect topBar = topBarRect();
     const QRect ruler = rulerRect();
     const QRect tracks = trackRect();
+    const QRect sidebar = trackSidebarRect();
     const QRect content = timelineContentRect();
     const QRect exportBar = exportRangeRect();
 
@@ -1869,6 +2302,20 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
     painter.setPen(Qt::NoPen);
     painter.setBrush(QColor(QStringLiteral("#171c22")));
     painter.drawRoundedRect(tracks, 10, 10);
+    painter.setBrush(QColor(QStringLiteral("#151b22")));
+    painter.drawRoundedRect(sidebar, 10, 10);
+    painter.setBrush(QColor(QStringLiteral("#202a34")));
+    painter.drawRoundedRect(QRect(sidebar.left(),
+                                  sidebar.top(),
+                                  sidebar.width(),
+                                  qMin(26, sidebar.height())),
+                            10,
+                            10);
+    painter.setPen(QPen(QColor(QStringLiteral("#2b3744")), 1));
+    painter.drawLine(sidebar.right() + (kTimelineLabelGap / 2),
+                     tracks.top() + 8,
+                     sidebar.right() + (kTimelineLabelGap / 2),
+                     tracks.bottom() - 8);
 
     painter.setPen(QColor(QStringLiteral("#6d7887")));
     for (int64_t frame = 0; frame <= totalFrames(); frame += 30) {
@@ -1887,18 +2334,50 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
     painter.setPen(QColor(QStringLiteral("#24303c")));
     for (int track = 0; track < trackCount(); ++track) {
         const QRect labelRect = trackLabelRect(track);
+        const QRect nameRect = trackNameRect(track);
         const bool dragged = track == m_draggedTrackIndex;
         const bool target = track == m_trackDropIndex && m_draggedTrackIndex >= 0 && !m_trackDropInGap;
-        painter.setBrush(dragged ? QColor(QStringLiteral("#ff6f61"))
-                                 : (target ? QColor(QStringLiteral("#32465f"))
-                                           : QColor(QStringLiteral("#202a34"))));
+        const bool selected = track == m_selectedTrackIndex && m_selectedClipId.isEmpty();
+        const QColor headerFill =
+            dragged ? QColor(QStringLiteral("#ff6f61"))
+                    : (target ? QColor(QStringLiteral("#32465f"))
+                              : (selected ? QColor(QStringLiteral("#24384d"))
+                                          : QColor(QStringLiteral("#192028"))));
+        painter.setBrush(headerFill);
         painter.drawRoundedRect(labelRect, 8, 8);
+        if (selected) {
+            painter.setPen(QPen(QColor(QStringLiteral("#7fc4ff")), 1.4));
+            painter.setBrush(Qt::NoBrush);
+            painter.drawRoundedRect(labelRect.adjusted(0, 0, -1, -1), 8, 8);
+        }
         painter.setPen(QColor(QStringLiteral("#eef4fa")));
-        painter.drawText(labelRect.adjusted(4, 0, -4, 0),
-                         Qt::AlignCenter,
-                         painter.fontMetrics().elidedText(m_tracks.value(track).name, Qt::ElideRight, labelRect.width() - 8));
+        QFont nameFont = painter.font();
+        nameFont.setBold(true);
+        painter.setFont(nameFont);
+        const QString trackLabel = QStringLiteral("%1. %2")
+                                       .arg(track + 1)
+                                       .arg(m_tracks.value(track).name);
+        painter.drawText(nameRect,
+                         Qt::AlignLeft | Qt::AlignVCenter,
+                         painter.fontMetrics().elidedText(trackLabel, Qt::ElideRight, nameRect.width()));
+        painter.setFont(QFont());
+
+        const QRect visualRect = trackVisualToggleRect(track);
+        const QRect audioRect = trackAudioToggleRect(track);
+        const bool hasVisual = trackHasVisualClips(track);
+        const bool hasAudio = trackHasAudioClips(track);
+        const bool visualEnabled = trackVisualEnabled(track);
+        const bool audioEnabled = trackAudioEnabled(track);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(QStringLiteral("#141a21")));
+        painter.drawRoundedRect(visualRect.adjusted(-4, -2, 4, 2), 7, 7);
+        painter.drawRoundedRect(audioRect.adjusted(-4, -2, 4, 2), 7, 7);
+        drawEyeIcon(painter, visualRect, visualEnabled, hasVisual);
+        drawSpeakerIcon(painter, audioRect, audioEnabled, hasAudio);
+
         painter.setPen(QColor(QStringLiteral("#24303c")));
         const int dividerY = trackTop(track) + trackHeight(track);
+        painter.drawLine(sidebar.left() + 6, dividerY, sidebar.right() - 6, dividerY);
         painter.drawLine(content.left() - 8, dividerY, tracks.right() - 10, dividerY);
     }
 
@@ -1907,6 +2386,8 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
         const bool audioOnly = clipIsAudioOnly(clip);
         const bool hovered = clip.id == m_hoveredClipId;
         const bool showSourceGhost = clip.mediaType != ClipMediaType::Image;
+        const bool visualsEnabled = !clipHasVisuals(clip) || clip.videoEnabled;
+        const bool audioEnabled = !clip.hasAudio || clip.audioEnabled;
         if (showSourceGhost) {
             const int64_t ghostStartFrame = qMax<int64_t>(0, clip.startFrame - clip.sourceInFrame);
             const int64_t ghostDurationFrames = qMax<int64_t>(clip.durationFrames, clip.sourceDurationFrames);
@@ -1924,8 +2405,13 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
             }
         }
 
+        QColor clipFill = clip.color;
+        if (!visualsEnabled || !audioEnabled) {
+            clipFill = clipFill.darker(160);
+            clipFill.setAlpha(160);
+        }
         painter.setPen(QColor(255, 255, 255, 32));
-        painter.setBrush(clip.color);
+        painter.setBrush(clipFill);
         painter.drawRoundedRect(clipRect, 7, 7);
 
         if (audioOnly) {
@@ -1976,6 +2462,12 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
             : clip.label;
         if (clip.locked) {
             clipTitle = QStringLiteral("🔒 %1").arg(clipTitle);
+        }
+        if (!visualsEnabled && clipHasVisuals(clip)) {
+            clipTitle = QStringLiteral("Hidden  %1").arg(clipTitle);
+        }
+        if (!audioEnabled && clip.hasAudio) {
+            clipTitle = QStringLiteral("Muted  %1").arg(clipTitle);
         }
         painter.drawText(clipRect.adjusted(10, 0, -10, 0),
                         Qt::AlignLeft | Qt::AlignVCenter,

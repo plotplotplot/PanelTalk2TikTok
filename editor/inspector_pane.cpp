@@ -8,6 +8,7 @@
 #include <QFrame>
 #include <QHeaderView>
 #include <QLabel>
+#include <QLineEdit>
 #include <QScrollArea>
 #include <QSplitter>
 #include <QSpinBox>
@@ -42,7 +43,8 @@ QWidget *InspectorPane::buildPane()
     m_inspectorTabs->addTab(buildSyncTab(), QStringLiteral("Sync"));
     m_inspectorTabs->addTab(buildKeyframesTab(), QStringLiteral("Keyframes"));
     m_inspectorTabs->addTab(buildTranscriptTab(), QStringLiteral("Transcript"));
-    m_inspectorTabs->addTab(buildClipTab(), QStringLiteral("Clip"));
+    m_inspectorTabs->addTab(buildClipTab(), QStringLiteral("Properties"));
+    m_inspectorTabs->addTab(buildPreviewTab(), QStringLiteral("Preview"));
     m_inspectorTabs->addTab(buildOutputTab(), QStringLiteral("Output"));
     m_inspectorTabs->addTab(buildProfileTab(), QStringLiteral("System"));
 
@@ -381,6 +383,26 @@ QWidget *InspectorPane::buildOutputTab()
     return page;
 }
 
+QWidget *InspectorPane::buildPreviewTab()
+{
+    auto *page = new QWidget;
+    auto *layout = new QVBoxLayout(page);
+
+    auto *summary = new QLabel(QStringLiteral("Preview controls affect only the editor preview."), page);
+    summary->setWordWrap(true);
+
+    m_previewHideOutsideOutputCheckBox =
+        new QCheckBox(QStringLiteral("Hide Content Outside Output Window"), page);
+    m_previewHideOutsideOutputCheckBox->setChecked(false);
+    m_previewHideOutsideOutputCheckBox->setToolTip(
+        QStringLiteral("Clip the preview to the current output frame so off-frame content is hidden."));
+
+    layout->addWidget(summary);
+    layout->addWidget(m_previewHideOutsideOutputCheckBox);
+    layout->addStretch(1);
+    return page;
+}
+
 QWidget *InspectorPane::buildClipTab()
 {
     auto *page = new QWidget;
@@ -393,10 +415,29 @@ QWidget *InspectorPane::buildClipTab()
     m_clipOriginalInfoLabel = new QLabel(QStringLiteral("Original\nNo clip selected."), page);
     m_clipProxyInfoLabel = new QLabel(QStringLiteral("Proxy\nNo proxy configured."), page);
     m_clipPlaybackRateSpin = new QDoubleSpinBox(page);
-    m_clipPlaybackRateSpin->setDecimals(3);
+    m_clipPlaybackRateSpin->setDecimals(4);
     m_clipPlaybackRateSpin->setRange(0.001, 4.0);
-    m_clipPlaybackRateSpin->setSingleStep(0.001);
+    m_clipPlaybackRateSpin->setSingleStep(0.0001);
     m_clipPlaybackRateSpin->setValue(1.0);
+    m_clipPlaybackRateSpin->setToolTip(
+        QStringLiteral("Adjust clip playback speed with fine precision. "
+                       "Example: 0.9999 for a slight slow-down."));
+    m_clipPlaybackRateSpin->setValue(1.0);
+    auto *trackSectionLabel = new QLabel(QStringLiteral("Track"), page);
+    trackSectionLabel->setStyleSheet(QStringLiteral("font-weight: 600; color: #8fa3b8;"));
+    m_trackInspectorLabel = new QLabel(QStringLiteral("No track selected"), page);
+    m_trackInspectorDetailsLabel = new QLabel(QStringLiteral("Select a track header to edit track-wide properties."), page);
+    m_trackNameEdit = new QLineEdit(page);
+    m_trackHeightSpin = new QSpinBox(page);
+    m_trackHeightSpin->setRange(28, 240);
+    m_trackVideoEnabledCheckBox = new QCheckBox(QStringLiteral("Track Video Enabled"), page);
+    m_trackAudioEnabledCheckBox = new QCheckBox(QStringLiteral("Track Audio Enabled"), page);
+    m_trackCrossfadeSecondsSpin = new QDoubleSpinBox(page);
+    m_trackCrossfadeSecondsSpin->setDecimals(2);
+    m_trackCrossfadeSecondsSpin->setRange(0.01, 30.0);
+    m_trackCrossfadeSecondsSpin->setSingleStep(0.05);
+    m_trackCrossfadeSecondsSpin->setValue(0.50);
+    m_trackCrossfadeButton = new QPushButton(QStringLiteral("Crossfade Consecutive Clips"), page);
     auto *audioSectionLabel = new QLabel(QStringLiteral("Audio"), page);
     audioSectionLabel->setStyleSheet(QStringLiteral("font-weight: 600; color: #8fa3b8;"));
     m_audioInspectorClipLabel = new QLabel(QStringLiteral("No audio clip selected"), page);
@@ -404,6 +445,7 @@ QWidget *InspectorPane::buildClipTab()
 
     for (QLabel *label : {m_clipInspectorClipLabel, m_clipProxyUsageLabel, m_clipPlaybackSourceLabel,
                           m_clipOriginalInfoLabel, m_clipProxyInfoLabel,
+                          m_trackInspectorLabel, m_trackInspectorDetailsLabel,
                           m_audioInspectorClipLabel, m_audioInspectorDetailsLabel})
     {
         label->setWordWrap(true);
@@ -417,6 +459,17 @@ QWidget *InspectorPane::buildClipTab()
     layout->addLayout(form);
     layout->addWidget(m_clipOriginalInfoLabel);
     layout->addWidget(m_clipProxyInfoLabel);
+    auto *trackForm = new QFormLayout;
+    trackForm->addRow(QStringLiteral("Track Name"), m_trackNameEdit);
+    trackForm->addRow(QStringLiteral("Track Height"), m_trackHeightSpin);
+    trackForm->addRow(QStringLiteral("Crossfade"), m_trackCrossfadeSecondsSpin);
+    layout->addWidget(trackSectionLabel);
+    layout->addWidget(m_trackInspectorLabel);
+    layout->addWidget(m_trackInspectorDetailsLabel);
+    layout->addLayout(trackForm);
+    layout->addWidget(m_trackVideoEnabledCheckBox);
+    layout->addWidget(m_trackAudioEnabledCheckBox);
+    layout->addWidget(m_trackCrossfadeButton);
     layout->addWidget(audioSectionLabel);
     layout->addWidget(m_audioInspectorClipLabel);
     layout->addWidget(m_audioInspectorDetailsLabel);

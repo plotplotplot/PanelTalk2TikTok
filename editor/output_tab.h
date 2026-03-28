@@ -46,6 +46,8 @@ public:
         std::function<QVector<TimelineClip>()> getTimelineClips;
         std::function<QVector<RenderSyncMarker>()> getRenderSyncMarkers;
         std::function<void(const RenderRequest&)> renderTimeline;
+        std::function<QString()> lastRenderOutputPath;
+        std::function<void(const QString&)> setLastRenderOutputPath;
         std::function<void()> scheduleSaveState;
         std::function<void()> pushHistorySnapshot;
     };

@@ -1215,33 +1215,14 @@ void TimelineCache::schedulePredictiveLoads() {
         return;
     }
     
-    // Keep predictive loads narrow and sequential so playback-visible decode
-    // remains local to the active clip instead of bouncing around the queue.
-    int lookahead = qBound(2,
-                           static_cast<int>(std::ceil(qMax(1.0, speed) * (pendingVisible > 0 ? 2.0 : 4.0))),
-                           qMin(m_lookaheadFrames, pendingVisible > 0 ? 4 : 8));
+    // Spend more on forward visibility so image-sequence playback and speech-
+    // filtered jumps have frames ready when the playhead arrives.
+    int lookahead = qBound(6,
+                           static_cast<int>(std::ceil(qMax(1.0, speed) * (pendingVisible > 0 ? 6.0 : 10.0))),
+                           qMin(m_lookaheadFrames, pendingVisible > 0 ? 12 : 20));
     int scheduledThisTick = 0;
 
     QMutexLocker lock(&m_clipsMutex);
-
-    QVector<ClipInfo> activeClips;
-    activeClips.reserve(m_clips.size());
-    for (auto it = m_clips.cbegin(); it != m_clips.cend(); ++it) {
-        const ClipInfo& info = it.value();
-        if (playhead < info.clip.startFrame ||
-            playhead >= info.clip.startFrame + info.clip.durationFrames) {
-            continue;
-        }
-        activeClips.push_back(info);
-    }
-
-    std::sort(activeClips.begin(), activeClips.end(),
-              [](const ClipInfo& a, const ClipInfo& b) {
-                  if (a.clip.startFrame == b.clip.startFrame) {
-                      return a.clip.id < b.clip.id;
-                  }
-                  return a.clip.startFrame < b.clip.startFrame;
-              });
 
     // Get export ranges for speech filter awareness
     QVector<ExportRangeSegment> exportRanges;
@@ -1265,6 +1246,32 @@ void TimelineCache::schedulePredictiveLoads() {
         if (currentTimelineFrame < 0) {
             break;
         }
+
+        QVector<ClipInfo> activeClips;
+        activeClips.reserve(m_clips.size());
+        for (auto it = m_clips.cbegin(); it != m_clips.cend(); ++it) {
+            const ClipInfo& info = it.value();
+            if (currentTimelineFrame < info.clip.startFrame ||
+                currentTimelineFrame >= info.clip.startFrame + info.clip.durationFrames) {
+                continue;
+            }
+            activeClips.push_back(info);
+        }
+
+        std::sort(activeClips.begin(), activeClips.end(),
+                  [currentTimelineFrame](const ClipInfo& a, const ClipInfo& b) {
+                      const bool aSequence = a.clip.sourceKind == MediaSourceKind::ImageSequence;
+                      const bool bSequence = b.clip.sourceKind == MediaSourceKind::ImageSequence;
+                      if (aSequence != bSequence) {
+                          return aSequence;
+                      }
+                      const int64_t aDistance = qAbs(currentTimelineFrame - a.clip.startFrame);
+                      const int64_t bDistance = qAbs(currentTimelineFrame - b.clip.startFrame);
+                      if (aDistance == bDistance) {
+                          return a.clip.id < b.clip.id;
+                      }
+                      return aDistance < bDistance;
+                  });
 
         for (const ClipInfo& info : activeClips) {
             const QString& id = info.clip.id;
@@ -1297,7 +1304,9 @@ void TimelineCache::schedulePredictiveLoads() {
                 m_inflightPrefetches.fetch_add(1);
             }
 
-            const int priority = qMax(8, 24 - (i * 2));
+            const bool sequenceClip = info.clip.sourceKind == MediaSourceKind::ImageSequence;
+            const int priority = qMax(sequenceClip ? 20 : 12,
+                                      (sequenceClip ? 44 : 30) - (i * (sequenceClip ? 2 : 1)));
 
             lock.unlock();
             m_prefetches++;

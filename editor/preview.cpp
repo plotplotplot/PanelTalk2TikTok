@@ -569,7 +569,7 @@ void PreviewWindow::setTimelineClips(const QVector<TimelineClip>& clips) {
     m_transcriptSectionsCache.clear();
     QSet<QString> visualClipIds;
     for (const auto& clip : clips) {
-        if (clipHasVisuals(clip)) {
+        if (clipVisualPlaybackEnabled(clip)) {
             visualClipIds.insert(clip.id);
         }
     }
@@ -592,7 +592,7 @@ void PreviewWindow::setTimelineClips(const QVector<TimelineClip>& clips) {
     // Update cache with new clips
     QSet<QString> registeredIds;
     for (const auto& clip : clips) {
-        if (!clipHasVisuals(clip)) {
+        if (!clipVisualPlaybackEnabled(clip)) {
             continue;
         }
         registeredIds.insert(clip.id);
@@ -686,6 +686,14 @@ void PreviewWindow::setOutputSize(const QSize& size) {
     scheduleRepaint();
 }
 
+void PreviewWindow::setHideOutsideOutputWindow(bool hide) {
+    if (m_hideOutsideOutputWindow == hide) {
+        return;
+    }
+    m_hideOutsideOutputWindow = hide;
+    scheduleRepaint();
+}
+
 void PreviewWindow::setBypassGrading(bool bypass) {
     if (m_bypassGrading == bypass) {
         return;
@@ -708,7 +716,7 @@ int PreviewWindow::audioVolumePercent() const {
 
 QString PreviewWindow::activeAudioClipLabel() const {
     for (const TimelineClip& clip : m_clips) {
-        if (clip.hasAudio && isSampleWithinClip(clip, m_currentSample)) {
+        if (clipAudioPlaybackEnabled(clip) && isSampleWithinClip(clip, m_currentSample)) {
             return clip.label;
         }
     }
@@ -734,6 +742,9 @@ bool PreviewWindow::preparePlaybackAdvanceSample(int64_t targetSample) {
 
     for (const TimelineClip& clip : m_clips) {
         if (!clipHasVisuals(clip)) {
+            continue;
+        }
+        if (!clip.videoEnabled) {
             continue;
         }
         if (!isSampleWithinClip(clip, targetSample)) {
@@ -1357,15 +1368,15 @@ void PreviewWindow::ensurePipeline() {
     m_decoder = std::make_unique<AsyncDecoder>(this);
     m_decoder->initialize();
     if (MemoryBudget* budget = m_decoder->memoryBudget()) {
-        budget->setMaxCpuMemory(384 * 1024 * 1024);
+        budget->setMaxCpuMemory(768 * 1024 * 1024);
     }
 
     m_cache = std::make_unique<TimelineCache>(m_decoder.get(),
                                               m_decoder->memoryBudget(),
                                               this);
     m_playbackPipeline = std::make_unique<PlaybackFramePipeline>(m_decoder.get(), this);
-    m_cache->setMaxMemory(384 * 1024 * 1024);
-    m_cache->setLookaheadFrames(18);
+    m_cache->setMaxMemory(768 * 1024 * 1024);
+    m_cache->setLookaheadFrames(36);
     m_cache->setPlaybackSpeed(1.0);
     m_cache->setPlaybackState(m_playing ?
         TimelineCache::PlaybackState::Playing :
@@ -1378,6 +1389,9 @@ void PreviewWindow::ensurePipeline() {
     m_registeredClips.clear();
     for (const TimelineClip& clip : m_clips) {
         if (!clipHasVisuals(clip)) {
+            continue;
+        }
+        if (!clip.videoEnabled) {
             continue;
         }
         m_cache->registerClip(clip);
@@ -1672,8 +1686,18 @@ void PreviewWindow::renderCompositedPreviewGL(const QRect& compositeRect,
     int nullCount = 0;
     int skippedZeroOpacityCount = 0;
     QJsonArray clipSelections;
+    GLboolean previousScissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
+    GLint previousScissorBox[4] = {0, 0, 0, 0};
+    if (m_hideOutsideOutputWindow) {
+        glGetIntegerv(GL_SCISSOR_BOX, previousScissorBox);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(compositeRect.left(),
+                  height() - compositeRect.bottom() - 1,
+                  compositeRect.width(),
+                  compositeRect.height());
+    }
     for (const TimelineClip& clip : activeClips) {
-        if (!clipHasVisuals(clip)) {
+        if (!clipVisualPlaybackEnabled(clip)) {
             continue;
         }
         if (!m_bypassGrading) {
@@ -1807,6 +1831,13 @@ void PreviewWindow::renderCompositedPreviewGL(const QRect& compositeRect,
             m_paintOrder.push_back(clip.id);
         }
         drewAnyFrame = true;
+    }
+    if (m_hideOutsideOutputWindow) {
+        glScissor(previousScissorBox[0], previousScissorBox[1],
+                  previousScissorBox[2], previousScissorBox[3]);
+        if (!previousScissorEnabled) {
+            glDisable(GL_SCISSOR_TEST);
+        }
     }
     m_lastFrameSelectionStats = QJsonObject{
         {QStringLiteral("path"), QStringLiteral("gl")},
@@ -1942,7 +1973,7 @@ void PreviewWindow::requestFramesForCurrentPosition() {
     QVector<const TimelineClip*> activeClips;
     activeClips.reserve(m_clips.size());
     for (const TimelineClip& clip : m_clips) {
-        if (!clipHasVisuals(clip)) {
+        if (!clipVisualPlaybackEnabled(clip)) {
             continue;
         }
         if (isSampleWithinClip(clip, m_currentSample)) {
@@ -2085,6 +2116,9 @@ void PreviewWindow::drawCompositedPreview(QPainter* painter, const QRect& safeRe
 
     const QRect compositeRect = scaledCanvasRect(previewCanvasBaseRect());
     painter->fillRect(compositeRect, Qt::black);
+    if (m_hideOutsideOutputWindow) {
+        painter->setClipRect(compositeRect);
+    }
     bool drewAnyFrame = false;
     bool waitingForFrame = false;
     int usedPlaybackPipelineCount = 0;
@@ -2238,6 +2272,9 @@ void PreviewWindow::drawCompositedPreview(QPainter* painter, const QRect& safeRe
             drawTranscriptOverlay(painter, clip, compositeRect);
         }
     }
+    if (m_hideOutsideOutputWindow) {
+        painter->setClipping(false);
+    }
     
     painter->restore();
 }
@@ -2271,7 +2308,10 @@ void PreviewWindow::drawFrameLayer(QPainter* painter, const QRect& targetRect,
     painter->setClipRect(targetRect);
 
     if (!frame.isNull() && frame.hasCpuImage()) {
-        const QImage img = m_bypassGrading ? frame.cpuImage() : applyClipGrade(frame.cpuImage(), clip);
+        const QImage img =
+            m_bypassGrading
+                ? frame.cpuImage()
+                : applyClipGrade(frame.cpuImage(), evaluateClipGradingAtPosition(clip, m_currentFramePosition));
         const QRect fitted = fitRect(img.size(), targetRect);
         const TimelineClip::TransformKeyframe transform =
             evaluateClipTransformAtPosition(clip, m_currentFramePosition);

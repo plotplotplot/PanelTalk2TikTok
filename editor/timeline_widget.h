@@ -15,6 +15,7 @@
 #include <QMessageBox>
 #include <QMimeData>
 #include <QMouseEvent>
+#include <QPainterPath>
 #include <QPainter>
 #include <QPalette>
 #include <QPoint>
@@ -48,11 +49,18 @@ public:
     QString selectedClipId() const { return m_selectedClipId; }
     const TimelineClip* selectedClip() const;
     void setSelectedClipId(const QString& clipId);
+    int selectedTrackIndex() const { return m_selectedTrackIndex; }
+    const TimelineTrack* selectedTrack() const;
+    void setSelectedTrackIndex(int trackIndex);
 
     bool updateClipById(const QString& clipId, const std::function<void(TimelineClip&)>& updater);
     bool deleteSelectedClip();
     bool splitSelectedClipAtFrame(int64_t frame);
     bool nudgeSelectedClip(int direction);
+    bool updateTrackByIndex(int trackIndex, const std::function<void(TimelineTrack&)>& updater);
+    bool updateTrackVisualEnabled(int trackIndex, bool enabled);
+    bool updateTrackAudioEnabled(int trackIndex, bool enabled);
+    bool crossfadeTrack(int trackIndex, double seconds);
 
     QVector<RenderSyncMarker> renderSyncMarkers() const { return m_renderSyncMarkers; }
     void setRenderSyncMarkers(const QVector<RenderSyncMarker>& markers);
@@ -118,8 +126,8 @@ private:
     static constexpr int kTimelineRulerHeight = 28;
     static constexpr int kTimelineTrackGap = 12;
     static constexpr int kTimelineClipHeight = 32;
-    static constexpr int kTimelineLabelWidth = 52;
-    static constexpr int kTimelineLabelGap = 12;
+    static constexpr int kTimelineLabelWidth = 120;
+    static constexpr int kTimelineLabelGap = 16;
     static constexpr int kTimelineTrackInnerPadding = 12;
     static constexpr int kTimelineClipVerticalPadding = 6;
     static constexpr int kTimelineTrackSpacing = 10;
@@ -170,13 +178,26 @@ private:
     QRect topBarRect() const;
     QRect rulerRect() const;
     QRect trackRect() const;
+    QRect trackSidebarRect() const;
     QRect timelineContentRect() const;
     QRect exportRangeRect() const;
     QRect exportHandleRect(int segmentIndex, bool startHandle) const;
     QRect exportSegmentRect(const ExportRangeSegment& segment) const;
     QRect trackLabelRect(int trackIndex) const;
+    QRect trackNameRect(int trackIndex) const;
+    QRect trackVisualToggleRect(int trackIndex) const;
+    QRect trackAudioToggleRect(int trackIndex) const;
     QRect clipRectFor(const TimelineClip& clip) const;
     QRect renderSyncMarkerRect(const TimelineClip& clip, const RenderSyncMarker& marker) const;
+
+    bool trackHasVisualClips(int trackIndex) const;
+    bool trackHasAudioClips(int trackIndex) const;
+    bool trackVisualEnabled(int trackIndex) const;
+    bool trackAudioEnabled(int trackIndex) const;
+    bool setTrackVisualEnabled(int trackIndex, bool enabled);
+    bool setTrackAudioEnabled(int trackIndex, bool enabled);
+    bool renameTrack(int trackIndex);
+    bool applyCrossfadeToTrack(int trackIndex, double seconds);
 
     void normalizeExportRange();
     void normalizeExportRanges();
@@ -209,6 +230,7 @@ private:
     int m_verticalScrollOffset = 0;
     int64_t m_snapIndicatorFrame = -1;
     QString m_selectedClipId;
+    int m_selectedTrackIndex = -1;
     QString m_hoveredClipId;
     QVector<RenderSyncMarker> m_renderSyncMarkers;
     ExportRangeDragMode m_exportRangeDragMode = ExportRangeDragMode::None;
