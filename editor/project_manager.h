@@ -1,15 +1,49 @@
 #pragma once
 
-class EditorWindow;
+#include <QObject>
+#include <QString>
+#include <QStringList>
+#include <QByteArray>
+#include <functional>
 
-// First-pass extraction target for project/state/history persistence.
-// The original implementation is heavily coupled to EditorWindow widget members.
-// This file gives you the correct seam and method inventory.
-class ProjectManager
+class ProjectManager : public QObject
 {
+    Q_OBJECT
+
 public:
-    explicit ProjectManager(EditorWindow *owner);
+    explicit ProjectManager(QObject *parent = nullptr);
+    ~ProjectManager() override = default;
+
+    // Project path helpers
+    QString projectsDirPath() const;
+    QString currentProjectMarkerPath() const;
+    QString currentProjectIdOrDefault() const;
+    QString projectPath(const QString &projectId) const;
+    QString stateFilePathForProject(const QString &projectId) const;
+    QString historyFilePathForProject(const QString &projectId) const;
+    QString stateFilePath() const;
+    QString historyFilePath() const;
+    
+    QString sanitizedProjectId(const QString &name) const;
+    void ensureProjectsDirectory() const;
+    QStringList availableProjectIds() const;
+    void ensureDefaultProjectExists() const;
+    
+    void loadProjectsFromFolders();
+    void saveCurrentProjectMarker();
+    QString currentProjectName() const;
+    void refreshProjectsList();
+    void switchToProject(const QString &projectId);
+    void createProject();
+    bool saveProjectPayload(const QString &projectId, const QByteArray &statePayload, const QByteArray &historyPayload);
+    void saveProjectAs(const QString &currentName, std::function<QByteArray()> buildStateJson, 
+                       const QJsonArray &historyEntries, int historyIndex);
+    void renameProject(const QString &projectId);
+
+signals:
+    void projectChanged(const QString &projectId);
+    void projectsListRefreshed();
 
 private:
-    EditorWindow *m_owner = nullptr;
+    QString m_currentProjectId;
 };

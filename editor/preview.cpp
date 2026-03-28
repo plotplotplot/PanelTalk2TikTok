@@ -1304,10 +1304,12 @@ QRectF PreviewWindow::renderFrameLayerGL(const QRect& targetRect, const Timeline
     model.rotate(transform.rotation, 0.0f, 0.0f, 1.0f);
     model.scale(fitted.width() * transform.scaleX, fitted.height() * transform.scaleY, 1.0f);
 
-    const qreal brightness = m_bypassGrading ? 0.0 : clip.brightness;
-    const qreal contrast = m_bypassGrading ? 1.0 : clip.contrast;
-    const qreal saturation = m_bypassGrading ? 1.0 : clip.saturation;
-    const qreal opacity = m_bypassGrading ? 1.0 : clip.opacity;
+    const TimelineClip::GradingKeyframe grade =
+        m_bypassGrading ? TimelineClip::GradingKeyframe{} : evaluateClipGradingAtPosition(clip, m_currentFramePosition);
+    const qreal brightness = grade.brightness;
+    const qreal contrast = grade.contrast;
+    const qreal saturation = grade.saturation;
+    const qreal opacity = grade.opacity;
 
     m_shaderProgram->bind();
     m_shaderProgram->setUniformValue("u_mvp", projection * model);

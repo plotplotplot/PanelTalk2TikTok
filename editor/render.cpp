@@ -19,6 +19,7 @@
 #include <QPainter>
 #include <QTextDocument>
 #include <QSurfaceFormat>
+#include <QElapsedTimer>
 
 #include <algorithm>
 #include <memory>
@@ -40,6 +41,11 @@ namespace {
 constexpr int kRenderAudioSampleRate = 48000;
 constexpr int kRenderAudioChannels = 2;
 
+struct VideoEncoderChoice {
+    QString label;
+    AVPixelFormat pixelFormat = AV_PIX_FMT_YUV420P;
+};
+
 bool isHardwareEncoderLabel(const QString& codecLabel) {
     const QString lowered = codecLabel.toLower();
     return lowered.contains(QStringLiteral("nvenc")) ||
@@ -49,6 +55,76 @@ bool isHardwareEncoderLabel(const QString& codecLabel) {
            lowered.contains(QStringLiteral("amf")) ||
            lowered.contains(QStringLiteral("omx")) ||
            lowered.contains(QStringLiteral("mediacodec"));
+}
+
+inline int clampByte(int value) {
+    return value < 0 ? 0 : (value > 255 ? 255 : value);
+}
+
+bool fillNv12FrameFromImage(const QImage& image, AVFrame* frame) {
+    if (!frame || frame->format != AV_PIX_FMT_NV12 || image.isNull()) {
+        return false;
+    }
+
+    QImage argb = image;
+    if (argb.format() != QImage::Format_ARGB32 && argb.format() != QImage::Format_ARGB32_Premultiplied) {
+        argb = image.convertToFormat(QImage::Format_ARGB32);
+    }
+    if (argb.isNull()) {
+        return false;
+    }
+
+    const int width = qMin(argb.width(), frame->width);
+    const int height = qMin(argb.height(), frame->height);
+    uint8_t* yPlane = frame->data[0];
+    uint8_t* uvPlane = frame->data[1];
+    const int yStride = frame->linesize[0];
+    const int uvStride = frame->linesize[1];
+
+    for (int y = 0; y < height; ++y) {
+        const uint8_t* src = argb.constScanLine(y);
+        uint8_t* dstY = yPlane + y * yStride;
+        for (int x = 0; x < width; ++x) {
+            const int b = src[x * 4 + 0];
+            const int g = src[x * 4 + 1];
+            const int r = src[x * 4 + 2];
+            const int yValue = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            dstY[x] = static_cast<uint8_t>(clampByte(yValue));
+        }
+    }
+
+    for (int y = 0; y < height; y += 2) {
+        const uint8_t* src0 = argb.constScanLine(y);
+        const uint8_t* src1 = argb.constScanLine(qMin(y + 1, height - 1));
+        uint8_t* dstUV = uvPlane + (y / 2) * uvStride;
+        for (int x = 0; x < width; x += 2) {
+            int sumU = 0;
+            int sumV = 0;
+            int sampleCount = 0;
+            for (int dy = 0; dy < 2; ++dy) {
+                const uint8_t* src = (dy == 0) ? src0 : src1;
+                const int yy = qMin(y + dy, height - 1);
+                Q_UNUSED(yy)
+                for (int dx = 0; dx < 2; ++dx) {
+                    const int xx = qMin(x + dx, width - 1);
+                    const int b = src[xx * 4 + 0];
+                    const int g = src[xx * 4 + 1];
+                    const int r = src[xx * 4 + 2];
+                    const int uValue = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                    const int vValue = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                    sumU += uValue;
+                    sumV += vValue;
+                    ++sampleCount;
+                }
+            }
+            dstUV[x + 0] = static_cast<uint8_t>(clampByte(sumU / qMax(1, sampleCount)));
+            if (x + 1 < uvStride) {
+                dstUV[x + 1] = static_cast<uint8_t>(clampByte(sumV / qMax(1, sampleCount)));
+            }
+        }
+    }
+
+    return true;
 }
 
 QString avErrToString(int errnum) {
@@ -197,6 +273,26 @@ const AVCodec* codecForRequest(const QString& outputFormat, QString* codecLabel)
     return avcodec_find_encoder(AV_CODEC_ID_H264);
 }
 
+QVector<VideoEncoderChoice> videoEncoderChoicesForRequest(const QString& outputFormat) {
+    const QString format = outputFormat.toLower();
+    QVector<VideoEncoderChoice> choices;
+    if (format == QStringLiteral("mp4")) {
+#if defined(Q_OS_LINUX)
+        choices.push_back({QStringLiteral("h264_nvenc"), AV_PIX_FMT_NV12});
+        choices.push_back({QStringLiteral("h264_qsv"), AV_PIX_FMT_NV12});
+        choices.push_back({QStringLiteral("h264_vaapi"), AV_PIX_FMT_NV12});
+#endif
+        choices.push_back({QStringLiteral("libx264"), AV_PIX_FMT_YUV420P});
+    } else if (format == QStringLiteral("mov")) {
+        choices.push_back({QStringLiteral("prores_ks"), AV_PIX_FMT_YUV422P10LE});
+    } else if (format == QStringLiteral("webm")) {
+        choices.push_back({QStringLiteral("libvpx-vp9"), AV_PIX_FMT_YUV420P});
+    } else if (format == QStringLiteral("mkv")) {
+        choices.push_back({QStringLiteral("ffv1"), AV_PIX_FMT_BGRA});
+    }
+    return choices;
+}
+
 const AVCodec* audioCodecForRequest(const QString& outputFormat, QString* codecLabel) {
     const QString format = outputFormat.toLower();
     if (format == QStringLiteral("webm")) {
@@ -226,8 +322,23 @@ AVPixelFormat pixelFormatForCodec(const AVCodec* codec, const QString& outputFor
     return AV_PIX_FMT_YUV420P;
 }
 
-void configureCodecOptions(AVCodecContext* codecCtx, const QString& outputFormat) {
+void configureCodecOptions(AVCodecContext* codecCtx, const QString& outputFormat, const QString& codecLabel = QString()) {
     const QString format = outputFormat.toLower();
+    const QString loweredCodec = codecLabel.toLower();
+    if (loweredCodec == QStringLiteral("h264_nvenc")) {
+        av_opt_set(codecCtx->priv_data, "preset", "p5", 0);
+        av_opt_set(codecCtx->priv_data, "rc", "vbr", 0);
+        av_opt_set(codecCtx->priv_data, "cq", "19", 0);
+        return;
+    } else if (loweredCodec == QStringLiteral("h264_qsv")) {
+        av_opt_set(codecCtx->priv_data, "preset", "medium", 0);
+        av_opt_set(codecCtx->priv_data, "global_quality", "23", 0);
+        return;
+    } else if (loweredCodec == QStringLiteral("h264_vaapi")) {
+        av_opt_set(codecCtx->priv_data, "rc_mode", "VBR", 0);
+        av_opt_set(codecCtx->priv_data, "qp", "20", 0);
+        return;
+    }
     if (format == QStringLiteral("mp4")) {
         av_opt_set(codecCtx->priv_data, "preset", "veryfast", 0);
         av_opt_set(codecCtx->priv_data, "crf", "18", 0);
@@ -918,7 +1029,8 @@ public:
     QImage renderFrame(const RenderRequest& request,
                        int64_t timelineFrame,
                        QHash<QString, editor::DecoderContext*>& decoders,
-                       const QVector<TimelineClip>& orderedClips) {
+                       const QVector<TimelineClip>& orderedClips,
+                       qint64* readbackMs = nullptr) {
         if (!m_context || !m_surface || !m_fbo || !m_shaderProgram) {
             return QImage();
         }
@@ -965,6 +1077,8 @@ public:
             const QRect fitted = fitRect(frame.size(), m_outputSize);
             const TimelineClip::TransformKeyframe transform =
                 evaluateClipTransformAtPosition(clip, static_cast<qreal>(timelineFrame));
+            const TimelineClip::GradingKeyframe grade =
+                evaluateClipGradingAtPosition(clip, static_cast<qreal>(timelineFrame));
             const QPointF center(fitted.center().x() + transform.translationX,
                                  fitted.center().y() + transform.translationY);
 
@@ -980,10 +1094,10 @@ public:
 
             m_shaderProgram->bind();
             m_shaderProgram->setUniformValue("u_mvp", projection * model);
-            m_shaderProgram->setUniformValue("u_brightness", GLfloat(clip.brightness));
-            m_shaderProgram->setUniformValue("u_contrast", GLfloat(clip.contrast));
-            m_shaderProgram->setUniformValue("u_saturation", GLfloat(clip.saturation));
-            m_shaderProgram->setUniformValue("u_opacity", GLfloat(clip.opacity));
+            m_shaderProgram->setUniformValue("u_brightness", GLfloat(grade.brightness));
+            m_shaderProgram->setUniformValue("u_contrast", GLfloat(grade.contrast));
+            m_shaderProgram->setUniformValue("u_saturation", GLfloat(grade.saturation));
+            m_shaderProgram->setUniformValue("u_opacity", GLfloat(grade.opacity));
             m_shaderProgram->setUniformValue("u_texture", 0);
 
             glActiveTexture(GL_TEXTURE0);
@@ -1004,7 +1118,12 @@ public:
 
         QImage image(m_outputSize, QImage::Format_ARGB32_Premultiplied);
         glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        QElapsedTimer readbackTimer;
+        readbackTimer.start();
         glReadPixels(0, 0, m_outputSize.width(), m_outputSize.height(), GL_BGRA, GL_UNSIGNED_BYTE, image.bits());
+        if (readbackMs) {
+            *readbackMs += readbackTimer.elapsed();
+        }
         m_fbo->release();
         trimTextureCache();
         return image.mirrored();
@@ -1140,7 +1259,7 @@ QImage renderTimelineFrame(const RenderRequest& request,
             continue;
         }
 
-        const QImage graded = applyClipGrade(frame.cpuImage(), clip);
+        const QImage graded = applyClipGrade(frame.cpuImage(), evaluateClipGradingAtFrame(clip, timelineFrame));
         const QRect fitted = fitRect(graded.size(), request.outputSize);
         const TimelineClip::TransformKeyframe transform =
             evaluateClipTransformAtPosition(clip, static_cast<qreal>(timelineFrame));
@@ -1257,17 +1376,6 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
         return result;
     }
 
-    QString codecLabel;
-    const AVCodec* codec = codecForRequest(request.outputFormat, &codecLabel);
-    if (!codec) {
-        avformat_free_context(formatCtx);
-        result.message = QStringLiteral("No encoder available for format %1.").arg(request.outputFormat);
-        return result;
-    }
-    const bool usingHardwareEncode = isHardwareEncoderLabel(codecLabel);
-    result.usedHardwareEncode = usingHardwareEncode;
-    result.encoderLabel = codecLabel;
-
     AVStream* stream = avformat_new_stream(formatCtx, nullptr);
     if (!stream) {
         avformat_free_context(formatCtx);
@@ -1275,36 +1383,97 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
         return result;
     }
 
-    AVCodecContext* codecCtx = avcodec_alloc_context3(codec);
-    if (!codecCtx) {
-        avformat_free_context(formatCtx);
-        result.message = QStringLiteral("Failed to allocate encoder context.");
-        return result;
+    QString codecLabel;
+    const AVCodec* codec = nullptr;
+    AVCodecContext* codecCtx = nullptr;
+    QStringList attemptedEncoders;
+    const QVector<VideoEncoderChoice> encoderChoices = videoEncoderChoicesForRequest(request.outputFormat);
+    for (const VideoEncoderChoice &choice : encoderChoices) {
+        const AVCodec* candidate = avcodec_find_encoder_by_name(choice.label.toUtf8().constData());
+        if (!candidate) {
+            attemptedEncoders.push_back(choice.label + QStringLiteral(" (unavailable)"));
+            continue;
+        }
+
+        AVCodecContext* candidateCtx = avcodec_alloc_context3(candidate);
+        if (!candidateCtx) {
+            attemptedEncoders.push_back(choice.label + QStringLiteral(" (alloc failed)"));
+            continue;
+        }
+
+        candidateCtx->codec_id = candidate->id;
+        candidateCtx->codec_type = AVMEDIA_TYPE_VIDEO;
+        candidateCtx->width = request.outputSize.width();
+        candidateCtx->height = request.outputSize.height();
+        candidateCtx->time_base = AVRational{1, kTimelineFps};
+        candidateCtx->framerate = AVRational{kTimelineFps, 1};
+        candidateCtx->gop_size = kTimelineFps;
+        candidateCtx->max_b_frames = 0;
+        candidateCtx->pix_fmt = choice.pixelFormat == AV_PIX_FMT_NONE
+                                    ? pixelFormatForCodec(candidate, request.outputFormat)
+                                    : choice.pixelFormat;
+        candidateCtx->bit_rate = 8'000'000;
+
+        if (formatCtx->oformat->flags & AVFMT_GLOBALHEADER) {
+            candidateCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        }
+
+        configureCodecOptions(candidateCtx, request.outputFormat, choice.label);
+        if (avcodec_open2(candidateCtx, candidate, nullptr) >= 0) {
+            codec = candidate;
+            codecCtx = candidateCtx;
+            codecLabel = choice.label;
+            break;
+        }
+
+        attemptedEncoders.push_back(choice.label + QStringLiteral(" (open failed)"));
+        avcodec_free_context(&candidateCtx);
     }
 
-    codecCtx->codec_id = codec->id;
-    codecCtx->codec_type = AVMEDIA_TYPE_VIDEO;
-    codecCtx->width = request.outputSize.width();
-    codecCtx->height = request.outputSize.height();
-    codecCtx->time_base = AVRational{1, kTimelineFps};
-    codecCtx->framerate = AVRational{kTimelineFps, 1};
-    codecCtx->gop_size = kTimelineFps;
-    codecCtx->max_b_frames = 0;
-    codecCtx->pix_fmt = pixelFormatForCodec(codec, request.outputFormat);
-    codecCtx->bit_rate = 8'000'000;
+    if (!codec || !codecCtx) {
+        codec = codecForRequest(request.outputFormat, &codecLabel);
+        if (!codec) {
+            avformat_free_context(formatCtx);
+            result.message = QStringLiteral("No encoder available for format %1. Tried: %2")
+                                 .arg(request.outputFormat, attemptedEncoders.join(QStringLiteral(", ")));
+            return result;
+        }
 
-    if (formatCtx->oformat->flags & AVFMT_GLOBALHEADER) {
-        codecCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        codecCtx = avcodec_alloc_context3(codec);
+        if (!codecCtx) {
+            avformat_free_context(formatCtx);
+            result.message = QStringLiteral("Failed to allocate encoder context.");
+            return result;
+        }
+
+        codecCtx->codec_id = codec->id;
+        codecCtx->codec_type = AVMEDIA_TYPE_VIDEO;
+        codecCtx->width = request.outputSize.width();
+        codecCtx->height = request.outputSize.height();
+        codecCtx->time_base = AVRational{1, kTimelineFps};
+        codecCtx->framerate = AVRational{kTimelineFps, 1};
+        codecCtx->gop_size = kTimelineFps;
+        codecCtx->max_b_frames = 0;
+        codecCtx->pix_fmt = pixelFormatForCodec(codec, request.outputFormat);
+        codecCtx->bit_rate = 8'000'000;
+
+        if (formatCtx->oformat->flags & AVFMT_GLOBALHEADER) {
+            codecCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        }
+
+        configureCodecOptions(codecCtx, request.outputFormat, codecLabel);
+
+        if (avcodec_open2(codecCtx, codec, nullptr) < 0) {
+            avcodec_free_context(&codecCtx);
+            avformat_free_context(formatCtx);
+            result.message = QStringLiteral("Failed to open encoder %1.").arg(codecLabel);
+            return result;
+        }
     }
 
-    configureCodecOptions(codecCtx, request.outputFormat);
-
-    if (avcodec_open2(codecCtx, codec, nullptr) < 0) {
-        avcodec_free_context(&codecCtx);
-        avformat_free_context(formatCtx);
-        result.message = QStringLiteral("Failed to open encoder %1.").arg(codecLabel);
-        return result;
-    }
+    const bool usingHardwareEncode = isHardwareEncoderLabel(codecLabel);
+    result.usedHardwareEncode = usingHardwareEncode;
+    result.encoderLabel = codecLabel;
 
     if (avcodec_parameters_from_context(stream->codecpar, codecCtx) < 0) {
         avcodec_free_context(&codecCtx);
@@ -1346,33 +1515,37 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
         return result;
     }
 
-    SwsContext* swsCtx = sws_getContext(codecCtx->width,
-                                        codecCtx->height,
-                                        AV_PIX_FMT_BGRA,
-                                        codecCtx->width,
-                                        codecCtx->height,
-                                        codecCtx->pix_fmt,
-                                        SWS_BILINEAR,
-                                        nullptr,
-                                        nullptr,
-                                        nullptr);
-    if (!swsCtx) {
-        av_write_trailer(formatCtx);
-        if (!(formatCtx->oformat->flags & AVFMT_NOFILE)) {
-            avio_closep(&formatCtx->pb);
+    const bool directNv12Conversion = codecCtx->pix_fmt == AV_PIX_FMT_NV12;
+    SwsContext* swsCtx = nullptr;
+    if (!directNv12Conversion) {
+        swsCtx = sws_getContext(codecCtx->width,
+                                codecCtx->height,
+                                AV_PIX_FMT_BGRA,
+                                codecCtx->width,
+                                codecCtx->height,
+                                codecCtx->pix_fmt,
+                                SWS_BILINEAR,
+                                nullptr,
+                                nullptr,
+                                nullptr);
+        if (!swsCtx) {
+            av_write_trailer(formatCtx);
+            if (!(formatCtx->oformat->flags & AVFMT_NOFILE)) {
+                avio_closep(&formatCtx->pb);
+            }
+            if (audioState.codecCtx) {
+                avcodec_free_context(&audioState.codecCtx);
+            }
+            avcodec_free_context(&codecCtx);
+            avformat_free_context(formatCtx);
+            result.message = QStringLiteral("Failed to create render color converter.");
+            return result;
         }
-        if (audioState.codecCtx) {
-            avcodec_free_context(&audioState.codecCtx);
-        }
-        avcodec_free_context(&codecCtx);
-        avformat_free_context(formatCtx);
-        result.message = QStringLiteral("Failed to create render color converter.");
-        return result;
     }
 
-    AVFrame* sourceFrame = av_frame_alloc();
+    AVFrame* sourceFrame = directNv12Conversion ? nullptr : av_frame_alloc();
     AVFrame* encodedFrame = av_frame_alloc();
-    if (!sourceFrame || !encodedFrame) {
+    if ((!directNv12Conversion && !sourceFrame) || !encodedFrame) {
         if (sourceFrame) av_frame_free(&sourceFrame);
         if (encodedFrame) av_frame_free(&encodedFrame);
         sws_freeContext(swsCtx);
@@ -1389,14 +1562,18 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
         return result;
     }
 
-    sourceFrame->format = AV_PIX_FMT_BGRA;
-    sourceFrame->width = codecCtx->width;
-    sourceFrame->height = codecCtx->height;
+    if (sourceFrame) {
+        sourceFrame->format = AV_PIX_FMT_BGRA;
+        sourceFrame->width = codecCtx->width;
+        sourceFrame->height = codecCtx->height;
+    }
     encodedFrame->format = codecCtx->pix_fmt;
     encodedFrame->width = codecCtx->width;
     encodedFrame->height = codecCtx->height;
 
-    if (av_frame_get_buffer(sourceFrame, 32) < 0 || av_frame_get_buffer(encodedFrame, 32) < 0) {
+    if ((!sourceFrame || av_frame_get_buffer(sourceFrame, 32) >= 0) &&
+        av_frame_get_buffer(encodedFrame, 32) >= 0) {
+    } else {
         av_frame_free(&sourceFrame);
         av_frame_free(&encodedFrame);
         sws_freeContext(swsCtx);
@@ -1418,6 +1595,14 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
     QHash<QString, editor::DecoderContext*> decoders;
     QHash<QString, QVector<TranscriptSection>> transcriptCache;
     QString errorMessage;
+    QElapsedTimer totalTimer;
+    totalTimer.start();
+    qint64 totalRenderStageMs = 0;
+    qint64 totalGpuReadbackMs = 0;
+    qint64 totalOverlayStageMs = 0;
+    qint64 totalConvertStageMs = 0;
+    qint64 totalEncodeStageMs = 0;
+    qint64 totalAudioStageMs = 0;
 
     for (int segmentIndex = 0; segmentIndex < exportRanges.size(); ++segmentIndex) {
         const ExportRangeSegment& range = exportRanges[segmentIndex];
@@ -1436,15 +1621,32 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
                 progress.usingGpu = useGpuRenderer;
                 progress.usingHardwareEncode = usingHardwareEncode;
                 progress.encoderLabel = codecLabel;
+                progress.elapsedMs = totalTimer.elapsed();
+                progress.estimatedRemainingMs =
+                    progress.framesCompleted > 0
+                        ? (progress.elapsedMs * qMax<int64_t>(0, progress.totalFrames - progress.framesCompleted)) /
+                              qMax<int64_t>(1, progress.framesCompleted)
+                        : -1;
+                progress.renderStageMs = totalRenderStageMs;
+                progress.gpuReadbackMs = totalGpuReadbackMs;
+                progress.overlayStageMs = totalOverlayStageMs;
+                progress.convertStageMs = totalConvertStageMs;
+                progress.encodeStageMs = totalEncodeStageMs;
+                progress.audioStageMs = totalAudioStageMs;
                 if (!progressCallback(progress)) {
                     result.cancelled = true;
                     errorMessage = QStringLiteral("Render cancelled.");
                     break;
                 }
             }
+            QElapsedTimer renderStageTimer;
+            renderStageTimer.start();
+            qint64 frameReadbackMs = 0;
             QImage rendered = useGpuRenderer
-                ? gpuRenderer.renderFrame(request, timelineFrame, decoders, orderedClips)
+                ? gpuRenderer.renderFrame(request, timelineFrame, decoders, orderedClips, &frameReadbackMs)
                 : renderTimelineFrame(request, timelineFrame, decoders, orderedClips);
+            totalRenderStageMs += renderStageTimer.elapsed();
+            totalGpuReadbackMs += frameReadbackMs;
             if (rendered.isNull()) {
                 errorMessage = useGpuRenderer
                     ? QStringLiteral("Failed to render GPU timeline frame %1.").arg(timelineFrame)
@@ -1452,7 +1654,10 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
                 break;
             }
 
+            QElapsedTimer overlayTimer;
+            overlayTimer.start();
             renderTranscriptOverlays(&rendered, request, timelineFrame, orderedClips, transcriptCache);
+            totalOverlayStageMs += overlayTimer.elapsed();
 
             if (progressCallback) {
                 RenderProgress progress;
@@ -1466,6 +1671,18 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
                 progress.usingGpu = useGpuRenderer;
                 progress.usingHardwareEncode = usingHardwareEncode;
                 progress.encoderLabel = codecLabel;
+                progress.elapsedMs = totalTimer.elapsed();
+                progress.estimatedRemainingMs =
+                    progress.framesCompleted > 0
+                        ? (progress.elapsedMs * qMax<int64_t>(0, progress.totalFrames - progress.framesCompleted)) /
+                              qMax<int64_t>(1, progress.framesCompleted)
+                        : -1;
+                progress.renderStageMs = totalRenderStageMs;
+                progress.gpuReadbackMs = totalGpuReadbackMs;
+                progress.overlayStageMs = totalOverlayStageMs;
+                progress.convertStageMs = totalConvertStageMs;
+                progress.encodeStageMs = totalEncodeStageMs;
+                progress.audioStageMs = totalAudioStageMs;
                 progress.previewFrame = rendered;
                 if (!progressCallback(progress)) {
                     result.cancelled = true;
@@ -1474,33 +1691,48 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
                 }
             }
 
-            if (av_frame_make_writable(sourceFrame) < 0 || av_frame_make_writable(encodedFrame) < 0) {
+            if ((!sourceFrame || av_frame_make_writable(sourceFrame) >= 0) &&
+                av_frame_make_writable(encodedFrame) >= 0) {
+            } else {
                 errorMessage = QStringLiteral("Failed to make render frame writable.");
                 break;
             }
 
-            const int copyBytesPerRow = qMin(static_cast<int>(rendered.bytesPerLine()), sourceFrame->linesize[0]);
-            for (int y = 0; y < rendered.height(); ++y) {
-                memcpy(sourceFrame->data[0] + (y * sourceFrame->linesize[0]),
-                       rendered.constScanLine(y),
-                       copyBytesPerRow);
-            }
+            QElapsedTimer convertTimer;
+            convertTimer.start();
+            if (directNv12Conversion) {
+                if (!fillNv12FrameFromImage(rendered, encodedFrame)) {
+                    errorMessage = QStringLiteral("Failed to convert rendered frame %1 to NV12 for encoding.").arg(timelineFrame);
+                    break;
+                }
+            } else {
+                const int copyBytesPerRow = qMin(static_cast<int>(rendered.bytesPerLine()), sourceFrame->linesize[0]);
+                for (int y = 0; y < rendered.height(); ++y) {
+                    memcpy(sourceFrame->data[0] + (y * sourceFrame->linesize[0]),
+                           rendered.constScanLine(y),
+                           copyBytesPerRow);
+                }
 
-            if (sws_scale(swsCtx,
-                          sourceFrame->data,
-                          sourceFrame->linesize,
-                          0,
-                          sourceFrame->height,
-                          encodedFrame->data,
-                          encodedFrame->linesize) <= 0) {
-                errorMessage = QStringLiteral("Failed to convert rendered frame %1 for encoding.").arg(timelineFrame);
-                break;
+                if (sws_scale(swsCtx,
+                              sourceFrame->data,
+                              sourceFrame->linesize,
+                              0,
+                              sourceFrame->height,
+                              encodedFrame->data,
+                              encodedFrame->linesize) <= 0) {
+                    errorMessage = QStringLiteral("Failed to convert rendered frame %1 for encoding.").arg(timelineFrame);
+                    break;
+                }
             }
+            totalConvertStageMs += convertTimer.elapsed();
 
             encodedFrame->pts = outputPts++;
+            QElapsedTimer encodeTimer;
+            encodeTimer.start();
             if (!encodeFrame(codecCtx, stream, formatCtx, encodedFrame, &errorMessage)) {
                 break;
             }
+            totalEncodeStageMs += encodeTimer.elapsed();
             ++framesCompleted;
             if (!errorMessage.isEmpty()) {
                 break;
@@ -1516,7 +1748,10 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
     }
 
     if (errorMessage.isEmpty() && audioState.enabled) {
+        QElapsedTimer audioTimer;
+        audioTimer.start();
         encodeExportAudio(exportRanges, audioState, formatCtx, &errorMessage);
+        totalAudioStageMs += audioTimer.elapsed();
     }
 
     av_write_trailer(formatCtx);
@@ -1535,10 +1770,26 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
 
     if (!errorMessage.isEmpty()) {
         result.message = errorMessage;
+        result.framesRendered = framesCompleted;
+        result.elapsedMs = totalTimer.elapsed();
+        result.renderStageMs = totalRenderStageMs;
+        result.gpuReadbackMs = totalGpuReadbackMs;
+        result.overlayStageMs = totalOverlayStageMs;
+        result.convertStageMs = totalConvertStageMs;
+        result.encodeStageMs = totalEncodeStageMs;
+        result.audioStageMs = totalAudioStageMs;
         return result;
     }
 
     result.success = true;
+    result.framesRendered = framesCompleted;
+    result.elapsedMs = totalTimer.elapsed();
+    result.renderStageMs = totalRenderStageMs;
+    result.gpuReadbackMs = totalGpuReadbackMs;
+    result.overlayStageMs = totalOverlayStageMs;
+    result.convertStageMs = totalConvertStageMs;
+    result.encodeStageMs = totalEncodeStageMs;
+    result.audioStageMs = totalAudioStageMs;
     result.message = QStringLiteral("Rendered %1 video frames to %2%3")
                          .arg(framesCompleted)
                          .arg(QDir::toNativeSeparators(request.outputPath))

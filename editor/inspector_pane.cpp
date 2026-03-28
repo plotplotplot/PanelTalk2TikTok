@@ -15,7 +15,6 @@
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QPushButton>
-#include <QPlainTextEdit>
 #include <QVBoxLayout>
 
 InspectorPane::InspectorPane(QWidget *parent)
@@ -45,7 +44,7 @@ QWidget *InspectorPane::buildPane()
     m_inspectorTabs->addTab(buildTranscriptTab(), QStringLiteral("Transcript"));
     m_inspectorTabs->addTab(buildClipTab(), QStringLiteral("Clip"));
     m_inspectorTabs->addTab(buildOutputTab(), QStringLiteral("Output"));
-    m_inspectorTabs->addTab(buildProfileTab(), QStringLiteral("Profile"));
+    m_inspectorTabs->addTab(buildProfileTab(), QStringLiteral("System"));
 
     layout->addWidget(m_inspectorTabs);
     return pane;
@@ -80,8 +79,33 @@ QWidget *InspectorPane::buildGradingTab()
     form->addRow(QStringLiteral("Saturation"), m_saturationSpin);
     form->addRow(QStringLiteral("Opacity"), m_opacitySpin);
 
+    m_gradingAutoScrollCheckBox = new QCheckBox(QStringLiteral("Auto Scroll"), page);
+    m_gradingFollowCurrentCheckBox = new QCheckBox(QStringLiteral("Follow Current Keyframe"), page);
+    m_gradingAutoScrollCheckBox->setChecked(true);
+    m_gradingFollowCurrentCheckBox->setChecked(true);
+    m_gradingKeyAtPlayheadButton = new QPushButton(QStringLiteral("Key At Playhead"), page);
+
+    m_gradingKeyframeTable = new QTableWidget(page);
+    m_gradingKeyframeTable->setColumnCount(6);
+    m_gradingKeyframeTable->setHorizontalHeaderLabels({QStringLiteral("Frame"),
+                                                       QStringLiteral("Bright"),
+                                                       QStringLiteral("Contrast"),
+                                                       QStringLiteral("Sat"),
+                                                       QStringLiteral("Opacity"),
+                                                       QStringLiteral("Interp")});
+    m_gradingKeyframeTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_gradingKeyframeTable->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    m_gradingKeyframeTable->setEditTriggers(QAbstractItemView::DoubleClicked |
+                                            QAbstractItemView::EditKeyPressed);
+    m_gradingKeyframeTable->verticalHeader()->setVisible(false);
+    m_gradingKeyframeTable->horizontalHeader()->setStretchLastSection(true);
+    m_gradingKeyframeTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+
     layout->addLayout(form);
-    layout->addStretch(1);
+    layout->addWidget(m_gradingAutoScrollCheckBox);
+    layout->addWidget(m_gradingFollowCurrentCheckBox);
+    layout->addWidget(m_gradingKeyAtPlayheadButton);
+    layout->addWidget(m_gradingKeyframeTable, 1);
     return page;
 }
 
@@ -125,9 +149,15 @@ QWidget *InspectorPane::buildKeyframesTab()
     m_videoInterpolationCombo = new QComboBox(page);
     m_mirrorHorizontalCheckBox = new QCheckBox(QStringLiteral("Mirror Horizontal"), page);
     m_mirrorVerticalCheckBox = new QCheckBox(QStringLiteral("Mirror Vertical"), page);
+    m_lockVideoScaleCheckBox = new QCheckBox(QStringLiteral("Lock Scale"), page);
+    m_keyframeSpaceCheckBox = new QCheckBox(QStringLiteral("Clip-Relative Frames"), page);
+    m_addVideoKeyframeButton = new QPushButton(QStringLiteral("Add Keyframe"), page);
+    m_removeVideoKeyframeButton = new QPushButton(QStringLiteral("Remove Keyframe"), page);
 
     m_videoInterpolationCombo->addItem(QStringLiteral("Step"));
     m_videoInterpolationCombo->addItem(QStringLiteral("Linear"));
+    m_lockVideoScaleCheckBox->setChecked(false);
+    m_keyframeSpaceCheckBox->setChecked(true);
 
     for (QDoubleSpinBox *spin : {
              m_videoTranslationXSpin, m_videoTranslationYSpin, m_videoRotationSpin,
@@ -145,6 +175,10 @@ QWidget *InspectorPane::buildKeyframesTab()
     form->addRow(QStringLiteral("Scale X"), m_videoScaleXSpin);
     form->addRow(QStringLiteral("Scale Y"), m_videoScaleYSpin);
     form->addRow(QStringLiteral("Interpolation"), m_videoInterpolationCombo);
+
+    auto *buttonRow = new QHBoxLayout;
+    buttonRow->addWidget(m_addVideoKeyframeButton);
+    buttonRow->addWidget(m_removeVideoKeyframeButton);
 
     m_keyframesAutoScrollCheckBox = new QCheckBox(QStringLiteral("Auto Scroll"), page);
     m_keyframesFollowCurrentCheckBox = new QCheckBox(QStringLiteral("Follow Current Keyframe"), page);
@@ -171,10 +205,13 @@ QWidget *InspectorPane::buildKeyframesTab()
     layout->addWidget(m_keyframesInspectorClipLabel);
     layout->addWidget(m_keyframesInspectorDetailsLabel);
     layout->addLayout(form);
+    layout->addWidget(m_lockVideoScaleCheckBox);
+    layout->addWidget(m_keyframeSpaceCheckBox);
     layout->addWidget(m_keyframesAutoScrollCheckBox);
     layout->addWidget(m_keyframesFollowCurrentCheckBox);
     layout->addWidget(m_mirrorHorizontalCheckBox);
     layout->addWidget(m_mirrorVerticalCheckBox);
+    layout->addLayout(buttonRow);
     layout->addWidget(m_videoKeyframeTable, 1);
 
     return page;
@@ -379,14 +416,20 @@ QWidget *InspectorPane::buildProfileTab()
     auto *page = new QWidget;
     auto *layout = new QVBoxLayout(page);
 
-    m_profileSummaryTextEdit = new QPlainTextEdit(page);
-    m_profileSummaryTextEdit->setReadOnly(true);
-    m_profileSummaryTextEdit->setLineWrapMode(QPlainTextEdit::WidgetWidth);
-    m_profileSummaryTextEdit->setPlainText(QStringLiteral("Profile information unavailable."));
+    m_profileSummaryTable = new QTableWidget(page);
+    m_profileSummaryTable->setColumnCount(2);
+    m_profileSummaryTable->setHorizontalHeaderLabels({QStringLiteral("Property"), QStringLiteral("Value")});
+    m_profileSummaryTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_profileSummaryTable->setSelectionMode(QAbstractItemView::NoSelection);
+    m_profileSummaryTable->setFocusPolicy(Qt::NoFocus);
+    m_profileSummaryTable->verticalHeader()->setVisible(false);
+    m_profileSummaryTable->horizontalHeader()->setStretchLastSection(true);
+    m_profileSummaryTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    m_profileSummaryTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
 
     m_profileBenchmarkButton = new QPushButton(QStringLiteral("Run Decode Benchmark"), page);
 
-    layout->addWidget(m_profileSummaryTextEdit, 1);
+    layout->addWidget(m_profileSummaryTable, 1);
     layout->addWidget(m_profileBenchmarkButton);
     return page;
 }

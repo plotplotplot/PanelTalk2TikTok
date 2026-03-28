@@ -48,6 +48,19 @@ QJsonObject clipToJson(const TimelineClip &clip)
             keyframes.push_back(keyframeObj);
         }
         obj[QStringLiteral("transformKeyframes")] = keyframes;
+        QJsonArray gradingKeyframes;
+        for (const TimelineClip::GradingKeyframe &keyframe : clip.gradingKeyframes)
+        {
+            QJsonObject keyframeObj;
+            keyframeObj[QStringLiteral("frame")] = static_cast<qint64>(keyframe.frame);
+            keyframeObj[QStringLiteral("brightness")] = keyframe.brightness;
+            keyframeObj[QStringLiteral("contrast")] = keyframe.contrast;
+            keyframeObj[QStringLiteral("saturation")] = keyframe.saturation;
+            keyframeObj[QStringLiteral("opacity")] = keyframe.opacity;
+            keyframeObj[QStringLiteral("linearInterpolation")] = keyframe.linearInterpolation;
+            gradingKeyframes.push_back(keyframeObj);
+        }
+        obj[QStringLiteral("gradingKeyframes")] = gradingKeyframes;
         QJsonObject transcriptOverlayObj;
         transcriptOverlayObj[QStringLiteral("enabled")] = clip.transcriptOverlay.enabled;
         transcriptOverlayObj[QStringLiteral("autoScroll")] = clip.transcriptOverlay.autoScroll;
@@ -145,6 +158,28 @@ TimelineClip clipFromJson(const QJsonObject &obj)
             }
             clip.transformKeyframes.push_back(keyframe);
         }
+        const QJsonArray gradingKeyframes = obj.value(QStringLiteral("gradingKeyframes")).toArray();
+        for (const QJsonValue &value : gradingKeyframes)
+        {
+            if (!value.isObject())
+            {
+                continue;
+            }
+            const QJsonObject keyframeObj = value.toObject();
+            TimelineClip::GradingKeyframe keyframe;
+            keyframe.frame = keyframeObj.value(QStringLiteral("frame")).toVariant().toLongLong();
+            keyframe.brightness = keyframeObj.value(QStringLiteral("brightness")).toDouble(0.0);
+            keyframe.contrast = keyframeObj.value(QStringLiteral("contrast")).toDouble(1.0);
+            keyframe.saturation = keyframeObj.value(QStringLiteral("saturation")).toDouble(1.0);
+            keyframe.opacity = keyframeObj.value(QStringLiteral("opacity")).toDouble(1.0);
+            if (keyframeObj.contains(QStringLiteral("linearInterpolation"))) {
+                keyframe.linearInterpolation =
+                    keyframeObj.value(QStringLiteral("linearInterpolation")).toBool(true);
+            } else {
+                keyframe.linearInterpolation = true;
+            }
+            clip.gradingKeyframes.push_back(keyframe);
+        }
         const QJsonObject transcriptOverlayObj = obj.value(QStringLiteral("transcriptOverlay")).toObject();
         clip.transcriptOverlay.enabled = transcriptOverlayObj.value(QStringLiteral("enabled")).toBool(false);
         clip.transcriptOverlay.autoScroll = transcriptOverlayObj.value(QStringLiteral("autoScroll")).toBool(false);
@@ -166,6 +201,7 @@ TimelineClip clipFromJson(const QJsonObject &obj)
         clip.fadeSamples = qMax(0, obj.value(QStringLiteral("fadeSamples")).toInt(250));
         clip.locked = obj.value(QStringLiteral("locked")).toBool(false);
         normalizeClipTransformKeyframes(clip);
+        normalizeClipGradingKeyframes(clip);
         return clip;
     }
 

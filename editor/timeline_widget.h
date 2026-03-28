@@ -79,6 +79,7 @@ public:
     std::function<void()> renderSyncMarkersChanged;
     std::function<void(const QString&, const QString&)> transcribeRequested;
     std::function<void(const QString&)> createProxyRequested;
+    std::function<void(const QString&)> deleteProxyRequested;
     std::function<void()> exportRangeChanged;
 
 protected:

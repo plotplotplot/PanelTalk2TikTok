@@ -188,6 +188,22 @@ bool TimelineWidget::splitSelectedClipAtFrame(int64_t frame) {
         }
         clip.transformKeyframes = leftKeyframes;
 
+        rightClip.gradingKeyframes.clear();
+        for (const TimelineClip::GradingKeyframe& keyframe : clip.gradingKeyframes) {
+            if (keyframe.frame >= leftDuration) {
+                TimelineClip::GradingKeyframe shifted = keyframe;
+                shifted.frame -= leftDuration;
+                rightClip.gradingKeyframes.push_back(shifted);
+            }
+        }
+        QVector<TimelineClip::GradingKeyframe> leftGradingKeyframes;
+        for (const TimelineClip::GradingKeyframe& keyframe : clip.gradingKeyframes) {
+            if (keyframe.frame < leftDuration) {
+                leftGradingKeyframes.push_back(keyframe);
+            }
+        }
+        clip.gradingKeyframes = leftGradingKeyframes;
+
         clip.durationFrames = leftDuration;
         if (isImage) {
             clip.sourceInFrame = 0;
@@ -197,6 +213,8 @@ bool TimelineWidget::splitSelectedClipAtFrame(int64_t frame) {
         clip.sourceInSubframeSamples = 0;
         normalizeClipTransformKeyframes(clip);
         normalizeClipTransformKeyframes(rightClip);
+        normalizeClipGradingKeyframes(clip);
+        normalizeClipGradingKeyframes(rightClip);
         normalizeClipTiming(clip);
         normalizeClipTiming(rightClip);
         m_clips.insert(i + 1, rightClip);
@@ -1015,6 +1033,7 @@ TimelineClip TimelineWidget::buildClipFromFile(const QString& filePath,
         clip.color = QColor(QStringLiteral("#2f7f93"));
     }
     normalizeClipTransformKeyframes(clip);
+    normalizeClipGradingKeyframes(clip);
     return clip;
 }
 
@@ -1497,6 +1516,7 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
     QAction* propertiesAction = nullptr;
     QAction* transcribeAction = nullptr;
     QAction* createProxyAction = nullptr;
+    QAction* deleteProxyAction = nullptr;
 
     if (clipIndex >= 0) {
         menu.addSeparator();
@@ -1518,6 +1538,12 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
         createProxyAction->setEnabled(
             m_clips[clipIndex].mediaType == ClipMediaType::Video &&
             !isImageSequencePath(m_clips[clipIndex].filePath));
+        if (!detectedProxyPath.isEmpty()) {
+            deleteProxyAction = menu.addAction(QStringLiteral("Delete Proxy"));
+            deleteProxyAction->setEnabled(
+                m_clips[clipIndex].mediaType == ClipMediaType::Video &&
+                !isImageSequencePath(m_clips[clipIndex].filePath));
+        }
         propertiesAction = menu.addAction(QStringLiteral("Properties"));
         menu.addSeparator();
     }
@@ -1637,6 +1663,8 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
         clip.contrast = 1.0;
         clip.saturation = 1.0;
         clip.opacity = 1.0;
+        clip.gradingKeyframes.clear();
+        normalizeClipGradingKeyframes(clip);
         if (clipsChanged) clipsChanged();
         update();
         return;
@@ -1653,6 +1681,13 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
     if (selected == createProxyAction) {
         if (createProxyRequested && clipIndex >= 0) {
             createProxyRequested(m_clips[clipIndex].id);
+        }
+        return;
+    }
+
+    if (selected == deleteProxyAction) {
+        if (deleteProxyRequested && clipIndex >= 0) {
+            deleteProxyRequested(m_clips[clipIndex].id);
         }
         return;
     }

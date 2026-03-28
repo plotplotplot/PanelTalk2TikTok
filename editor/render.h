@@ -20,6 +20,14 @@ struct RenderProgress {
     bool usingGpu = false;
     bool usingHardwareEncode = false;
     QString encoderLabel;
+    qint64 elapsedMs = 0;
+    qint64 estimatedRemainingMs = -1;
+    qint64 renderStageMs = 0;
+    qint64 gpuReadbackMs = 0;
+    qint64 overlayStageMs = 0;
+    qint64 convertStageMs = 0;
+    qint64 encodeStageMs = 0;
+    qint64 audioStageMs = 0;
     QImage previewFrame;
 };
 
@@ -40,6 +48,14 @@ struct RenderResult {
     bool usedGpu = false;
     bool usedHardwareEncode = false;
     QString encoderLabel;
+    int64_t framesRendered = 0;
+    qint64 elapsedMs = 0;
+    qint64 renderStageMs = 0;
+    qint64 gpuReadbackMs = 0;
+    qint64 overlayStageMs = 0;
+    qint64 convertStageMs = 0;
+    qint64 encodeStageMs = 0;
+    qint64 audioStageMs = 0;
     QString message;
 };
 

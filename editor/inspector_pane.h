@@ -11,7 +11,6 @@ class QCheckBox;
 class QFontComboBox;
 class QTableWidget;
 class QPushButton;
-class QPlainTextEdit;
 
 class InspectorPane final : public QWidget
 {
@@ -35,6 +34,8 @@ public:
     QComboBox *videoInterpolationCombo() const { return m_videoInterpolationCombo; }
     QCheckBox *mirrorHorizontalCheckBox() const { return m_mirrorHorizontalCheckBox; }
     QCheckBox *mirrorVerticalCheckBox() const { return m_mirrorVerticalCheckBox; }
+    QCheckBox *lockVideoScaleCheckBox() const { return m_lockVideoScaleCheckBox; }
+    QCheckBox *keyframeSpaceCheckBox() const { return m_keyframeSpaceCheckBox; }
 
     QCheckBox *transcriptOverlayEnabledCheckBox() const { return m_transcriptOverlayEnabledCheckBox; }
     QSpinBox *transcriptMaxLinesSpin() const { return m_transcriptMaxLinesSpin; }
@@ -51,6 +52,10 @@ public:
     QCheckBox *transcriptFollowCurrentWordCheckBox() const { return m_transcriptFollowCurrentWordCheckBox; }
 
     QLabel *gradingPathLabel() const { return m_gradingPathLabel; }
+    QTableWidget *gradingKeyframeTable() const { return m_gradingKeyframeTable; }
+    QCheckBox *gradingAutoScrollCheckBox() const { return m_gradingAutoScrollCheckBox; }
+    QCheckBox *gradingFollowCurrentCheckBox() const { return m_gradingFollowCurrentCheckBox; }
+    QPushButton *gradingKeyAtPlayheadButton() const { return m_gradingKeyAtPlayheadButton; }
     QLabel *syncInspectorClipLabel() const { return m_syncInspectorClipLabel; }
     QLabel *syncInspectorDetailsLabel() const { return m_syncInspectorDetailsLabel; }
     QTableWidget *syncTable() const { return m_syncTable; }
@@ -60,6 +65,8 @@ public:
     QTableWidget *videoKeyframeTable() const { return m_videoKeyframeTable; }
     QCheckBox *keyframesAutoScrollCheckBox() const { return m_keyframesAutoScrollCheckBox; }
     QCheckBox *keyframesFollowCurrentCheckBox() const { return m_keyframesFollowCurrentCheckBox; }
+    QPushButton *addVideoKeyframeButton() const { return m_addVideoKeyframeButton; }
+    QPushButton *removeVideoKeyframeButton() const { return m_removeVideoKeyframeButton; }
 
     QLabel *audioInspectorClipLabel() const { return m_audioInspectorClipLabel; }
     QLabel *audioInspectorDetailsLabel() const { return m_audioInspectorDetailsLabel; }
@@ -72,7 +79,7 @@ public:
     QLabel *clipPlaybackSourceLabel() const { return m_clipPlaybackSourceLabel; }
     QLabel *clipOriginalInfoLabel() const { return m_clipOriginalInfoLabel; }
     QLabel *clipProxyInfoLabel() const { return m_clipProxyInfoLabel; }
-    QPlainTextEdit *profileSummaryTextEdit() const { return m_profileSummaryTextEdit; }
+    QTableWidget *profileSummaryTable() const { return m_profileSummaryTable; }
     QPushButton *profileBenchmarkButton() const { return m_profileBenchmarkButton; }
 
     QSpinBox *outputWidthSpin() const { return m_outputWidthSpin; }
@@ -111,6 +118,10 @@ private:
     QDoubleSpinBox *m_contrastSpin = nullptr;
     QDoubleSpinBox *m_saturationSpin = nullptr;
     QDoubleSpinBox *m_opacitySpin = nullptr;
+    QTableWidget *m_gradingKeyframeTable = nullptr;
+    QCheckBox *m_gradingAutoScrollCheckBox = nullptr;
+    QCheckBox *m_gradingFollowCurrentCheckBox = nullptr;
+    QPushButton *m_gradingKeyAtPlayheadButton = nullptr;
 
     QLabel *m_syncInspectorClipLabel = nullptr;
     QLabel *m_syncInspectorDetailsLabel = nullptr;
@@ -129,6 +140,10 @@ private:
     QComboBox *m_videoInterpolationCombo = nullptr;
     QCheckBox *m_mirrorHorizontalCheckBox = nullptr;
     QCheckBox *m_mirrorVerticalCheckBox = nullptr;
+    QCheckBox *m_lockVideoScaleCheckBox = nullptr;
+    QCheckBox *m_keyframeSpaceCheckBox = nullptr;
+    QPushButton *m_addVideoKeyframeButton = nullptr;
+    QPushButton *m_removeVideoKeyframeButton = nullptr;
 
     QLabel *m_audioInspectorClipLabel = nullptr;
     QLabel *m_audioInspectorDetailsLabel = nullptr;
@@ -141,7 +156,7 @@ private:
     QLabel *m_clipPlaybackSourceLabel = nullptr;
     QLabel *m_clipOriginalInfoLabel = nullptr;
     QLabel *m_clipProxyInfoLabel = nullptr;
-    QPlainTextEdit *m_profileSummaryTextEdit = nullptr;
+    QTableWidget *m_profileSummaryTable = nullptr;
     QPushButton *m_profileBenchmarkButton = nullptr;
     QCheckBox *m_transcriptOverlayEnabledCheckBox = nullptr;
     QSpinBox *m_transcriptMaxLinesSpin = nullptr;

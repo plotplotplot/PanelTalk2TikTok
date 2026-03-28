@@ -31,6 +31,15 @@ struct TimelineClip {
         bool linearInterpolation = true;
     };
 
+    struct GradingKeyframe {
+        int64_t frame = 0;
+        qreal brightness = 0.0;
+        qreal contrast = 1.0;
+        qreal saturation = 1.0;
+        qreal opacity = 1.0;
+        bool linearInterpolation = true;
+    };
+
     struct TranscriptOverlaySettings {
         bool enabled = false;
         bool autoScroll = false;
@@ -72,6 +81,7 @@ struct TimelineClip {
     qreal baseScaleX = 1.0;
     qreal baseScaleY = 1.0;
     QVector<TransformKeyframe> transformKeyframes;
+    QVector<GradingKeyframe> gradingKeyframes;
     TranscriptOverlaySettings transcriptOverlay;
     int fadeSamples = 250;  // Crossfade with previous audio clip (0 = no fade)
     bool locked = false;    // When true, prevents temporal adjustments
@@ -162,9 +172,12 @@ void normalizeClipTiming(TimelineClip& clip);
 QString transformInterpolationLabel(bool linearInterpolation);
 qreal sanitizeScaleValue(qreal value);
 void normalizeClipTransformKeyframes(TimelineClip& clip);
+void normalizeClipGradingKeyframes(TimelineClip& clip);
 TimelineClip::TransformKeyframe evaluateClipKeyframeOffsetAtFrame(const TimelineClip& clip, int64_t timelineFrame);
 TimelineClip::TransformKeyframe evaluateClipTransformAtFrame(const TimelineClip& clip, int64_t timelineFrame);
 TimelineClip::TransformKeyframe evaluateClipTransformAtPosition(const TimelineClip& clip, qreal timelineFramePosition);
+TimelineClip::GradingKeyframe evaluateClipGradingAtFrame(const TimelineClip& clip, int64_t timelineFrame);
+TimelineClip::GradingKeyframe evaluateClipGradingAtPosition(const TimelineClip& clip, qreal timelineFramePosition);
 int64_t adjustedClipLocalFrameAtTimelineFrame(const TimelineClip& clip,
                                               int64_t localTimelineFrame,
                                               const QVector<RenderSyncMarker>& markers);
@@ -174,6 +187,7 @@ int64_t sourceFrameForClipAtTimelinePosition(const TimelineClip& clip,
 
 MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames = 120);
 QImage applyClipGrade(const QImage& source, const TimelineClip& clip);
+QImage applyClipGrade(const QImage& source, const TimelineClip::GradingKeyframe& grade);
 QString playbackProxyPathForClip(const TimelineClip& clip);
 QString playbackMediaPathForClip(const TimelineClip& clip);
 QString interactivePreviewMediaPathForClip(const TimelineClip& clip);

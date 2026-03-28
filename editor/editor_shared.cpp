@@ -294,6 +294,51 @@ void normalizeClipTransformKeyframes(TimelineClip& clip) {
     clip.transformKeyframes = normalized;
 }
 
+void normalizeClipGradingKeyframes(TimelineClip& clip) {
+    std::sort(clip.gradingKeyframes.begin(), clip.gradingKeyframes.end(),
+              [](const TimelineClip::GradingKeyframe& a, const TimelineClip::GradingKeyframe& b) {
+                  return a.frame < b.frame;
+              });
+
+    QVector<TimelineClip::GradingKeyframe> normalized;
+    normalized.reserve(clip.gradingKeyframes.size());
+    const int64_t maxFrame = qMax<int64_t>(0, clip.durationFrames - 1);
+    for (TimelineClip::GradingKeyframe keyframe : clip.gradingKeyframes) {
+        keyframe.frame = qBound<int64_t>(0, keyframe.frame, maxFrame);
+        if (!normalized.isEmpty() && normalized.constLast().frame == keyframe.frame) {
+            normalized.last() = keyframe;
+        } else {
+            normalized.push_back(keyframe);
+        }
+    }
+
+    if (clipHasVisuals(clip)) {
+        if (normalized.isEmpty()) {
+            TimelineClip::GradingKeyframe keyframe;
+            keyframe.frame = 0;
+            keyframe.brightness = clip.brightness;
+            keyframe.contrast = clip.contrast;
+            keyframe.saturation = clip.saturation;
+            keyframe.opacity = clip.opacity;
+            normalized.push_back(keyframe);
+        } else if (normalized.constFirst().frame > 0) {
+            TimelineClip::GradingKeyframe firstKeyframe = normalized.constFirst();
+            firstKeyframe.frame = 0;
+            normalized.push_front(firstKeyframe);
+        } else {
+            normalized.first().frame = 0;
+        }
+    }
+
+    clip.gradingKeyframes = normalized;
+    if (!clip.gradingKeyframes.isEmpty()) {
+        clip.brightness = clip.gradingKeyframes.constFirst().brightness;
+        clip.contrast = clip.gradingKeyframes.constFirst().contrast;
+        clip.saturation = clip.gradingKeyframes.constFirst().saturation;
+        clip.opacity = clip.gradingKeyframes.constFirst().opacity;
+    }
+}
+
 TimelineClip::TransformKeyframe evaluateClipKeyframeOffsetAtFrame(const TimelineClip& clip, int64_t timelineFrame) {
     TimelineClip::TransformKeyframe state;
     if (clip.transformKeyframes.isEmpty()) {
@@ -389,6 +434,87 @@ TimelineClip::TransformKeyframe evaluateClipTransformAtPosition(const TimelineCl
     state.rotation += clip.baseRotation;
     state.scaleX = sanitizeScaleValue(clip.baseScaleX * state.scaleX);
     state.scaleY = sanitizeScaleValue(clip.baseScaleY * state.scaleY);
+    return state;
+}
+
+TimelineClip::GradingKeyframe evaluateClipGradingAtFrame(const TimelineClip& clip, int64_t timelineFrame) {
+    TimelineClip::GradingKeyframe state;
+    state.brightness = clip.brightness;
+    state.contrast = clip.contrast;
+    state.saturation = clip.saturation;
+    state.opacity = clip.opacity;
+    if (clip.gradingKeyframes.isEmpty()) {
+        return state;
+    }
+
+    const int64_t localFrame = qBound<int64_t>(0, timelineFrame - clip.startFrame, qMax<int64_t>(0, clip.durationFrames - 1));
+    if (localFrame <= clip.gradingKeyframes.constFirst().frame) {
+        return clip.gradingKeyframes.constFirst();
+    }
+
+    for (int i = 1; i < clip.gradingKeyframes.size(); ++i) {
+        const TimelineClip::GradingKeyframe& previous = clip.gradingKeyframes[i - 1];
+        const TimelineClip::GradingKeyframe& current = clip.gradingKeyframes[i];
+        if (localFrame < current.frame) {
+            if (!current.linearInterpolation || current.frame <= previous.frame) {
+                return previous;
+            }
+            const qreal t = static_cast<qreal>(localFrame - previous.frame) /
+                            static_cast<qreal>(current.frame - previous.frame);
+            state.frame = localFrame;
+            state.brightness = previous.brightness + ((current.brightness - previous.brightness) * t);
+            state.contrast = previous.contrast + ((current.contrast - previous.contrast) * t);
+            state.saturation = previous.saturation + ((current.saturation - previous.saturation) * t);
+            state.opacity = previous.opacity + ((current.opacity - previous.opacity) * t);
+            state.linearInterpolation = current.linearInterpolation;
+            return state;
+        }
+        if (localFrame == current.frame) {
+            return current;
+        }
+    }
+
+    return clip.gradingKeyframes.constLast();
+}
+
+TimelineClip::GradingKeyframe evaluateClipGradingAtPosition(const TimelineClip& clip, qreal timelineFramePosition) {
+    TimelineClip::GradingKeyframe state;
+    state.brightness = clip.brightness;
+    state.contrast = clip.contrast;
+    state.saturation = clip.saturation;
+    state.opacity = clip.opacity;
+    if (clip.gradingKeyframes.isEmpty()) {
+        return state;
+    }
+
+    const qreal maxFrame = static_cast<qreal>(qMax<int64_t>(0, clip.durationFrames - 1));
+    const qreal localFrame = qBound<qreal>(0.0, timelineFramePosition - static_cast<qreal>(clip.startFrame), maxFrame);
+    if (localFrame <= static_cast<qreal>(clip.gradingKeyframes.constFirst().frame)) {
+        return clip.gradingKeyframes.constFirst();
+    }
+
+    state = clip.gradingKeyframes.constLast();
+    for (int i = 1; i < clip.gradingKeyframes.size(); ++i) {
+        const TimelineClip::GradingKeyframe& previous = clip.gradingKeyframes[i - 1];
+        const TimelineClip::GradingKeyframe& current = clip.gradingKeyframes[i];
+        if (localFrame < static_cast<qreal>(current.frame)) {
+            if (!current.linearInterpolation || current.frame <= previous.frame) {
+                return previous;
+            }
+            const qreal t = (localFrame - static_cast<qreal>(previous.frame)) /
+                            static_cast<qreal>(current.frame - previous.frame);
+            state.frame = qRound64(localFrame);
+            state.brightness = previous.brightness + ((current.brightness - previous.brightness) * t);
+            state.contrast = previous.contrast + ((current.contrast - previous.contrast) * t);
+            state.saturation = previous.saturation + ((current.saturation - previous.saturation) * t);
+            state.opacity = previous.opacity + ((current.opacity - previous.opacity) * t);
+            state.linearInterpolation = current.linearInterpolation;
+            return state;
+        }
+        if (qFuzzyCompare(localFrame + 1.0, static_cast<qreal>(current.frame) + 1.0)) {
+            return current;
+        }
+    }
     return state;
 }
 
@@ -520,12 +646,12 @@ MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames)
     return result;
 }
 
-QImage applyClipGrade(const QImage& source, const TimelineClip& clip) {
+QImage applyClipGrade(const QImage& source, const TimelineClip::GradingKeyframe& grade) {
     const bool needsGrade =
-        !qFuzzyIsNull(clip.brightness) ||
-        !qFuzzyCompare(clip.contrast, 1.0) ||
-        !qFuzzyCompare(clip.saturation, 1.0) ||
-        !qFuzzyCompare(clip.opacity, 1.0);
+        !qFuzzyIsNull(grade.brightness) ||
+        !qFuzzyCompare(grade.contrast, 1.0) ||
+        !qFuzzyCompare(grade.saturation, 1.0) ||
+        !qFuzzyCompare(grade.opacity, 1.0);
     if (source.isNull() || !needsGrade) {
         return source;
     }
@@ -541,19 +667,23 @@ QImage applyClipGrade(const QImage& source, const TimelineClip& clip) {
             float a = 0.0f;
             color.getHslF(&h, &s, &l, &a);
 
-            int r = clampChannel(qRound(((color.red() - 127.5) * clip.contrast) + 127.5 + clip.brightness * 255.0));
-            int g = clampChannel(qRound(((color.green() - 127.5) * clip.contrast) + 127.5 + clip.brightness * 255.0));
-            int b = clampChannel(qRound(((color.blue() - 127.5) * clip.contrast) + 127.5 + clip.brightness * 255.0));
+            int r = clampChannel(qRound(((color.red() - 127.5) * grade.contrast) + 127.5 + grade.brightness * 255.0));
+            int g = clampChannel(qRound(((color.green() - 127.5) * grade.contrast) + 127.5 + grade.brightness * 255.0));
+            int b = clampChannel(qRound(((color.blue() - 127.5) * grade.contrast) + 127.5 + grade.brightness * 255.0));
 
             QColor adjusted(r, g, b, color.alpha());
             adjusted.getHslF(&h, &s, &l, &a);
-            s = qBound(0.0f, static_cast<float>(s * clip.saturation), 1.0f);
-            a = qBound(0.0f, static_cast<float>(a * clip.opacity), 1.0f);
+            s = qBound(0.0f, static_cast<float>(s * grade.saturation), 1.0f);
+            a = qBound(0.0f, static_cast<float>(a * grade.opacity), 1.0f);
             adjusted.setHslF(h, s, l, a);
             row[x] = adjusted.rgba();
         }
     }
     return graded.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+}
+
+QImage applyClipGrade(const QImage& source, const TimelineClip& clip) {
+    return applyClipGrade(source, evaluateClipGradingAtFrame(clip, clip.startFrame));
 }
 
 QString playbackProxyPathForClip(const TimelineClip& clip) {
