@@ -57,6 +57,14 @@ void GradingTab::wire()
         connect(m_widgets.gradingKeyAtPlayheadButton, &QPushButton::clicked,
                 this, &GradingTab::onKeyAtPlayheadClicked);
     }
+    if (m_widgets.gradingFadeInButton) {
+        connect(m_widgets.gradingFadeInButton, &QPushButton::clicked,
+                this, &GradingTab::onFadeInClicked);
+    }
+    if (m_widgets.gradingFadeOutButton) {
+        connect(m_widgets.gradingFadeOutButton, &QPushButton::clicked,
+                this, &GradingTab::onFadeOutClicked);
+    }
     if (m_widgets.gradingKeyframeTable) {
         connect(m_widgets.gradingKeyframeTable, &QTableWidget::itemSelectionChanged,
                 this, &GradingTab::onTableSelectionChanged);
@@ -212,6 +220,16 @@ void GradingTab::upsertKeyframeAtPlayhead()
     emit keyframeAdded();
 }
 
+void GradingTab::fadeInFromPlayhead()
+{
+    applyOpacityFadeFromPlayhead(true);
+}
+
+void GradingTab::fadeOutFromPlayhead()
+{
+    applyOpacityFadeFromPlayhead(false);
+}
+
 void GradingTab::syncTableToPlayhead()
 {
     if (!m_widgets.gradingKeyframeTable || m_updating) return;
@@ -323,6 +341,16 @@ void GradingTab::onFollowCurrentToggled(bool checked)
 void GradingTab::onKeyAtPlayheadClicked()
 {
     upsertKeyframeAtPlayhead();
+}
+
+void GradingTab::onFadeInClicked()
+{
+    fadeInFromPlayhead();
+}
+
+void GradingTab::onFadeOutClicked()
+{
+    fadeOutFromPlayhead();
 }
 
 void GradingTab::onTableSelectionChanged()
@@ -642,6 +670,73 @@ void GradingTab::populateTable(const TimelineClip& clip)
             m_widgets.gradingKeyframeTable->setItem(row, column, item);
         }
     }
+}
+
+void GradingTab::applyOpacityFadeFromPlayhead(bool fadeIn)
+{
+    const TimelineClip* clip = m_deps.getSelectedClip();
+    if (!clip || !m_deps.clipHasVisuals(*clip)) {
+        return;
+    }
+
+    const int64_t localStartFrame = qBound<int64_t>(0,
+                                                    m_deps.getCurrentTimelineFrame() - clip->startFrame,
+                                                    qMax<int64_t>(0, clip->durationFrames - 1));
+    const int64_t localEndFrame = qMax<int64_t>(0, clip->durationFrames - 1);
+    if (localStartFrame >= localEndFrame) {
+        QMessageBox::information(nullptr,
+                                 QStringLiteral("Opacity Fade"),
+                                 QStringLiteral("Move the playhead before the end of the clip to create a fade."));
+        return;
+    }
+
+    const GradingKeyframeDisplay startDisplay = evaluateDisplayedGrading(*clip, clip->startFrame + localStartFrame);
+    const GradingKeyframeDisplay endDisplay = evaluateDisplayedGrading(*clip, clip->startFrame + localEndFrame);
+    const double targetVisibleOpacity = qBound(0.0, qMax(startDisplay.opacity, endDisplay.opacity), 1.0);
+
+    const bool updated = m_deps.updateClipById(clip->id, [&](TimelineClip& updatedClip) {
+        auto upsertFrame = [](QVector<TimelineClip::GradingKeyframe>& keyframes,
+                              const TimelineClip::GradingKeyframe& keyframe) {
+            for (TimelineClip::GradingKeyframe& existing : keyframes) {
+                if (existing.frame == keyframe.frame) {
+                    existing = keyframe;
+                    return;
+                }
+            }
+            keyframes.push_back(keyframe);
+        };
+
+        TimelineClip::GradingKeyframe startKeyframe;
+        startKeyframe.frame = localStartFrame;
+        startKeyframe.brightness = startDisplay.brightness;
+        startKeyframe.contrast = startDisplay.contrast;
+        startKeyframe.saturation = startDisplay.saturation;
+        startKeyframe.opacity = fadeIn ? 0.0 : qBound(0.0, startDisplay.opacity, 1.0);
+        startKeyframe.linearInterpolation = true;
+
+        TimelineClip::GradingKeyframe endKeyframe;
+        endKeyframe.frame = localEndFrame;
+        endKeyframe.brightness = endDisplay.brightness;
+        endKeyframe.contrast = endDisplay.contrast;
+        endKeyframe.saturation = endDisplay.saturation;
+        endKeyframe.opacity = fadeIn ? targetVisibleOpacity : 0.0;
+        endKeyframe.linearInterpolation = true;
+
+        upsertFrame(updatedClip.gradingKeyframes, startKeyframe);
+        upsertFrame(updatedClip.gradingKeyframes, endKeyframe);
+        normalizeClipGradingKeyframes(updatedClip);
+    });
+
+    if (!updated) {
+        return;
+    }
+
+    m_selectedKeyframeFrame = localStartFrame;
+    m_selectedKeyframeFrames = {localStartFrame, localEndFrame};
+    m_deps.setPreviewTimelineClips();
+    m_deps.refreshInspector();
+    m_deps.scheduleSaveState();
+    m_deps.pushHistorySnapshot();
 }
 
 void GradingTab::removeSelectedKeyframes()

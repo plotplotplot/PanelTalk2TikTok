@@ -50,6 +50,7 @@ public:
     void insert(int64_t frameNumber, const FrameHandle& frame);
     FrameHandle get(int64_t frameNumber);
     FrameHandle getBest(int64_t frameNumber);
+    FrameHandle getLatestAtOrBefore(int64_t frameNumber);
     bool contains(int64_t frameNumber) const;
     void remove(int64_t frameNumber);
     
@@ -67,6 +68,13 @@ public:
     int64_t duration() const { return m_duration; }
     
 private:
+    struct FrameMemoryUse {
+        size_t cpuBytes = 0;
+        size_t gpuBytes = 0;
+    };
+
+    FrameMemoryUse frameMemoryUse(const FrameHandle& frame) const;
+
     QString m_path;
     int64_t m_duration;
     MemoryBudget* m_budget = nullptr;
@@ -131,8 +139,10 @@ public:
     // Try to get frame from cache (synchronous)
     FrameHandle getCachedFrame(const QString& clipId, int64_t frameNumber);
     FrameHandle getBestCachedFrame(const QString& clipId, int64_t frameNumber);
+    FrameHandle getLatestCachedFrame(const QString& clipId, int64_t frameNumber);
     FrameHandle getPlaybackFrame(const QString& clipId, int64_t frameNumber);
     FrameHandle getBestPlaybackFrame(const QString& clipId, int64_t frameNumber);
+    FrameHandle getLatestPlaybackFrame(const QString& clipId, int64_t frameNumber);
     bool isFrameCached(const QString& clipId, int64_t frameNumber) const;
     bool isPlaybackFrameBuffered(const QString& clipId, int64_t frameNumber) const;
     
@@ -180,6 +190,7 @@ private:
         void insert(int64_t frameNumber, const FrameHandle& frame);
         FrameHandle get(int64_t frameNumber);
         FrameHandle getBest(int64_t frameNumber);
+        FrameHandle getLatestAtOrBefore(int64_t frameNumber);
         bool contains(int64_t frameNumber) const;
 
     private:

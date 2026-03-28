@@ -3,6 +3,7 @@
 #include "editor_shared.h"
 
 #include <QDebug>
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QElapsedTimer>
 #include <QFile>
@@ -10,6 +11,7 @@
 #include <QHash>
 #include <QImageReader>
 #include <QGuiApplication>
+#include <QFile>
 #include <QPainter>
 #include <QThread>
 #include <QThreadStorage>
@@ -32,6 +34,12 @@ namespace {
 constexpr int64_t kMaxSequentialDecodeGap = 90;
 constexpr int64_t kPlaybackBatchFrameSlack = 2;
 
+#if defined(__SANITIZE_ADDRESS__)
+constexpr bool kAsanBuild = true;
+#else
+constexpr bool kAsanBuild = false;
+#endif
+
 qint64 decodeTraceMs() {
     static QElapsedTimer timer;
     static bool started = false;
@@ -44,6 +52,23 @@ qint64 decodeTraceMs() {
 
 QString shortPath(const QString& path) {
     return QFileInfo(path).fileName();
+}
+
+bool linuxNvidiaDetected() {
+#if defined(Q_OS_LINUX)
+    return QFile::exists(QStringLiteral("/proc/driver/nvidia/version")) ||
+           QFile::exists(QStringLiteral("/sys/module/nvidia"));
+#else
+    return false;
+#endif
+}
+
+bool zeroCopyInteropSupportedForCurrentBuild() {
+#if defined(Q_OS_LINUX)
+    return linuxNvidiaDetected();
+#else
+    return false;
+#endif
 }
 
 bool isStillImagePath(const QString& path) {
@@ -220,6 +245,26 @@ void decodeTrace(const QString& stage, const QString& detail = QString()) {
                               .arg(now, 6)
                               .arg(stage)
                               .arg(detail.isEmpty() ? QString() : QStringLiteral(" | ") + detail);
+}
+
+void invokeRequestCallback(std::function<void(FrameHandle)> callback, FrameHandle frame) {
+    if (!callback) {
+        return;
+    }
+
+    QCoreApplication* app = QCoreApplication::instance();
+    if (!app) {
+        callback(frame);
+        return;
+    }
+
+    QMetaObject::invokeMethod(app,
+                              [callback = std::move(callback), frame]() mutable {
+                                  if (callback) {
+                                      callback(frame);
+                                  }
+                              },
+                              Qt::QueuedConnection);
 }
 }
 
@@ -479,26 +524,41 @@ bool DecoderContext::initCodec() {
     const bool headlessOffscreen =
         qEnvironmentVariable("QT_QPA_PLATFORM") == QStringLiteral("offscreen");
     const DecodePreference decodePreference = debugDecodePreference();
+    const bool zeroCopyPreferred =
+        decodePreference == DecodePreference::Auto ||
+        decodePreference == DecodePreference::HardwareZeroCopy;
+    const bool zeroCopySupported =
+        zeroCopyPreferred &&
+        !headlessOffscreen &&
+        !m_streamHasAlphaTag &&
+        zeroCopyInteropSupportedForCurrentBuild();
     const bool allowHardware =
         decodePreference != DecodePreference::Software &&
         !headlessOffscreen &&
         !m_streamHasAlphaTag;
     const bool hardwareEnabled = allowHardware && initHardwareAccel(decoder);
+    const bool softwareProResAsanWorkaround =
+        kAsanBuild &&
+        !hardwareEnabled &&
+        stream->codecpar->codec_id == AV_CODEC_ID_PRORES;
+
     if (hardwareEnabled) {
         // Let FFmpeg choose sensible threading for hardware-backed decode.
         m_codecCtx->thread_count = 0;
         m_codecCtx->thread_type = FF_THREAD_FRAME;
-    } else if (requiresSoftwareAlphaPath) {
-        // Alpha WebM preview needs software decode, but professional editors
-        // still run that path with codec-level parallelism for realtime use.
+    } else if (softwareProResAsanWorkaround) {
+        // ASan currently trips inside libavcodec's internal ProRes worker
+        // threads. Keep our app threading intact, but serialize this codec's
+        // internal decode path in sanitizer builds so we can debug our code.
+        m_codecCtx->thread_count = 1;
+        m_codecCtx->thread_type = 0;
+    } else {
+        // Let software decoders use their normal parallel paths. Forcing
+        // single-threaded decode here is not worth the stability cost, and
+        // ProRes in particular behaves better with FFmpeg's default threading.
         m_codecCtx->thread_count = qBound(2, QThread::idealThreadCount(), 8);
         m_codecCtx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
         m_codecCtx->flags2 |= AV_CODEC_FLAG2_FAST;
-    } else {
-        // Timeline playback benefits from deterministic frame-exact decoding
-        // when we stay on the software path.
-        m_codecCtx->thread_count = 1;
-        m_codecCtx->thread_type = 0;
     }
 
     // For alpha-tagged streams, request a pixel format that supports alpha.
@@ -518,6 +578,10 @@ bool DecoderContext::initCodec() {
     m_info.hardwareAccelerated = hardwareEnabled;
     m_info.decodePath = hardwareEnabled ? QStringLiteral("hardware")
                                         : QStringLiteral("software");
+    m_info.interopPath = hardwareEnabled
+                             ? (zeroCopySupported ? QStringLiteral("cuda_gl_nv12_copy_candidate")
+                                                  : QStringLiteral("hardware_cpu_upload"))
+                             : QStringLiteral("software");
 
     qDebug() << "Decoder path for" << m_path << ":" << (hardwareEnabled ? "hardware" : "software");
     
@@ -769,6 +833,22 @@ bool DecoderContext::seekToKeyframe(int64_t targetFrame) {
 }
 
 FrameHandle DecoderContext::convertToFrame(AVFrame* avFrame, int64_t frameNumber) {
+    if (avFrame->format == m_hwPixFmt &&
+        m_hwPixFmt != AV_PIX_FMT_NONE &&
+        (debugDecodePreference() == DecodePreference::HardwareZeroCopy ||
+         debugDecodePreference() == DecodePreference::Auto) &&
+        avFrame->hw_frames_ctx) {
+        auto* framesContext = reinterpret_cast<AVHWFramesContext*>(avFrame->hw_frames_ctx->data);
+        const int swPixelFormat = framesContext ? framesContext->sw_format : AV_PIX_FMT_NONE;
+        if (swPixelFormat == AV_PIX_FMT_NV12) {
+            FrameHandle hardwareHandle =
+                FrameHandle::createHardwareFrame(avFrame, frameNumber, m_path, swPixelFormat);
+            if (!hardwareHandle.isNull()) {
+                return hardwareHandle;
+            }
+        }
+    }
+
     QImage image = convertAVFrameToImage(avFrame);
     if (image.isNull()) {
         return FrameHandle();
@@ -942,434 +1022,30 @@ void DecoderContext::updateAccessTime() {
 }
 
 // ============================================================================
-// DecodeQueue Implementation
-// ============================================================================
-
-bool DecodeQueue::enqueue(DecodeRequest req) {
-    QVector<std::function<void(FrameHandle)>> droppedCallbacks;
-    QMutexLocker lock(&m_mutex);
-    
-    if (m_shutdown.load()) return false;
-
-    const int visibleReserve = qBound(0, debugVisibleQueueReserve(), kMaxSize - 1);
-    const int nonVisibleLimit = kMaxSize - visibleReserve;
-    if (req.kind != DecodeRequestKind::Visible && static_cast<int>(m_queue.size()) >= nonVisibleLimit) {
-        return false;
-    }
-
-    collectSupersededRequests(req, &droppedCallbacks);
-    
-    if (m_queue.size() >= kMaxSize) {
-        // Try to drop a lower priority request
-        bool dropped = false;
-        for (int i = static_cast<int>(m_queue.size()) - 1; i >= 0; --i) {
-            const bool kindFavored =
-                req.kind == DecodeRequestKind::Visible && m_queue[i].kind != DecodeRequestKind::Visible;
-            if (kindFavored || m_queue[i].priority < req.priority) {
-                if (m_queue[i].callback) {
-                    droppedCallbacks.push_back(std::move(m_queue[i].callback));
-                }
-                m_queue.erase(m_queue.begin() + i);
-                dropped = true;
-                break;
-            }
-        }
-        if (!dropped) {
-            return false;
-        }
-    }
-    
-    insertByPriority(req);
-    m_condition.wakeOne();
-    lock.unlock();
-    for (const auto& droppedCallback : droppedCallbacks) {
-        if (droppedCallback) {
-            droppedCallback(FrameHandle());
-        }
-    }
-    return true;
-}
-
-bool DecodeQueue::dequeue(DecodeRequest* out) {
-    QMutexLocker lock(&m_mutex);
-    
-    while (m_queue.empty() && !m_shutdown.load()) {
-        m_condition.wait(&m_mutex);
-    }
-    
-    if (m_shutdown.load() && m_queue.empty()) {
-        return false;
-    }
-    
-    *out = std::move(m_queue.front());
-    m_queue.pop_front();
-    return true;
-}
-
-bool DecodeQueue::tryDequeue(DecodeRequest* out, int timeoutMs) {
-    QMutexLocker lock(&m_mutex);
-    
-    if (m_queue.empty() && !m_shutdown.load()) {
-        m_condition.wait(&m_mutex, timeoutMs);
-    }
-    
-    if (m_queue.empty()) {
-        return false;
-    }
-    
-    *out = std::move(m_queue.front());
-    m_queue.pop_front();
-    return true;
-}
-
-QVector<DecodeRequest> DecodeQueue::takeSameFileVisibleRequests(const QString& path,
-                                                                int64_t minimumFrameNumber,
-                                                                int maxRequests) {
-    QVector<DecodeRequest> requests;
-    if (maxRequests <= 0) {
-        return requests;
-    }
-
-    QMutexLocker lock(&m_mutex);
-    for (auto it = m_queue.begin(); it != m_queue.end() && requests.size() < maxRequests;) {
-        if (it->filePath != path ||
-            it->kind != DecodeRequestKind::Visible ||
-            it->frameNumber < minimumFrameNumber) {
-            ++it;
-            continue;
-        }
-        requests.push_back(std::move(*it));
-        it = m_queue.erase(it);
-    }
-    return requests;
-}
-
-void DecodeQueue::clear() {
-    QMutexLocker lock(&m_mutex);
-    m_queue.clear();
-}
-
-void DecodeQueue::removeForFile(const QString& path) {
-    QVector<std::function<void(FrameHandle)>> callbacks;
-    QMutexLocker lock(&m_mutex);
-    for (int i = static_cast<int>(m_queue.size()) - 1; i >= 0; --i) {
-        if (m_queue[i].filePath == path) {
-            if (m_queue[i].callback) {
-                callbacks.push_back(std::move(m_queue[i].callback));
-            }
-            m_queue.erase(m_queue.begin() + i);
-        }
-    }
-    lock.unlock();
-    for (const auto& callback : callbacks) {
-        if (callback) {
-            callback(FrameHandle());
-        }
-    }
-}
-
-void DecodeQueue::removeForFileBefore(const QString& path, int64_t frameNumber) {
-    QVector<std::function<void(FrameHandle)>> callbacks;
-    QMutexLocker lock(&m_mutex);
-    for (int i = static_cast<int>(m_queue.size()) - 1; i >= 0; --i) {
-        if (m_queue[i].filePath == path && m_queue[i].frameNumber < frameNumber) {
-            if (m_queue[i].callback) {
-                callbacks.push_back(std::move(m_queue[i].callback));
-            }
-            m_queue.erase(m_queue.begin() + i);
-        }
-    }
-    lock.unlock();
-    for (const auto& callback : callbacks) {
-        if (callback) {
-            callback(FrameHandle());
-        }
-    }
-}
-
-int DecodeQueue::size() const {
-    QMutexLocker lock(&m_mutex);
-    return m_queue.size();
-}
-
-bool DecodeQueue::isEmpty() const {
-    QMutexLocker lock(&m_mutex);
-    return m_queue.empty();
-}
-
-void DecodeQueue::shutdown() {
-    QMutexLocker lock(&m_mutex);
-    m_shutdown.store(true);
-    m_condition.wakeAll();
-}
-
-void DecodeQueue::insertByPriority(const DecodeRequest& req) {
-    // Insertion sort by priority (higher first)
-    int i = 0;
-    for (; i < static_cast<int>(m_queue.size()); ++i) {
-        if (m_queue[i].priority < req.priority) {
-            break;
-        }
-    }
-    m_queue.insert(m_queue.begin() + i, req);
-}
-
-void DecodeQueue::collectSupersededRequests(const DecodeRequest& req,
-                                            QVector<std::function<void(FrameHandle)>>* droppedCallbacks) {
-    if (!droppedCallbacks) {
-        return;
-    }
-
-    // During forward playback, newer same-file requests supersede older queued
-    // targets. Keeping the newest target lets the decoder stay close to the
-    // active frontier instead of spending queue time on already-obsolete work.
-    for (int i = static_cast<int>(m_queue.size()) - 1; i >= 0; --i) {
-        const DecodeRequest& queued = m_queue[i];
-        if (queued.filePath != req.filePath) {
-            continue;
-        }
-        if (queued.frameNumber >= req.frameNumber) {
-            continue;
-        }
-        if (queued.priority > req.priority) {
-            continue;
-        }
-        if (queued.kind == DecodeRequestKind::Visible && req.kind != DecodeRequestKind::Visible) {
-            continue;
-        }
-        if (queued.callback) {
-            droppedCallbacks->push_back(std::move(m_queue[i].callback));
-        }
-        m_queue.erase(m_queue.begin() + i);
-    }
-}
-
-// ============================================================================
-// DecoderWorker Implementation
-// ============================================================================
-
-DecoderWorker::DecoderWorker(DecodeQueue* queue, MemoryBudget* budget, QObject* parent)
-    : QObject(parent), m_queue(queue), m_budget(budget) {}
-
-DecoderWorker::~DecoderWorker() {
-    stop();
-    
-    // Clean up decoder contexts
-    QMutexLocker lock(&m_contextsMutex);
-    for (auto it = m_contexts.begin(); it != m_contexts.end(); ++it) {
-        delete it.value();
-    }
-    m_contexts.clear();
-}
-
-void DecoderWorker::start() {
-    if (m_thread) return;
-    
-    m_thread = new QThread();
-    moveToThread(m_thread);
-    connect(m_thread, &QThread::started, this, &DecoderWorker::run);
-    m_running.store(true);
-    m_thread->start();
-}
-
-void DecoderWorker::stop() {
-    m_running.store(false);
-    if (m_thread) {
-        m_thread->quit();
-        m_thread->wait(5000);
-        delete m_thread;
-        m_thread = nullptr;
-    }
-    
-    QMutexLocker lock(&m_contextsMutex);
-    m_contexts.clear();
-}
-
-void DecoderWorker::run() {
-    while (m_running.load()) {
-        DecodeRequest req;
-        if (!m_queue->dequeue(&req)) {
-            continue;
-        }
-        
-        if (req.isExpired()) {
-            m_dropCount++;
-            if (req.callback) {
-                req.callback(FrameHandle());
-            }
-            continue;
-        }
-        
-        processRequest(req);
-    }
-}
-
-void DecoderWorker::processRequest(const DecodeRequest& req) {
-    const qint64 startedAt = decodeTraceMs();
-    decodeTrace(QStringLiteral("DecoderWorker::processRequest.begin"),
-                QStringLiteral("seq=%1 file=%2 frame=%3 priority=%4 queue=%5 thread=%6")
-                    .arg(req.sequenceId)
-                    .arg(shortPath(req.filePath))
-                    .arg(req.frameNumber)
-                    .arg(req.priority)
-                    .arg(m_queue ? m_queue->size() : -1)
-                    .arg(reinterpret_cast<quintptr>(QThread::currentThreadId()), 0, 16));
-    DecoderContext* ctx = getOrCreateContext(req.filePath);
-    if (!ctx) {
-        m_dropCount++;
-        if (req.callback) {
-            req.callback(FrameHandle());
-        }
-        emit decodeError(req.filePath, "Failed to create decoder context");
-        return;
-    }
-
-    FrameHandle frame = ctx->decodeFrame(req.frameNumber);
-
-    if (frame.isNull()) {
-        m_dropCount++;
-    } else {
-        m_decodeCount++;
-    }
-
-    if (req.callback) {
-        req.callback(frame);
-    }
-
-    emit frameDecoded(frame);
-    decodeTrace(QStringLiteral("DecoderWorker::processRequest.end"),
-                QStringLiteral("seq=%1 file=%2 frame=%3 kind=%4 null=%5 waitMs=%6")
-                    .arg(req.sequenceId)
-                    .arg(shortPath(req.filePath))
-                    .arg(req.frameNumber)
-                    .arg(static_cast<int>(req.kind))
-                    .arg(frame.isNull())
-                    .arg(decodeTraceMs() - startedAt));
-}
-
-void DecoderWorker::processVisibleBatch(const QVector<DecodeRequest>& requests, DecoderContext* ctx) {
-    if (!ctx) {
-        return;
-    }
-
-    int64_t highestTarget = -1;
-    for (const DecodeRequest& request : requests) {
-        if (!request.isExpired()) {
-            highestTarget = qMax(highestTarget, request.frameNumber);
-        }
-    }
-    if (highestTarget < 0) {
-        for (const DecodeRequest& request : requests) {
-            m_dropCount++;
-            if (request.callback) {
-                request.callback(FrameHandle());
-            }
-        }
-        return;
-    }
-
-    const QVector<FrameHandle> decodedFrames = ctx->decodeThroughFrame(highestTarget);
-    QHash<int64_t, FrameHandle> decodedByFrame;
-    QVector<int64_t> decodedFrameNumbers;
-    for (const FrameHandle& frame : decodedFrames) {
-        if (frame.isNull()) {
-            continue;
-        }
-        decodedByFrame.insert(frame.frameNumber(), frame);
-        decodedFrameNumbers.push_back(frame.frameNumber());
-        emit frameDecoded(frame);
-    }
-    std::sort(decodedFrameNumbers.begin(), decodedFrameNumbers.end());
-
-    for (const DecodeRequest& request : requests) {
-        if (request.isExpired()) {
-            m_dropCount++;
-            if (request.callback) {
-                request.callback(FrameHandle());
-            }
-            continue;
-        }
-
-        FrameHandle deliveredFrame = decodedByFrame.value(request.frameNumber);
-        if (deliveredFrame.isNull()) {
-            int64_t bestFrameNumber = std::numeric_limits<int64_t>::max();
-            int64_t bestDistance = std::numeric_limits<int64_t>::max();
-            for (int64_t decodedFrameNumber : decodedFrameNumbers) {
-                const int64_t distance = qAbs(decodedFrameNumber - request.frameNumber);
-                if (distance > kPlaybackBatchFrameSlack) {
-                    continue;
-                }
-                if (bestFrameNumber == std::numeric_limits<int64_t>::max() ||
-                    distance < bestDistance ||
-                    (distance == bestDistance && decodedFrameNumber > bestFrameNumber)) {
-                    bestFrameNumber = decodedFrameNumber;
-                    bestDistance = distance;
-                }
-            }
-            if (bestFrameNumber != std::numeric_limits<int64_t>::max()) {
-                deliveredFrame = decodedByFrame.value(bestFrameNumber);
-                decodeTrace(QStringLiteral("DecoderWorker::processVisibleBatch.nearest"),
-                            QStringLiteral("file=%1 requested=%2 delivered=%3 distance=%4")
-                                .arg(shortPath(request.filePath))
-                                .arg(request.frameNumber)
-                                .arg(bestFrameNumber)
-                                .arg(bestDistance));
-            }
-        }
-        if (deliveredFrame.isNull()) {
-            m_dropCount++;
-        } else {
-            m_decodeCount++;
-        }
-
-        if (request.callback) {
-            request.callback(deliveredFrame);
-        }
-    }
-}
-
-DecoderContext* DecoderWorker::getOrCreateContext(const QString& path) {
-    QMutexLocker lock(&m_contextsMutex);
-    
-    auto it = m_contexts.find(path);
-    if (it != m_contexts.end()) {
-        return it.value();
-    }
-    
-    // Evict oldest if at limit
-    if (m_contexts.size() >= kMaxContexts) {
-        evictOldestContext();
-    }
-    
-    DecoderContext* ctx = new DecoderContext(path);
-    if (!ctx->initialize()) {
-        delete ctx;
-        return nullptr;
-    }
-    
-    m_contexts[path] = ctx;
-    return ctx;
-}
-
-void DecoderWorker::evictOldestContext() {
-    qint64 oldestTime = INT64_MAX;
-    QString oldestPath;
-    
-    for (auto it = m_contexts.begin(); it != m_contexts.end(); ++it) {
-        if (it.value()->lastAccessTime() < oldestTime) {
-            oldestTime = it.value()->lastAccessTime();
-            oldestPath = it.key();
-        }
-    }
-    
-    if (!oldestPath.isEmpty()) {
-        delete m_contexts.take(oldestPath);
-    }
-}
-
-// ============================================================================
 // AsyncDecoder Implementation
 // ============================================================================
+
+struct AsyncDecoder::LaneState {
+    struct FileDecodeState {
+        std::atomic<int64_t> cancelBeforeFrame{std::numeric_limits<int64_t>::min()};
+        std::atomic<uint64_t> generation{0};
+        std::unique_ptr<DecoderContext> context;
+    };
+
+    explicit LaneState(int laneIndex)
+        : index(laneIndex) {}
+
+    int index = 0;
+    mutable std::mutex mutex;
+    std::condition_variable condition;
+    std::deque<DecodeRequest> queue;
+    QHash<QString, std::shared_ptr<FileDecodeState>> fileStates;
+    std::unique_ptr<std::thread> thread;
+    bool shuttingDown = false;
+    bool running = false;
+    int activeRequests = 0;
+    static constexpr int kMaxContexts = 4;
+};
 
 AsyncDecoder::AsyncDecoder(QObject* parent) : QObject(parent) {
     m_budget = new MemoryBudget(this);
@@ -1381,43 +1057,32 @@ AsyncDecoder::~AsyncDecoder() {
 }
 
 bool AsyncDecoder::initialize() {
-    if (!m_workers.isEmpty()) {
+    if (m_initialized) {
         return true;
     }
 
-    // Shard requests by file path so each file stays on one worker/context,
-    // while different files can decode in parallel.
-    const int workerCount = qBound(2, QThread::idealThreadCount(), 6);
-    
-    for (int i = 0; i < workerCount; ++i) {
-        auto* queue = new DecodeQueue();
-        auto* worker = new DecoderWorker(queue, m_budget);
-        connect(worker, &DecoderWorker::frameDecoded, this, &AsyncDecoder::frameReady, Qt::QueuedConnection);
-        connect(worker, &DecoderWorker::decodeError, this, &AsyncDecoder::error, Qt::QueuedConnection);
-        m_queues.append(queue);
-        worker->start();
-        m_workers.append(worker);
+    m_workerCount = qBound(2, QThread::idealThreadCount(), 6);
+    m_lanes.reserve(m_workerCount);
+    m_shuttingDown = false;
+    for (int i = 0; i < m_workerCount; ++i) {
+        auto lane = std::make_unique<LaneState>(i);
+        startLane(lane.get());
+        m_lanes.push_back(std::move(lane));
     }
-    
-    qDebug() << "AsyncDecoder initialized with" << workerCount << "workers";
+    m_initialized = true;
+
+    qDebug() << "AsyncDecoder initialized with" << m_workerCount << "workers";
     return true;
 }
 
 void AsyncDecoder::shutdown() {
-    for (DecodeQueue* queue : m_queues) {
-        if (queue) {
-            queue->shutdown();
-        }
+    m_shuttingDown = true;
+    for (const auto& lane : m_lanes) {
+        stopLane(lane.get());
     }
-    
-    for (auto* worker : m_workers) {
-        worker->stop();
-        delete worker;
-    }
-    m_workers.clear();
-
-    qDeleteAll(m_queues);
-    m_queues.clear();
+    m_lanes.clear();
+    m_initialized = false;
+    m_workerCount = 0;
 }
 
 uint64_t AsyncDecoder::requestFrame(const QString& path,
@@ -1434,8 +1099,15 @@ uint64_t AsyncDecoder::requestFrame(const QString& path,
                                     int timeoutMs,
                                     DecodeRequestKind kind,
                                     std::function<void(FrameHandle)> callback) {
-    uint64_t seqId = m_nextSequenceId++;
-    
+    LaneState* lane = laneForPath(path);
+    if (!lane || m_shuttingDown) {
+        if (callback) {
+            callback(FrameHandle());
+        }
+        return 0;
+    }
+
+    const uint64_t seqId = m_nextSequenceId++;
     DecodeRequest req;
     req.sequenceId = seqId;
     req.filePath = path;
@@ -1445,21 +1117,84 @@ uint64_t AsyncDecoder::requestFrame(const QString& path,
     req.deadline = QDeadlineTimer(timeoutMs);
     req.callback = callback;
     req.submittedAt = QDateTime::currentMSecsSinceEpoch();
-    DecodeQueue* queue = queueForPath(path);
-    const int pendingBefore = totalPendingRequests();
+
+    QVector<std::function<void(FrameHandle)>> droppedCallbacks;
+    int pendingBefore = 0;
+    int pendingAfter = 0;
+    bool accepted = false;
+
+    {
+        std::unique_lock<std::mutex> lock(lane->mutex);
+        auto stateIt = lane->fileStates.find(path);
+        if (stateIt == lane->fileStates.end()) {
+            stateIt = lane->fileStates.insert(path, std::make_shared<LaneState::FileDecodeState>());
+        }
+        const std::shared_ptr<LaneState::FileDecodeState> state = stateIt.value();
+        if (frameNumber < state->cancelBeforeFrame.load()) {
+            state->cancelBeforeFrame.store(std::numeric_limits<int64_t>::min());
+        }
+        req.generation = state->generation.load();
+        pendingBefore = static_cast<int>(lane->queue.size()) + lane->activeRequests;
+
+        collectSupersededRequests(req, lane->queue, &droppedCallbacks);
+
+        constexpr int kMaxPendingRequests = 128;
+        const int visibleReserve = qBound(0, debugVisibleQueueReserve(), kMaxPendingRequests - 1);
+        const int nonVisibleLimit = kMaxPendingRequests - visibleReserve;
+        if (req.kind != DecodeRequestKind::Visible &&
+            static_cast<int>(lane->queue.size()) >= nonVisibleLimit) {
+            accepted = false;
+        } else {
+            if (static_cast<int>(lane->queue.size()) >= kMaxPendingRequests) {
+                bool dropped = false;
+                for (auto it = lane->queue.end(); it != lane->queue.begin();) {
+                    --it;
+                    const bool kindFavored =
+                        req.kind == DecodeRequestKind::Visible && it->kind != DecodeRequestKind::Visible;
+                    if (kindFavored || it->priority < req.priority) {
+                        if (it->callback) {
+                            droppedCallbacks.push_back(std::move(it->callback));
+                        }
+                        lane->queue.erase(it);
+                        dropped = true;
+                        break;
+                    }
+                }
+                if (!dropped) {
+                    accepted = false;
+                } else {
+                    insertByPriority(lane->queue, req);
+                    accepted = true;
+                }
+            } else {
+                insertByPriority(lane->queue, req);
+                accepted = true;
+            }
+        }
+        pendingAfter = static_cast<int>(lane->queue.size()) + lane->activeRequests;
+        if (accepted) {
+            lane->condition.notify_one();
+        }
+    }
 
     decodeTrace(QStringLiteral("AsyncDecoder::requestFrame"),
-                QStringLiteral("seq=%1 file=%2 frame=%3 priority=%4 kind=%5 timeoutMs=%6 pending=%7")
+                QStringLiteral("seq=%1 file=%2 frame=%3 priority=%4 kind=%5 timeoutMs=%6 pending=%7 lane=%8")
                     .arg(seqId)
                     .arg(shortPath(path))
                     .arg(frameNumber)
                     .arg(priority)
                     .arg(static_cast<int>(kind))
                     .arg(timeoutMs)
-                    .arg(pendingBefore));
-    
-    if (!queue || !queue->enqueue(req)) {
-        // Queue full, return immediately with null
+                    .arg(pendingBefore)
+                    .arg(lane->index));
+
+    for (const auto& droppedCallback : droppedCallbacks) {
+        if (droppedCallback) {
+            invokeRequestCallback(droppedCallback, FrameHandle());
+        }
+    }
+
+    if (!accepted) {
         decodeTrace(QStringLiteral("AsyncDecoder::requestFrame.queue-full"),
                     QStringLiteral("seq=%1 file=%2 frame=%3 kind=%4")
                         .arg(seqId)
@@ -1471,45 +1206,116 @@ uint64_t AsyncDecoder::requestFrame(const QString& path,
         }
         return 0;
     }
-    
+
     emit queuePressureChanged(totalPendingRequests());
     return seqId;
 }
 
 void AsyncDecoder::cancelForFile(const QString& path) {
-    for (DecodeQueue* queue : m_queues) {
-        if (queue) {
-            queue->removeForFile(path);
+    LaneState* lane = laneForPath(path);
+    if (!lane) {
+        return;
+    }
+
+    QVector<std::function<void(FrameHandle)>> callbacks;
+    {
+        std::unique_lock<std::mutex> lock(lane->mutex);
+        auto stateIt = lane->fileStates.find(path);
+        if (stateIt == lane->fileStates.end()) {
+            stateIt = lane->fileStates.insert(path, std::make_shared<LaneState::FileDecodeState>());
+        }
+        stateIt.value()->generation.fetch_add(1);
+        stateIt.value()->cancelBeforeFrame.store(std::numeric_limits<int64_t>::min());
+
+        for (auto it = lane->queue.begin(); it != lane->queue.end();) {
+            if (it->filePath == path) {
+                if (it->callback) {
+                    callbacks.push_back(std::move(it->callback));
+                }
+                it = lane->queue.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
+
+    for (const auto& callback : callbacks) {
+        if (callback) {
+            invokeRequestCallback(callback, FrameHandle());
+        }
+    }
+    emit queuePressureChanged(totalPendingRequests());
 }
 
 void AsyncDecoder::cancelForFileBefore(const QString& path, int64_t frameNumber) {
-    for (DecodeQueue* queue : m_queues) {
-        if (queue) {
-            queue->removeForFileBefore(path, frameNumber);
+    LaneState* lane = laneForPath(path);
+    if (!lane) {
+        return;
+    }
+
+    QVector<std::function<void(FrameHandle)>> callbacks;
+    {
+        std::unique_lock<std::mutex> lock(lane->mutex);
+        auto stateIt = lane->fileStates.find(path);
+        if (stateIt == lane->fileStates.end()) {
+            stateIt = lane->fileStates.insert(path, std::make_shared<LaneState::FileDecodeState>());
+        }
+        const auto& state = stateIt.value();
+        state->cancelBeforeFrame.store(qMax(state->cancelBeforeFrame.load(), frameNumber));
+
+        for (auto it = lane->queue.begin(); it != lane->queue.end();) {
+            if (it->filePath == path && it->frameNumber < frameNumber) {
+                if (it->callback) {
+                    callbacks.push_back(std::move(it->callback));
+                }
+                it = lane->queue.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
+
+    for (const auto& callback : callbacks) {
+        if (callback) {
+            invokeRequestCallback(callback, FrameHandle());
+        }
+    }
+    emit queuePressureChanged(totalPendingRequests());
 }
 
 void AsyncDecoder::cancelAll() {
-    for (DecodeQueue* queue : m_queues) {
-        if (queue) {
-            queue->clear();
+    QVector<std::function<void(FrameHandle)>> callbacks;
+    for (const auto& lane : m_lanes) {
+        std::unique_lock<std::mutex> lock(lane->mutex);
+        for (auto& state : lane->fileStates) {
+            state->generation.fetch_add(1);
+            state->cancelBeforeFrame.store(std::numeric_limits<int64_t>::min());
+        }
+        for (DecodeRequest& request : lane->queue) {
+            if (request.callback) {
+                callbacks.push_back(std::move(request.callback));
+            }
+        }
+        lane->queue.clear();
+    }
+
+    for (const auto& callback : callbacks) {
+        if (callback) {
+            invokeRequestCallback(callback, FrameHandle());
         }
     }
+    emit queuePressureChanged(totalPendingRequests());
 }
 
 VideoStreamInfo AsyncDecoder::getVideoInfo(const QString& path) {
     QMutexLocker lock(&m_infoCacheMutex);
     const QString requestedDecodeMode = decodePreferenceToString(debugDecodePreference());
-    
+
     auto it = m_infoCache.find(path);
     if (it != m_infoCache.end() && it.value().requestedDecodeMode == requestedDecodeMode) {
         return it.value();
     }
-    
-    // Probe file
+
     DecoderContext ctx(path);
     if (ctx.initialize()) {
         VideoStreamInfo info = ctx.info();
@@ -1517,12 +1323,11 @@ VideoStreamInfo AsyncDecoder::getVideoInfo(const QString& path) {
         m_infoCache[path] = info;
         return info;
     }
-    
+
     return VideoStreamInfo();
 }
 
 void AsyncDecoder::preloadFile(const QString& path) {
-    // Just create a decoder context to warm up
     getVideoInfo(path);
 }
 
@@ -1535,35 +1340,200 @@ void AsyncDecoder::setupTrimCallback() {
 }
 
 void AsyncDecoder::trimCaches() {
-    // Called under memory pressure - could clear info cache, etc.
     QMutexLocker lock(&m_infoCacheMutex);
-    // Keep only recent entries
-    // (In production, implement proper LRU)
 }
 
 int AsyncDecoder::totalPendingRequests() const {
     int total = 0;
-    for (DecodeQueue* queue : m_queues) {
-        if (queue) {
-            total += queue->size();
-        }
+    for (const auto& lane : m_lanes) {
+        std::unique_lock<std::mutex> lock(lane->mutex);
+        total += static_cast<int>(lane->queue.size()) + lane->activeRequests;
     }
     return total;
 }
 
-int AsyncDecoder::queueIndexForPath(const QString& path) const {
-    if (m_queues.isEmpty()) {
+int AsyncDecoder::laneIndexForPath(const QString& path) const {
+    if (m_lanes.empty()) {
         return -1;
     }
-    return static_cast<int>(qHash(path) % static_cast<uint>(m_queues.size()));
+    return static_cast<int>(qHash(path) % static_cast<uint>(m_lanes.size()));
 }
 
-DecodeQueue* AsyncDecoder::queueForPath(const QString& path) const {
-    const int index = queueIndexForPath(path);
-    if (index < 0 || index >= m_queues.size()) {
+AsyncDecoder::LaneState* AsyncDecoder::laneForPath(const QString& path) const {
+    const int index = laneIndexForPath(path);
+    if (index < 0 || index >= m_lanes.size()) {
         return nullptr;
     }
-    return m_queues[index];
+    return m_lanes[index].get();
+}
+
+void AsyncDecoder::startLane(LaneState* lane) {
+    if (!lane || lane->thread) {
+        return;
+    }
+    lane->running = true;
+    lane->thread = std::make_unique<std::thread>([this, lane]() {
+        runLane(lane);
+    });
+}
+
+void AsyncDecoder::stopLane(LaneState* lane) {
+    if (!lane) {
+        return;
+    }
+    {
+        std::unique_lock<std::mutex> lock(lane->mutex);
+        lane->shuttingDown = true;
+        lane->condition.notify_all();
+    }
+    if (lane->thread && lane->thread->joinable()) {
+        lane->thread->join();
+    }
+    lane->thread.reset();
+    lane->running = false;
+}
+
+void AsyncDecoder::runLane(LaneState* lane) {
+    while (true) {
+        DecodeRequest request;
+        std::shared_ptr<LaneState::FileDecodeState> state;
+        {
+            std::unique_lock<std::mutex> lock(lane->mutex);
+            lane->condition.wait(lock, [lane]() {
+                return lane->shuttingDown || !lane->queue.empty();
+            });
+            if (lane->shuttingDown) {
+                return;
+            }
+
+            request = std::move(lane->queue.front());
+            lane->queue.pop_front();
+            ++lane->activeRequests;
+
+            auto stateIt = lane->fileStates.find(request.filePath);
+            if (stateIt == lane->fileStates.end()) {
+                stateIt = lane->fileStates.insert(request.filePath, std::make_shared<LaneState::FileDecodeState>());
+            }
+            state = stateIt.value();
+        }
+
+        const qint64 startedAt = decodeTraceMs();
+        decodeTrace(QStringLiteral("AsyncDecoder::runLane.begin"),
+                    QStringLiteral("lane=%1 seq=%2 file=%3 frame=%4 priority=%5 thread=%6")
+                        .arg(lane->index)
+                        .arg(request.sequenceId)
+                        .arg(shortPath(request.filePath))
+                        .arg(request.frameNumber)
+                        .arg(request.priority)
+                        .arg(reinterpret_cast<quintptr>(QThread::currentThreadId()), 0, 16));
+
+        FrameHandle frame;
+        QString errorMessage;
+        const bool cancelled =
+            request.generation != state->generation.load() ||
+            request.frameNumber < state->cancelBeforeFrame.load();
+
+        if (!request.isExpired() && !cancelled) {
+            if (!state->context) {
+                state->context = std::make_unique<DecoderContext>(request.filePath);
+                if (!state->context->initialize()) {
+                    errorMessage = QStringLiteral("Failed to create decoder context");
+                    state->context.reset();
+                }
+            }
+            if (state->context) {
+                frame = state->context->decodeFrame(request.frameNumber);
+            }
+        }
+
+        if (request.isExpired() ||
+            request.generation != state->generation.load() ||
+            request.frameNumber < state->cancelBeforeFrame.load()) {
+            frame = FrameHandle();
+        }
+
+        invokeRequestCallback(std::move(request.callback), frame);
+        QMetaObject::invokeMethod(this,
+                                  [this, frame, path = request.filePath, errorMessage]() {
+                                      emit frameReady(frame);
+                                      if (!errorMessage.isEmpty()) {
+                                          emit error(path, errorMessage);
+                                      }
+                                  },
+                                  Qt::QueuedConnection);
+
+        decodeTrace(QStringLiteral("AsyncDecoder::runLane.end"),
+                    QStringLiteral("lane=%1 seq=%2 file=%3 frame=%4 null=%5 waitMs=%6")
+                        .arg(lane->index)
+                        .arg(request.sequenceId)
+                        .arg(shortPath(request.filePath))
+                        .arg(request.frameNumber)
+                        .arg(frame.isNull())
+                        .arg(decodeTraceMs() - startedAt));
+
+        {
+            std::unique_lock<std::mutex> lock(lane->mutex);
+            lane->activeRequests = qMax(0, lane->activeRequests - 1);
+
+            if (lane->fileStates.size() > LaneState::kMaxContexts) {
+                qint64 oldestTime = std::numeric_limits<qint64>::max();
+                QString oldestPath;
+                for (auto it = lane->fileStates.begin(); it != lane->fileStates.end(); ++it) {
+                    if (!it.value()->context) {
+                        oldestPath = it.key();
+                        break;
+                    }
+                    const qint64 accessTime = it.value()->context->lastAccessTime();
+                    if (accessTime < oldestTime) {
+                        oldestTime = accessTime;
+                        oldestPath = it.key();
+                    }
+                }
+                if (!oldestPath.isEmpty()) {
+                    lane->fileStates.remove(oldestPath);
+                }
+            }
+        }
+        emit queuePressureChanged(totalPendingRequests());
+    }
+}
+
+void AsyncDecoder::insertByPriority(std::deque<DecodeRequest>& queue, const DecodeRequest& req) {
+    auto insertAt = queue.begin();
+    for (; insertAt != queue.end(); ++insertAt) {
+        if (insertAt->priority < req.priority) {
+            break;
+        }
+    }
+    queue.insert(insertAt, req);
+}
+
+void AsyncDecoder::collectSupersededRequests(const DecodeRequest& req,
+                                             std::deque<DecodeRequest>& queue,
+                                             QVector<std::function<void(FrameHandle)>>* droppedCallbacks) {
+    if (!droppedCallbacks) {
+        return;
+    }
+
+    for (int i = static_cast<int>(queue.size()) - 1; i >= 0; --i) {
+        const DecodeRequest& queued = queue[static_cast<size_t>(i)];
+        if (queued.filePath != req.filePath) {
+            continue;
+        }
+        if (queued.frameNumber >= req.frameNumber) {
+            continue;
+        }
+        if (queued.priority > req.priority) {
+            continue;
+        }
+        if (queued.kind == DecodeRequestKind::Visible && req.kind != DecodeRequestKind::Visible) {
+            continue;
+        }
+        if (queue[static_cast<size_t>(i)].callback) {
+            droppedCallbacks->push_back(std::move(queue[static_cast<size_t>(i)].callback));
+        }
+        queue.erase(queue.begin() + i);
+    }
 }
 
 } // namespace editor

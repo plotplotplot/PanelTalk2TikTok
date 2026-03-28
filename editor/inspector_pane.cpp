@@ -84,6 +84,8 @@ QWidget *InspectorPane::buildGradingTab()
     m_gradingAutoScrollCheckBox->setChecked(true);
     m_gradingFollowCurrentCheckBox->setChecked(true);
     m_gradingKeyAtPlayheadButton = new QPushButton(QStringLiteral("Key At Playhead"), page);
+    m_gradingFadeInButton = new QPushButton(QStringLiteral("Fade In From Playhead"), page);
+    m_gradingFadeOutButton = new QPushButton(QStringLiteral("Fade Out From Playhead"), page);
 
     m_gradingKeyframeTable = new QTableWidget(page);
     m_gradingKeyframeTable->setColumnCount(6);
@@ -105,6 +107,8 @@ QWidget *InspectorPane::buildGradingTab()
     layout->addWidget(m_gradingAutoScrollCheckBox);
     layout->addWidget(m_gradingFollowCurrentCheckBox);
     layout->addWidget(m_gradingKeyAtPlayheadButton);
+    layout->addWidget(m_gradingFadeInButton);
+    layout->addWidget(m_gradingFadeOutButton);
     layout->addWidget(m_gradingKeyframeTable, 1);
     return page;
 }
@@ -358,6 +362,7 @@ QWidget *InspectorPane::buildOutputTab()
     m_outputFormatCombo->addItem(QStringLiteral("MP4"), QStringLiteral("mp4"));
     m_outputFormatCombo->addItem(QStringLiteral("MOV"), QStringLiteral("mov"));
     m_outputFormatCombo->addItem(QStringLiteral("WebM"), QStringLiteral("webm"));
+    m_renderUseProxiesCheckBox = new QCheckBox(QStringLiteral("Use Proxies For Render"), page);
 
     form->addRow(QStringLiteral("Output Width"), m_outputWidthSpin);
     form->addRow(QStringLiteral("Output Height"), m_outputHeightSpin);
@@ -369,6 +374,7 @@ QWidget *InspectorPane::buildOutputTab()
 
     layout->addWidget(m_outputRangeSummaryLabel);
     layout->addLayout(form);
+    layout->addWidget(m_renderUseProxiesCheckBox);
     layout->addWidget(m_renderButton);
     layout->addStretch(1);
 

@@ -452,6 +452,8 @@ QJsonObject EditorWindow::buildStateJson() const
     root[QStringLiteral("outputFormat")] =
         m_outputFormatCombo ? m_outputFormatCombo->currentData().toString()
                             : QStringLiteral("mp4");
+    root[QStringLiteral("renderUseProxies")] =
+        m_renderUseProxiesCheckBox ? m_renderUseProxiesCheckBox->isChecked() : false;
     root[QStringLiteral("speechFilterEnabled")] =
         m_speechFilterEnabledCheckBox ? m_speechFilterEnabledCheckBox->isChecked() : false;
     root[QStringLiteral("transcriptPrependMs")] = m_transcriptPrependMs;

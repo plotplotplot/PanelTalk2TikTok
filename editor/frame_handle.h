@@ -11,6 +11,7 @@
 // Forward declarations for QRhi
 class QRhiTexture;
 class QRhi;
+struct AVFrame;
 
 namespace editor {
 
@@ -32,6 +33,9 @@ public:
     // GPU-side texture (if available)
     QRhiTexture* gpuTexture = nullptr;
     QRhi* rhiContext = nullptr;  // For texture cleanup
+    AVFrame* hardwareFrame = nullptr;
+    int hardwarePixelFormat = -1;
+    int hardwareSwPixelFormat = -1;
     
     // Metadata
     int64_t frameNumber = -1;
@@ -58,6 +62,10 @@ public:
     // Creation helpers
     static FrameHandle createCpuFrame(const QImage& image, int64_t frameNum, const QString& path);
     static FrameHandle createGpuFrame(QRhiTexture* texture, int64_t frameNum, const QString& path);
+    static FrameHandle createHardwareFrame(const AVFrame* frame,
+                                           int64_t frameNum,
+                                           const QString& path,
+                                           int swPixelFormat);
     
     // Validity
     bool isNull() const { return d.constData() == nullptr; }
@@ -69,11 +77,17 @@ public:
     QSize size() const { return d ? d->size : QSize(); }
     bool hasCpuImage() const { return d && !d->cpuImage.isNull(); }
     bool hasGpuTexture() const { return d && d->gpuTexture != nullptr; }
+    bool hasHardwareFrame() const { return d && d->hardwareFrame != nullptr; }
     
     QImage cpuImage() const { return d ? d->cpuImage : QImage(); }
     QRhiTexture* gpuTexture() const { return d ? d->gpuTexture : nullptr; }
+    const AVFrame* hardwareFrame() const { return d ? d->hardwareFrame : nullptr; }
+    int hardwarePixelFormat() const { return d ? d->hardwarePixelFormat : -1; }
+    int hardwareSwPixelFormat() const { return d ? d->hardwareSwPixelFormat : -1; }
     
     size_t memoryUsage() const { return d ? d->memoryUsage() : 0; }
+    size_t cpuMemoryUsage() const;
+    size_t gpuMemoryUsage() const;
     
     // GPU texture upload (async)
     void uploadToGpu(QRhi* rhi);

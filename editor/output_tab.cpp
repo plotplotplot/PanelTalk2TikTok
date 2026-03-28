@@ -31,6 +31,10 @@ void OutputTab::wire()
         connect(m_widgets.outputFormatCombo, qOverload<int>(&QComboBox::currentIndexChanged),
                 this, &OutputTab::onOutputFormatChanged);
     }
+    if (m_widgets.renderUseProxiesCheckBox) {
+        connect(m_widgets.renderUseProxiesCheckBox, &QCheckBox::toggled,
+                this, &OutputTab::onRenderUseProxiesToggled);
+    }
     if (m_widgets.renderButton) {
         connect(m_widgets.renderButton, &QPushButton::clicked,
                 this, &OutputTab::onRenderClicked);
@@ -110,6 +114,8 @@ void OutputTab::renderFromInspector()
     request.outputSize = QSize(
         m_widgets.outputWidthSpin ? m_widgets.outputWidthSpin->value() : 1080,
         m_widgets.outputHeightSpin ? m_widgets.outputHeightSpin->value() : 1920);
+    request.useProxyMedia = m_widgets.renderUseProxiesCheckBox &&
+                            m_widgets.renderUseProxiesCheckBox->isChecked();
     request.clips = m_deps.getTimelineClips();
     request.renderSyncMarkers = m_deps.getRenderSyncMarkers
         ? m_deps.getRenderSyncMarkers()
@@ -171,6 +177,14 @@ void OutputTab::onOutputFormatChanged(int index)
 void OutputTab::onRenderClicked()
 {
     renderFromInspector();
+}
+
+void OutputTab::onRenderUseProxiesToggled(bool checked)
+{
+    Q_UNUSED(checked);
+    if (m_updating) return;
+    if (m_deps.scheduleSaveState) m_deps.scheduleSaveState();
+    if (m_deps.pushHistorySnapshot) m_deps.pushHistorySnapshot();
 }
 
 void OutputTab::updateRangeSummary()

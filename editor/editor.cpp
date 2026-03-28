@@ -108,6 +108,8 @@ EditorWindow::EditorWindow(quint16 controlPort)
     m_gradingAutoScrollCheckBox = m_inspectorPane->gradingAutoScrollCheckBox();
     m_gradingFollowCurrentCheckBox = m_inspectorPane->gradingFollowCurrentCheckBox();
     m_gradingKeyAtPlayheadButton = m_inspectorPane->gradingKeyAtPlayheadButton();
+    m_gradingFadeInButton = m_inspectorPane->gradingFadeInButton();
+    m_gradingFadeOutButton = m_inspectorPane->gradingFadeOutButton();
     m_keyframesInspectorClipLabel = m_inspectorPane->keyframesInspectorClipLabel();
     m_keyframesInspectorDetailsLabel = m_inspectorPane->keyframesInspectorDetailsLabel();
     m_keyframesAutoScrollCheckBox = m_inspectorPane->keyframesAutoScrollCheckBox();
@@ -133,6 +135,7 @@ EditorWindow::EditorWindow(quint16 controlPort)
     m_exportEndSpin = m_inspectorPane->exportEndSpin();
     m_outputFormatCombo = m_inspectorPane->outputFormatCombo();
     m_outputRangeSummaryLabel = m_inspectorPane->outputRangeSummaryLabel();
+    m_renderUseProxiesCheckBox = m_inspectorPane->renderUseProxiesCheckBox();
     m_renderButton = m_inspectorPane->renderButton();
     m_profileSummaryTable = m_inspectorPane->profileSummaryTable();
     m_profileBenchmarkButton = m_inspectorPane->profileBenchmarkButton();
@@ -273,7 +276,7 @@ EditorWindow::EditorWindow(quint16 controlPort)
         OutputTab::Widgets{
             m_outputWidthSpin, m_outputHeightSpin,
             m_exportStartSpin, m_exportEndSpin,
-            m_outputFormatCombo, m_outputRangeSummaryLabel, m_renderButton},
+            m_outputFormatCombo, m_outputRangeSummaryLabel, m_renderUseProxiesCheckBox, m_renderButton},
         OutputTab::Dependencies{
             [this]() { return m_timeline != nullptr; },
             [this]() { return m_timeline && !m_timeline->clips().isEmpty(); },
@@ -335,7 +338,7 @@ EditorWindow::EditorWindow(quint16 controlPort)
             m_gradingPathLabel, m_brightnessSpin, m_contrastSpin,
             m_saturationSpin, m_opacitySpin, m_gradingKeyframeTable,
             m_gradingAutoScrollCheckBox, m_gradingFollowCurrentCheckBox,
-            m_gradingKeyAtPlayheadButton},
+            m_gradingKeyAtPlayheadButton, m_gradingFadeInButton, m_gradingFadeOutButton},
         GradingTab::Dependencies{
             [this]() { return m_timeline ? m_timeline->selectedClip() : nullptr; },
             [this]() { return m_timeline ? m_timeline->selectedClip() : nullptr; },
@@ -567,7 +570,7 @@ QString EditorWindow::defaultProxyOutputPath(const TimelineClip &clip, const Med
     const QFileInfo sourceInfo(clip.filePath);
     MediaProbeResult fallbackProbe;
     const MediaProbeResult &probe = knownProbe ? *knownProbe : fallbackProbe;
-    const QString suffix = probe.hasAlpha ? QStringLiteral("mov") : QStringLiteral("mp4");
+    const QString suffix = QStringLiteral("mov");
     return sourceInfo.dir().absoluteFilePath(
         QStringLiteral("%1.proxy.%2").arg(sourceInfo.completeBaseName(), suffix));
 }
@@ -698,14 +701,12 @@ void EditorWindow::createProxyForClip(const QString &clipId)
     else
     {
         arguments << QStringLiteral("-vf") << QStringLiteral("scale='min(1280,iw)':-2")
-                  << QStringLiteral("-c:v") << QStringLiteral("libx264")
-                  << QStringLiteral("-preset") << QStringLiteral("veryfast")
-                  << QStringLiteral("-crf") << QStringLiteral("28")
-                  << QStringLiteral("-pix_fmt") << QStringLiteral("yuv420p")
-                  << QStringLiteral("-movflags") << QStringLiteral("+faststart");
+                  << QStringLiteral("-c:v") << QStringLiteral("mjpeg")
+                  << QStringLiteral("-q:v") << QStringLiteral("3")
+                  << QStringLiteral("-pix_fmt") << QStringLiteral("yuvj420p");
     }
-    arguments << QStringLiteral("-c:a") << (alphaProxy ? QStringLiteral("pcm_s16le") : QStringLiteral("aac"))
-              << QStringLiteral("-b:a") << (alphaProxy ? QStringLiteral("1536k") : QStringLiteral("128k"))
+    arguments << QStringLiteral("-c:a") << QStringLiteral("pcm_s16le")
+              << QStringLiteral("-b:a") << QStringLiteral("1536k")
               << QFileInfo(outputPath).absoluteFilePath();
 
     const auto appendOutput = [output, autoScrollBox](const QString &text)
@@ -1196,6 +1197,7 @@ void EditorWindow::applyStateJson(const QJsonObject &root)
     const int outputWidth = qMax(16, root.value(QStringLiteral("outputWidth")).toInt(1080));
     const int outputHeight = qMax(16, root.value(QStringLiteral("outputHeight")).toInt(1920));
     const QString outputFormat = root.value(QStringLiteral("outputFormat")).toString(QStringLiteral("mp4"));
+    const bool renderUseProxies = root.value(QStringLiteral("renderUseProxies")).toBool(false);
     const bool speechFilterEnabled = root.value(QStringLiteral("speechFilterEnabled")).toBool(false);
     const int transcriptPrependMs = root.value(QStringLiteral("transcriptPrependMs")).toInt(0);
     const int transcriptPostpendMs = root.value(QStringLiteral("transcriptPostpendMs")).toInt(0);
@@ -1283,6 +1285,10 @@ void EditorWindow::applyStateJson(const QJsonObject &root)
         QSignalBlocker block(m_outputFormatCombo);
         const int formatIndex = m_outputFormatCombo->findData(outputFormat);
         if (formatIndex >= 0) m_outputFormatCombo->setCurrentIndex(formatIndex);
+    }
+    if (m_renderUseProxiesCheckBox) {
+        QSignalBlocker block(m_renderUseProxiesCheckBox);
+        m_renderUseProxiesCheckBox->setChecked(renderUseProxies);
     }
     if (m_speechFilterEnabledCheckBox) { QSignalBlocker block(m_speechFilterEnabledCheckBox); m_speechFilterEnabledCheckBox->setChecked(speechFilterEnabled); }
     
@@ -1584,14 +1590,27 @@ void EditorWindow::renderFromOutputInspector()
 
 void EditorWindow::renderTimelineFromOutputRequest(const RenderRequest &request)
 {
+    RenderRequest effectiveRequest = request;
+    if (effectiveRequest.useProxyMedia)
+    {
+        for (TimelineClip &clip : effectiveRequest.clips)
+        {
+            const QString proxyPath = playbackProxyPathForClip(clip);
+            if (!proxyPath.isEmpty())
+            {
+                clip.filePath = proxyPath;
+            }
+        }
+    }
+
     int64_t totalFramesToRender = 0;
-    for (const ExportRangeSegment &range : std::as_const(request.exportRanges))
+    for (const ExportRangeSegment &range : std::as_const(effectiveRequest.exportRanges))
     {
         totalFramesToRender += qMax<int64_t>(0, range.endFrame - range.startFrame + 1);
     }
     if (totalFramesToRender <= 0)
     {
-        totalFramesToRender = qMax<int64_t>(1, request.exportEndFrame - request.exportStartFrame + 1);
+        totalFramesToRender = qMax<int64_t>(1, effectiveRequest.exportEndFrame - effectiveRequest.exportStartFrame + 1);
     }
 
     QProgressDialog progressDialog(QStringLiteral("Preparing render..."),
@@ -1612,7 +1631,7 @@ void EditorWindow::renderTimelineFromOutputRequest(const RenderRequest &request)
         "QPushButton { min-width: 96px; padding: 6px 14px; }"));
     progressDialog.show();
 
-    const QString outputPath = request.outputPath;
+    const QString outputPath = effectiveRequest.outputPath;
     const auto formatEta = [](qint64 remainingMs) -> QString
     {
         if (remainingMs <= 0)
@@ -1723,9 +1742,9 @@ void EditorWindow::renderTimelineFromOutputRequest(const RenderRequest &request)
         {QStringLiteral("total_frames"), static_cast<qint64>(totalFramesToRender)}};
     refreshProfileInspector();
 
-    const RenderResult result = renderTimelineToFile(
-        request,
-        [this, &progressDialog, formatEta, stageSummary, renderProfileFromProgress, outputPath](const RenderProgress &progress)
+        const RenderResult result = renderTimelineToFile(
+        effectiveRequest,
+            [this, &progressDialog, formatEta, stageSummary, renderProfileFromProgress, outputPath](const RenderProgress &progress)
         {
             progressDialog.setMaximum(qMax(1, static_cast<int>(qMin<int64_t>(progress.totalFrames, std::numeric_limits<int>::max()))));
             progressDialog.setValue(static_cast<int>(qMin<int64_t>(progress.framesCompleted, std::numeric_limits<int>::max())));
@@ -1923,11 +1942,30 @@ bool EditorWindow::playbackActive() const
     return m_fastPlaybackActive.load();
 }
 
+namespace {
+
+bool zeroCopyPreferredEnvironmentDetected() {
+#if defined(Q_OS_LINUX)
+    return QFile::exists(QStringLiteral("/proc/driver/nvidia/version")) ||
+           QFile::exists(QStringLiteral("/sys/module/nvidia"));
+#else
+    return false;
+#endif
+}
+
+}
+
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
     QApplication::setApplicationName(QStringLiteral("QRhi Editor"));
     qRegisterMetaType<editor::FrameHandle>();
+
+    if (!zeroCopyPreferredEnvironmentDetected()) {
+        qWarning().noquote() << QStringLiteral(
+            "[STARTUP][WARN] Preferred zero-copy decode path requires Linux + NVIDIA detection; "
+            "falling back to hardware CPU-upload or software decode.");
+    }
 
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("PanelVid2TikTok editor"));

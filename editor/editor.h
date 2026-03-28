@@ -169,6 +169,8 @@ private:
     QCheckBox *m_gradingAutoScrollCheckBox = nullptr;
     QCheckBox *m_gradingFollowCurrentCheckBox = nullptr;
     QPushButton *m_gradingKeyAtPlayheadButton = nullptr;
+    QPushButton *m_gradingFadeInButton = nullptr;
+    QPushButton *m_gradingFadeOutButton = nullptr;
 
     QLabel *m_videoInspectorClipLabel = nullptr;
     QLabel *m_videoInspectorDetailsLabel = nullptr;
@@ -208,6 +210,7 @@ private:
     QSpinBox *m_exportEndSpin = nullptr;
     QComboBox *m_outputFormatCombo = nullptr;
     QLabel *m_outputRangeSummaryLabel = nullptr;
+    QCheckBox *m_renderUseProxiesCheckBox = nullptr;
 
     QDoubleSpinBox *m_videoTranslationXSpin = nullptr;
     QDoubleSpinBox *m_videoTranslationYSpin = nullptr;

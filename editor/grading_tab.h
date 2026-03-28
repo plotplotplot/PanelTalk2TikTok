@@ -26,6 +26,8 @@ public:
         QCheckBox* gradingAutoScrollCheckBox = nullptr;
         QCheckBox* gradingFollowCurrentCheckBox = nullptr;
         QPushButton* gradingKeyAtPlayheadButton = nullptr;
+        QPushButton* gradingFadeInButton = nullptr;
+        QPushButton* gradingFadeOutButton = nullptr;
     };
 
     struct Dependencies
@@ -54,6 +56,8 @@ public:
     void refresh();
     void applyGradeFromInspector(bool pushHistory = false);
     void upsertKeyframeAtPlayhead();
+    void fadeInFromPlayhead();
+    void fadeOutFromPlayhead();
     void removeSelectedKeyframes();
     void syncTableToPlayhead();
     void setSelectedKeyframeFrame(int64_t frame);
@@ -77,6 +81,8 @@ private slots:
     void onAutoScrollToggled(bool checked);
     void onFollowCurrentToggled(bool checked);
     void onKeyAtPlayheadClicked();
+    void onFadeInClicked();
+    void onFadeOutClicked();
     void onTableSelectionChanged();
     void onTableItemChanged(QTableWidgetItem* item);
     void onTableItemClicked(QTableWidgetItem* item);
@@ -103,6 +109,7 @@ private:
     GradingKeyframeDisplay evaluateDisplayedGrading(const TimelineClip& clip, int64_t localFrame) const;
     void updateSpinBoxesFromKeyframe(const GradingKeyframeDisplay& keyframe);
     void populateTable(const TimelineClip& clip);
+    void applyOpacityFadeFromPlayhead(bool fadeIn);
 
     Widgets m_widgets;
     Dependencies m_deps;

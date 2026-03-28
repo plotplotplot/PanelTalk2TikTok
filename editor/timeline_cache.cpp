@@ -14,8 +14,8 @@
 namespace editor {
 
 namespace {
-constexpr int64_t kVisibleDecodeKeepWindow = 8;
-constexpr int64_t kObsoleteVisibleFrameSlack = 2;
+constexpr int64_t kVisibleDecodeKeepWindow = 2;
+constexpr int64_t kObsoleteVisibleFrameSlack = 0;
 qint64 cacheTraceMs() {
     static QElapsedTimer timer;
     static bool started = false;
@@ -81,7 +81,7 @@ void TimelineCache::PlaybackBuffer::clear() {
 }
 
 void TimelineCache::PlaybackBuffer::insert(int64_t frameNumber, const FrameHandle& frame) {
-    if (frame.isNull()) {
+    if (frame.isNull() || frame.hasHardwareFrame()) {
         return;
     }
     QMutexLocker lock(&m_mutex);
@@ -124,6 +124,27 @@ FrameHandle TimelineCache::PlaybackBuffer::getBest(int64_t frameNumber) {
     return best == m_frames.end() ? FrameHandle() : best.value().frame;
 }
 
+FrameHandle TimelineCache::PlaybackBuffer::getLatestAtOrBefore(int64_t frameNumber) {
+    QMutexLocker lock(&m_mutex);
+    auto best = m_frames.end();
+    for (auto it = m_frames.begin(); it != m_frames.end(); ++it) {
+        if (it.key() <= frameNumber && (best == m_frames.end() || it.key() > best.key())) {
+            best = it;
+        }
+    }
+    if (best != m_frames.end()) {
+        return best.value().frame;
+    }
+
+    auto earliestAhead = m_frames.end();
+    for (auto it = m_frames.begin(); it != m_frames.end(); ++it) {
+        if (it.key() > frameNumber && (earliestAhead == m_frames.end() || it.key() < earliestAhead.key())) {
+            earliestAhead = it;
+        }
+    }
+    return earliestAhead == m_frames.end() ? FrameHandle() : earliestAhead.value().frame;
+}
+
 bool TimelineCache::PlaybackBuffer::contains(int64_t frameNumber) const {
     QMutexLocker lock(&m_mutex);
     return m_frames.contains(frameNumber);
@@ -155,20 +176,41 @@ ClipCache::ClipCache(const QString& path, int64_t duration, MemoryBudget* budget
 
 ClipCache::~ClipCache() {
     if (m_budget && m_memoryUsage > 0) {
-        m_budget->deallocateCpu(m_memoryUsage);
+        size_t cpuBytes = 0;
+        size_t gpuBytes = 0;
+        {
+            QMutexLocker lock(&m_mutex);
+            for (auto it = m_frames.cbegin(); it != m_frames.cend(); ++it) {
+                cpuBytes += it.value().frame.cpuMemoryUsage();
+                gpuBytes += it.value().frame.gpuMemoryUsage();
+            }
+        }
+        if (cpuBytes > 0) {
+            m_budget->deallocateCpu(cpuBytes);
+        }
+        if (gpuBytes > 0) {
+            m_budget->deallocateGpu(gpuBytes);
+        }
     }
 }
 
+ClipCache::FrameMemoryUse ClipCache::frameMemoryUse(const FrameHandle& frame) const {
+    return FrameMemoryUse{
+        frame.cpuMemoryUsage(),
+        frame.gpuMemoryUsage()
+    };
+}
+
 void ClipCache::insert(int64_t frameNumber, const FrameHandle& frame) {
-    size_t replacedBytes = 0;
-    size_t insertedBytes = 0;
+    FrameMemoryUse replacedUse;
+    FrameMemoryUse insertedUse;
     QMutexLocker lock(&m_mutex);
     
     // Remove old frame if exists
     auto it = m_frames.find(frameNumber);
     if (it != m_frames.end()) {
-        replacedBytes = it.value().frame.memoryUsage();
-        m_memoryUsage -= replacedBytes;
+        replacedUse = frameMemoryUse(it.value().frame);
+        m_memoryUsage -= (replacedUse.cpuBytes + replacedUse.gpuBytes);
     }
     
     CachedFrame cf;
@@ -177,15 +219,21 @@ void ClipCache::insert(int64_t frameNumber, const FrameHandle& frame) {
     cf.accessCount = 1;
     
     m_frames[frameNumber] = cf;
-    insertedBytes = frame.memoryUsage();
-    m_memoryUsage += insertedBytes;
+    insertedUse = frameMemoryUse(frame);
+    m_memoryUsage += (insertedUse.cpuBytes + insertedUse.gpuBytes);
     lock.unlock();
 
-    if (m_budget && replacedBytes > 0) {
-        m_budget->deallocateCpu(replacedBytes);
+    if (m_budget && replacedUse.cpuBytes > 0) {
+        m_budget->deallocateCpu(replacedUse.cpuBytes);
     }
-    if (m_budget && insertedBytes > 0) {
-        m_budget->allocateCpu(insertedBytes, MemoryBudget::Priority::Normal);
+    if (m_budget && replacedUse.gpuBytes > 0) {
+        m_budget->deallocateGpu(replacedUse.gpuBytes);
+    }
+    if (m_budget && insertedUse.cpuBytes > 0) {
+        m_budget->allocateCpu(insertedUse.cpuBytes, MemoryBudget::Priority::Normal);
+    }
+    if (m_budget && insertedUse.gpuBytes > 0) {
+        m_budget->allocateGpu(insertedUse.gpuBytes, MemoryBudget::Priority::Normal);
     }
 }
 
@@ -232,25 +280,57 @@ FrameHandle ClipCache::getBest(int64_t frameNumber) {
     return best.value().frame;
 }
 
+FrameHandle ClipCache::getLatestAtOrBefore(int64_t frameNumber) {
+    QMutexLocker lock(&m_mutex);
+
+    auto best = m_frames.end();
+    for (auto it = m_frames.begin(); it != m_frames.end(); ++it) {
+        if (it.key() <= frameNumber && (best == m_frames.end() || it.key() > best.key())) {
+            best = it;
+        }
+    }
+    if (best != m_frames.end()) {
+        best.value().lastAccessTime = QDateTime::currentMSecsSinceEpoch();
+        best.value().accessCount++;
+        return best.value().frame;
+    }
+
+    auto earliestAhead = m_frames.end();
+    for (auto it = m_frames.begin(); it != m_frames.end(); ++it) {
+        if (it.key() > frameNumber && (earliestAhead == m_frames.end() || it.key() < earliestAhead.key())) {
+            earliestAhead = it;
+        }
+    }
+    if (earliestAhead == m_frames.end()) {
+        return FrameHandle();
+    }
+    earliestAhead.value().lastAccessTime = QDateTime::currentMSecsSinceEpoch();
+    earliestAhead.value().accessCount++;
+    return earliestAhead.value().frame;
+}
+
 bool ClipCache::contains(int64_t frameNumber) const {
     QMutexLocker lock(&m_mutex);
     return m_frames.contains(frameNumber);
 }
 
 void ClipCache::remove(int64_t frameNumber) {
-    size_t releasedBytes = 0;
+    FrameMemoryUse releasedUse;
     QMutexLocker lock(&m_mutex);
     
     auto it = m_frames.find(frameNumber);
     if (it != m_frames.end()) {
-        releasedBytes = it.value().frame.memoryUsage();
-        m_memoryUsage -= releasedBytes;
+        releasedUse = frameMemoryUse(it.value().frame);
+        m_memoryUsage -= (releasedUse.cpuBytes + releasedUse.gpuBytes);
         m_frames.erase(it);
     }
     lock.unlock();
 
-    if (m_budget && releasedBytes > 0) {
-        m_budget->deallocateCpu(releasedBytes);
+    if (m_budget && releasedUse.cpuBytes > 0) {
+        m_budget->deallocateCpu(releasedUse.cpuBytes);
+    }
+    if (m_budget && releasedUse.gpuBytes > 0) {
+        m_budget->deallocateGpu(releasedUse.gpuBytes);
     }
 }
 
@@ -275,7 +355,14 @@ void ClipCache::evictToFit(size_t maxMemory) {
         
         auto it = m_frames.find(key);
         if (it != m_frames.end()) {
-            m_memoryUsage -= it.value().frame.memoryUsage();
+            const FrameMemoryUse use = frameMemoryUse(it.value().frame);
+            m_memoryUsage -= (use.cpuBytes + use.gpuBytes);
+            if (m_budget && use.cpuBytes > 0) {
+                m_budget->deallocateCpu(use.cpuBytes);
+            }
+            if (m_budget && use.gpuBytes > 0) {
+                m_budget->deallocateGpu(use.gpuBytes);
+            }
             m_frames.erase(it);
         }
     }
@@ -327,9 +414,7 @@ TimelineCache::~TimelineCache() {
         delete buffer;
     }
     m_playbackBuffers.clear();
-    if (m_budget && releasedMemory > 0) {
-        m_budget->deallocateCpu(releasedMemory);
-    }
+    Q_UNUSED(releasedMemory)
 }
 
 void TimelineCache::setMaxMemory(size_t bytes) {
@@ -696,6 +781,18 @@ FrameHandle TimelineCache::getBestCachedFrame(const QString& clipId, int64_t fra
     return it.value()->getBest(frameNumber);
 }
 
+FrameHandle TimelineCache::getLatestCachedFrame(const QString& clipId, int64_t frameNumber) {
+    frameNumber = normalizeFrameNumber(clipId, frameNumber);
+    QMutexLocker lock(&m_clipsMutex);
+
+    auto it = m_caches.find(clipId);
+    if (it == m_caches.end()) {
+        return FrameHandle();
+    }
+
+    return it.value()->getLatestAtOrBefore(frameNumber);
+}
+
 FrameHandle TimelineCache::getPlaybackFrame(const QString& clipId, int64_t frameNumber) {
     frameNumber = normalizeFrameNumber(clipId, frameNumber);
     QMutexLocker lock(&m_clipsMutex);
@@ -718,6 +815,18 @@ FrameHandle TimelineCache::getBestPlaybackFrame(const QString& clipId, int64_t f
     }
 
     return it.value()->getBest(frameNumber);
+}
+
+FrameHandle TimelineCache::getLatestPlaybackFrame(const QString& clipId, int64_t frameNumber) {
+    frameNumber = normalizeFrameNumber(clipId, frameNumber);
+    QMutexLocker lock(&m_clipsMutex);
+
+    auto it = m_playbackBuffers.find(clipId);
+    if (it == m_playbackBuffers.end()) {
+        return FrameHandle();
+    }
+
+    return it.value()->getLatestAtOrBefore(frameNumber);
 }
 
 bool TimelineCache::isFrameCached(const QString& clipId, int64_t frameNumber) const {

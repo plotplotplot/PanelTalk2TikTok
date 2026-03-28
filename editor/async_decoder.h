@@ -10,13 +10,15 @@
 #include <QImage>
 #include <QMutex>
 #include <QObject>
-#include <QThread>
 #include <QVector>
-#include <QWaitCondition>
 #include <functional>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 // FFmpeg forward declarations (actual includes in .cpp)
 extern "C" {
@@ -48,6 +50,7 @@ struct DecodeRequest {
     int64_t frameNumber;
     int priority;  // Higher = more urgent (0-255)
     DecodeRequestKind kind = DecodeRequestKind::Visible;
+    uint64_t generation = 0;
     QDeadlineTimer deadline;
     std::function<void(FrameHandle)> callback;
     qint64 submittedAt;
@@ -67,6 +70,7 @@ struct VideoStreamInfo {
     int64_t bitrate = 0;
     QString codecName;
     QString decodePath;
+    QString interopPath;
     QString requestedDecodeMode;
     bool hasAudio = false;
     bool hasAlpha = false;
@@ -149,83 +153,6 @@ private:
 };
 
 // ============================================================================
-// DecodeQueue - Thread-safe priority queue
-// ============================================================================
-class DecodeQueue {
-public:
-    static constexpr int kMaxSize = 128;
-    
-    bool enqueue(DecodeRequest req);
-    bool dequeue(DecodeRequest* out);
-    bool tryDequeue(DecodeRequest* out, int timeoutMs);
-    QVector<DecodeRequest> takeSameFileVisibleRequests(const QString& path,
-                                                       int64_t minimumFrameNumber,
-                                                       int maxRequests);
-    
-    void clear();
-    void removeForFile(const QString& path);
-    void removeForFileBefore(const QString& path, int64_t frameNumber);
-    int size() const;
-    bool isEmpty() const;
-    
-    void shutdown();
-    bool isShutdown() const { return m_shutdown.load(); }
-    
-private:
-    mutable QMutex m_mutex;
-    QWaitCondition m_condition;
-    std::deque<DecodeRequest> m_queue;
-    std::atomic<bool> m_shutdown{false};
-    
-    // Insert by priority (higher priority = earlier in queue)
-    void insertByPriority(const DecodeRequest& req);
-    void collectSupersededRequests(const DecodeRequest& req,
-                                   QVector<std::function<void(FrameHandle)>>* droppedCallbacks);
-};
-
-// ============================================================================
-// DecoderWorker - Runs on background thread, processes decode requests
-// ============================================================================
-class DecoderWorker : public QObject {
-    Q_OBJECT
-public:
-    explicit DecoderWorker(DecodeQueue* queue, MemoryBudget* budget, QObject* parent = nullptr);
-    ~DecoderWorker();
-    
-    void start();
-    void stop();
-    bool isRunning() const { return m_running.load(); }
-    
-    // Statistics
-    int decodedFrameCount() const { return m_decodeCount.load(); }
-    int droppedFrameCount() const { return m_dropCount.load(); }
-    
-signals:
-    void frameDecoded(FrameHandle frame);
-    void decodeError(QString path, QString error);
-    
-public slots:
-    void run();
-    
-private:
-    DecoderContext* getOrCreateContext(const QString& path);
-    void evictOldestContext();
-    void processRequest(const DecodeRequest& req);
-    void processVisibleBatch(const QVector<DecodeRequest>& requests, DecoderContext* ctx);
-    
-    DecodeQueue* m_queue = nullptr;
-    MemoryBudget* m_budget = nullptr;
-    QThread* m_thread = nullptr;
-    std::atomic<bool> m_running{false};
-    std::atomic<int> m_decodeCount{0};
-    std::atomic<int> m_dropCount{0};
-    
-    QMutex m_contextsMutex;
-    QHash<QString, DecoderContext*> m_contexts;
-    static constexpr int kMaxContexts = 4;  // Max concurrent files per worker
-};
-
-// ============================================================================
 // AsyncDecoder - Main API for async frame decoding
 // ============================================================================
 class AsyncDecoder : public QObject {
@@ -265,7 +192,7 @@ public:
     
     // Statistics
     int pendingRequestCount() const { return totalPendingRequests(); }
-    int workerCount() const { return m_workers.size(); }
+    int workerCount() const { return m_workerCount; }
     
     // Memory budget access
     MemoryBudget* memoryBudget() const { return m_budget; }
@@ -276,15 +203,26 @@ signals:
     void queuePressureChanged(int pendingCount);
     
 private:
+    struct LaneState;
+
     void setupTrimCallback();
     void trimCaches();
     int totalPendingRequests() const;
-    int queueIndexForPath(const QString& path) const;
-    DecodeQueue* queueForPath(const QString& path) const;
+    int laneIndexForPath(const QString& path) const;
+    LaneState* laneForPath(const QString& path) const;
+    void startLane(LaneState* lane);
+    void stopLane(LaneState* lane);
+    void runLane(LaneState* lane);
+    void insertByPriority(std::deque<DecodeRequest>& queue, const DecodeRequest& req);
+    void collectSupersededRequests(const DecodeRequest& req,
+                                   std::deque<DecodeRequest>& queue,
+                                   QVector<std::function<void(FrameHandle)>>* droppedCallbacks);
     
     MemoryBudget* m_budget = nullptr;
-    QVector<DecodeQueue*> m_queues;
-    QVector<DecoderWorker*> m_workers;
+    int m_workerCount = 0;
+    std::vector<std::unique_ptr<LaneState>> m_lanes;
+    bool m_initialized = false;
+    bool m_shuttingDown = false;
     std::atomic<uint64_t> m_nextSequenceId{1};
     
     QMutex m_infoCacheMutex;

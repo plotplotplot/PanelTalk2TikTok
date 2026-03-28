@@ -56,6 +56,8 @@ public:
     QCheckBox *gradingAutoScrollCheckBox() const { return m_gradingAutoScrollCheckBox; }
     QCheckBox *gradingFollowCurrentCheckBox() const { return m_gradingFollowCurrentCheckBox; }
     QPushButton *gradingKeyAtPlayheadButton() const { return m_gradingKeyAtPlayheadButton; }
+    QPushButton *gradingFadeInButton() const { return m_gradingFadeInButton; }
+    QPushButton *gradingFadeOutButton() const { return m_gradingFadeOutButton; }
     QLabel *syncInspectorClipLabel() const { return m_syncInspectorClipLabel; }
     QLabel *syncInspectorDetailsLabel() const { return m_syncInspectorDetailsLabel; }
     QTableWidget *syncTable() const { return m_syncTable; }
@@ -88,6 +90,7 @@ public:
     QSpinBox *exportEndSpin() const { return m_exportEndSpin; }
     QComboBox *outputFormatCombo() const { return m_outputFormatCombo; }
     QLabel *outputRangeSummaryLabel() const { return m_outputRangeSummaryLabel; }
+    QCheckBox *renderUseProxiesCheckBox() const { return m_renderUseProxiesCheckBox; }
     QPushButton *renderButton() const { return m_renderButton; }
 
     QCheckBox *speechFilterEnabledCheckBox() const { return m_speechFilterEnabledCheckBox; }
@@ -122,6 +125,8 @@ private:
     QCheckBox *m_gradingAutoScrollCheckBox = nullptr;
     QCheckBox *m_gradingFollowCurrentCheckBox = nullptr;
     QPushButton *m_gradingKeyAtPlayheadButton = nullptr;
+    QPushButton *m_gradingFadeInButton = nullptr;
+    QPushButton *m_gradingFadeOutButton = nullptr;
 
     QLabel *m_syncInspectorClipLabel = nullptr;
     QLabel *m_syncInspectorDetailsLabel = nullptr;
@@ -178,6 +183,7 @@ private:
     QSpinBox *m_exportEndSpin = nullptr;
     QComboBox *m_outputFormatCombo = nullptr;
     QLabel *m_outputRangeSummaryLabel = nullptr;
+    QCheckBox *m_renderUseProxiesCheckBox = nullptr;
     QPushButton *m_renderButton = nullptr;
 
     QCheckBox *m_speechFilterEnabledCheckBox = nullptr;

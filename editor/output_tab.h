@@ -5,6 +5,7 @@
 #include <QComboBox>
 #include <QLabel>
 #include <QPushButton>
+#include <QCheckBox>
 #include <QJsonObject>
 #include <QString>
 #include <QSize>
@@ -27,6 +28,7 @@ public:
         QSpinBox* exportEndSpin = nullptr;
         QComboBox* outputFormatCombo = nullptr;
         QLabel* outputRangeSummaryLabel = nullptr;
+        QCheckBox* renderUseProxiesCheckBox = nullptr;
         QPushButton* renderButton = nullptr;
     };
 
@@ -62,6 +64,7 @@ private slots:
     void onExportStartChanged(int value);
     void onExportEndChanged(int value);
     void onOutputFormatChanged(int index);
+    void onRenderUseProxiesToggled(bool checked);
     void onRenderClicked();
 
 private:

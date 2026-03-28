@@ -19,7 +19,6 @@
 
 QT_BEGIN_NAMESPACE
 class QOpenGLShaderProgram;
-class QOpenGLTexture;
 QT_END_NAMESPACE
 
 using namespace editor;
@@ -83,10 +82,12 @@ private:
     };
 
     struct TextureCacheEntry {
-        QOpenGLTexture* texture = nullptr;
+        GLuint textureId = 0;
+        GLuint auxTextureId = 0;
         qint64 decodeTimestamp = 0;
         qint64 lastUsedMs = 0;
         QSize size;
+        bool usesYuvTextures = false;
     };
 
     enum class PreviewDragMode {
@@ -110,7 +111,8 @@ private:
     void ensurePipeline();
     void releaseGlResources();
     QString textureCacheKey(const FrameHandle& frame) const;
-    QOpenGLTexture* textureForFrame(const FrameHandle& frame);
+    GLuint textureForFrame(const FrameHandle& frame);
+    bool uploadCudaNv12FrameToTextures(const FrameHandle& frame, TextureCacheEntry& entry);
     void trimTextureCache();
     bool isSampleWithinClip(const TimelineClip& clip, int64_t samplePosition) const;
     int64_t sourceSampleForPlaybackSample(const TimelineClip& clip, int64_t samplePosition) const;
@@ -129,6 +131,7 @@ private:
     void drawBackground(QPainter* painter);
     QList<TimelineClip> getActiveClips() const;
     void requestFramesForCurrentPosition();
+    void scheduleFrameRequest();
     void scheduleRepaint();
     void drawCompositedPreview(QPainter* painter, const QRect& safeRect,
                                const QList<TimelineClip>& activeClips);
@@ -165,6 +168,7 @@ private:
     QVector<RenderSyncMarker> m_renderSyncMarkers;
     QSet<QString> m_registeredClips;
     QTimer m_repaintTimer;
+    QTimer m_frameRequestTimer;
     qint64 m_lastFrameRequestMs = 0;
     qint64 m_lastFrameReadyMs = 0;
     qint64 m_lastPaintMs = 0;
@@ -181,6 +185,7 @@ private:
     QVector<QString> m_paintOrder;
     int m_bulkUpdateDepth = 0;
     bool m_pendingFrameRequest = false;
+    bool m_frameRequestsArmed = false;
     PreviewDragMode m_dragMode = PreviewDragMode::None;
     QPointF m_dragOriginPos;
     QRectF m_dragOriginBounds;

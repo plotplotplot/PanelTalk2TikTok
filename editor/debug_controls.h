@@ -16,8 +16,9 @@ enum class DebugLogLevel : int {
 
 enum class DecodePreference : int {
     Auto = 0,
-    Hardware = 1,
-    Software = 2,
+    HardwareZeroCopy = 1,
+    Hardware = 2,
+    Software = 3,
 };
 
 DebugLogLevel debugPlaybackLevel();

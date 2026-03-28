@@ -35,6 +35,7 @@ struct RenderRequest {
     QString outputPath;
     QString outputFormat;
     QSize outputSize;
+    bool useProxyMedia = false;
     QVector<TimelineClip> clips;
     QVector<RenderSyncMarker> renderSyncMarkers;
     QVector<ExportRangeSegment> exportRanges;
