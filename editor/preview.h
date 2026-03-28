@@ -11,6 +11,7 @@
 
 // Include frame_handle first to avoid conflicts with forward declarations
 #include "frame_handle.h"
+#include "gl_frame_texture_shared.h"
 #include "editor_shared.h"
 #include "timeline_widget.h"
 #include "async_decoder.h"
@@ -82,15 +83,6 @@ private:
         QRectF cornerHandle;
     };
 
-    struct TextureCacheEntry {
-        GLuint textureId = 0;
-        GLuint auxTextureId = 0;
-        qint64 decodeTimestamp = 0;
-        qint64 lastUsedMs = 0;
-        QSize size;
-        bool usesYuvTextures = false;
-    };
-
     enum class PreviewDragMode {
         None,
         Move,
@@ -111,9 +103,7 @@ private:
     bool usingCpuFallback() const;
     void ensurePipeline();
     void releaseGlResources();
-    QString textureCacheKey(const FrameHandle& frame) const;
     GLuint textureForFrame(const FrameHandle& frame);
-    bool uploadCudaNv12FrameToTextures(const FrameHandle& frame, TextureCacheEntry& entry);
     void trimTextureCache();
     bool isSampleWithinClip(const TimelineClip& clip, int64_t samplePosition) const;
     int64_t sourceSampleForPlaybackSample(const TimelineClip& clip, int64_t samplePosition) const;
@@ -181,7 +171,7 @@ private:
     QPointF m_previewPanOffset;
     QHash<QString, PreviewOverlayInfo> m_overlayInfo;
     mutable QHash<QString, QVector<TranscriptSection>> m_transcriptSectionsCache;
-    QHash<QString, TextureCacheEntry> m_textureCache;
+    QHash<QString, editor::GlTextureCacheEntry> m_textureCache;
     QHash<QString, FrameHandle> m_lastPresentedFrames;
     mutable QJsonObject m_lastFrameSelectionStats;
     QVector<QString> m_paintOrder;

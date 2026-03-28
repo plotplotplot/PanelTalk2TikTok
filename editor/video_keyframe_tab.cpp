@@ -1,6 +1,7 @@
 #include "video_keyframe_tab.h"
 #include "clip_serialization.h"
 #include "editor_shared.h"
+#include "keyframe_table_shared.h"
 
 #include <QMenu>
 #include <QHeaderView>
@@ -497,14 +498,7 @@ void VideoKeyframeTab::refresh()
     updateMirrorCheckboxesFromScale(displayed.scaleX, displayed.scaleY);
     m_widgets.videoInterpolationCombo->setCurrentIndex(displayed.linearInterpolation ? 1 : 0);
 
-    for (int row = 0; row < m_widgets.videoKeyframeTable->rowCount(); ++row) {
-        QTableWidgetItem* item = m_widgets.videoKeyframeTable->item(row, 0);
-        if (!item) continue;
-        const int64_t frame = item->data(Qt::UserRole).toLongLong();
-        if (m_selectedKeyframeFrames.contains(frame)) {
-            m_widgets.videoKeyframeTable->selectRow(row);
-        }
-    }
+    editor::restoreSelectionByFrameRole(m_widgets.videoKeyframeTable, m_selectedKeyframeFrames);
 
     const QString keyframeSummary = clip->transformKeyframes.isEmpty()
                                         ? QStringLiteral("Using base transform only")
@@ -1138,20 +1132,10 @@ void VideoKeyframeTab::onTableSelectionChanged()
 {
     if (m_updating || m_syncingTableSelection) return;
 
-    QList<QTableWidgetItem*> selectedItems = m_widgets.videoKeyframeTable->selectedItems();
-    if (selectedItems.isEmpty()) return;
-
-    QSet<int64_t> selectedFrames;
-    int64_t primaryFrame = -1;
-    for (QTableWidgetItem* item : selectedItems) {
-        const QVariant frameData = item->data(Qt::UserRole);
-        if (!frameData.isValid()) continue;
-        const int64_t frame = frameData.toLongLong();
-        selectedFrames.insert(frame);
-        if (primaryFrame < 0 || frame < primaryFrame) {
-            primaryFrame = frame;
-        }
-    }
+    const QSet<int64_t> selectedFrames =
+        editor::collectSelectedFrameRoles(m_widgets.videoKeyframeTable);
+    const int64_t primaryFrame =
+        editor::primarySelectedFrameRole(m_widgets.videoKeyframeTable);
 
     if (primaryFrame < 0) return;
 
@@ -1273,41 +1257,17 @@ void VideoKeyframeTab::onTableCustomContextMenu(const QPoint& pos)
 {
     if (!m_widgets.videoKeyframeTable) return;
 
-    QTableWidgetItem* item = m_widgets.videoKeyframeTable->itemAt(pos);
+    int row = -1;
+    QTableWidgetItem* item =
+        editor::ensureContextRowSelected(m_widgets.videoKeyframeTable, pos, &row);
     if (!item) return;
 
-    const int row = item->row();
-    if (!m_widgets.videoKeyframeTable->selectionModel()->isRowSelected(row, QModelIndex())) {
-        m_widgets.videoKeyframeTable->clearSelection();
-        m_widgets.videoKeyframeTable->selectRow(row);
-    }
-
     const int64_t anchorFrame = item->data(Qt::UserRole).toLongLong();
-    int64_t previousFrame = -1;
-    int64_t nextFrame = -1;
-
-    if (row > 0) {
-        if (QTableWidgetItem* previousItem = m_widgets.videoKeyframeTable->item(row - 1, 0)) {
-            previousFrame = previousItem->data(Qt::UserRole).toLongLong();
-        }
-    }
-    if (row + 1 < m_widgets.videoKeyframeTable->rowCount()) {
-        if (QTableWidgetItem* nextItem = m_widgets.videoKeyframeTable->item(row + 1, 0)) {
-            nextFrame = nextItem->data(Qt::UserRole).toLongLong();
-        }
-    }
-
-    int deletableRowCount = 0;
-    const QList<QTableWidgetSelectionRange> ranges = m_widgets.videoKeyframeTable->selectedRanges();
-    for (const QTableWidgetSelectionRange& range : ranges) {
-        for (int selectedRow = range.topRow(); selectedRow <= range.bottomRow(); ++selectedRow) {
-            QTableWidgetItem* selectedItem = m_widgets.videoKeyframeTable->item(selectedRow, 0);
-            if (selectedItem && selectedItem->data(Qt::UserRole).toLongLong() > 0) {
-                ++deletableRowCount;
-            }
-        }
-    }
-        QMenu menu;
+    const int64_t previousFrame = editor::rowFrameRole(m_widgets.videoKeyframeTable, row - 1);
+    const int64_t nextFrame = editor::rowFrameRole(m_widgets.videoKeyframeTable, row + 1);
+    const int deletableRowCount =
+        editor::countSelectedFrameRoles(m_widgets.videoKeyframeTable, [](int64_t frame) { return frame > 0; });
+    QMenu menu;
     QAction* addAboveAction = menu.addAction(QStringLiteral("Add Keyframe Above"));
     addAboveAction->setEnabled(previousFrame >= 0);
     QAction* addBelowAction = menu.addAction(QStringLiteral("Add Keyframe Below"));

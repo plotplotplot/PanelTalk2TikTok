@@ -49,6 +49,11 @@ public:
         }
     }
 
+    void setRenderSyncMarkers(const QVector<RenderSyncMarker>& markers) {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_renderSyncMarkers = markers;
+    }
+
     void setSpeechFilterFadeSamples(int samples) {
         m_speechFilterFadeSamples.store(qMax(0, samples), std::memory_order_release);
     }
@@ -244,6 +249,7 @@ private:
     struct MixContext {
         QVector<TimelineClip> clips;
         QVector<ExportRangeSegment> exportRanges;
+        QVector<RenderSyncMarker> renderSyncMarkers;
         bool muted = false;
         qreal volume = 0.8;
     };
@@ -525,9 +531,13 @@ private:
             
             for (int64_t samplePos = mixStart; samplePos < mixEnd; ++samplePos) {
                 const int outFrame = static_cast<int>(samplePos - chunkStartSample);
-                const int inFrame = static_cast<int>(sourceInSample + (samplePos - clipStartSample));
+                const int64_t inFrame =
+                    sourceSampleForClipAtTimelineSample(clip, samplePos, context.renderSyncMarkers);
+                if (inFrame < 0 || inFrame >= (audio.samples.size() / m_channelCount)) {
+                    continue;
+                }
                 const int outIndex = outFrame * m_channelCount;
-                const int inIndex = inFrame * m_channelCount;
+                const int inIndex = static_cast<int>(inFrame * m_channelCount);
                 
                 // Calculate crossfade gain for this sample
                 float gain = 1.0f;
@@ -618,6 +628,7 @@ private:
                 }
                 context.clips = m_timelineClips;
                 context.exportRanges = exportRangesCopy();
+                context.renderSyncMarkers = m_renderSyncMarkers;
                 chunkStartSample = nextPlayableSampleAtOrAfter(m_timelineSampleCursor, context.exportRanges);
                 m_timelineSampleCursor = chunkStartSample + m_periodFrames;
                 context.muted = m_muted;
@@ -746,6 +757,7 @@ private:
     std::condition_variable m_decodeCondition;
     std::condition_variable m_queueCondition;
     QVector<TimelineClip> m_timelineClips;
+    QVector<RenderSyncMarker> m_renderSyncMarkers;
     QVector<ExportRangeSegment> m_exportRanges;
     QHash<QString, AudioClipCacheEntry> m_audioCache;
     std::deque<QString> m_pendingDecodePaths;

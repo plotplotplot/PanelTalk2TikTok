@@ -189,6 +189,9 @@ int64_t adjustedClipLocalFrameAtTimelineFrame(const TimelineClip& clip,
 int64_t sourceFrameForClipAtTimelinePosition(const TimelineClip& clip,
                                              qreal timelineFramePosition,
                                              const QVector<RenderSyncMarker>& markers);
+int64_t sourceSampleForClipAtTimelineSample(const TimelineClip& clip,
+                                            int64_t timelineSample,
+                                            const QVector<RenderSyncMarker>& markers);
 
 MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames = 120);
 QImage applyClipGrade(const QImage& source, const TimelineClip& clip);

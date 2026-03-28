@@ -16,6 +16,8 @@
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QPushButton>
+#include <QSize>
+#include <QStyle>
 #include <QVBoxLayout>
 
 InspectorPane::InspectorPane(QWidget *parent)
@@ -37,8 +39,6 @@ QWidget *InspectorPane::buildPane()
     layout->setSpacing(8);
 
     m_inspectorTabs = new QTabWidget(pane);
-    m_inspectorTabs->tabBar()->setExpanding(true);
-    m_inspectorTabs->tabBar()->setUsesScrollButtons(false);
     m_inspectorTabs->addTab(buildGradingTab(), QStringLiteral("Grade"));
     m_inspectorTabs->addTab(buildSyncTab(), QStringLiteral("Sync"));
     m_inspectorTabs->addTab(buildKeyframesTab(), QStringLiteral("Keyframes"));
@@ -47,9 +47,71 @@ QWidget *InspectorPane::buildPane()
     m_inspectorTabs->addTab(buildPreviewTab(), QStringLiteral("Preview"));
     m_inspectorTabs->addTab(buildOutputTab(), QStringLiteral("Output"));
     m_inspectorTabs->addTab(buildProfileTab(), QStringLiteral("System"));
+    configureInspectorTabs();
 
     layout->addWidget(m_inspectorTabs);
     return pane;
+}
+
+void InspectorPane::configureInspectorTabs()
+{
+    if (!m_inspectorTabs) {
+        return;
+    }
+
+    auto *bar = m_inspectorTabs->tabBar();
+    m_inspectorTabs->setTabPosition(QTabWidget::East);
+    m_inspectorTabs->setDocumentMode(true);
+    bar->setExpanding(false);
+    bar->setUsesScrollButtons(false);
+    bar->setIconSize(QSize(18, 18));
+    bar->setDrawBase(false);
+
+    struct TabSpec {
+        int index;
+        QStyle::StandardPixmap icon;
+        const char* tooltip;
+    };
+
+    const TabSpec specs[] = {
+        {0, QStyle::SP_DriveDVDIcon, "Grade: clip color, opacity, and grading keyframes"},
+        {1, QStyle::SP_BrowserReload, "Sync: render sync markers for the selected clip"},
+        {2, QStyle::SP_FileDialogDetailedView, "Keyframes: transform keyframes for the selected clip"},
+        {3, QStyle::SP_FileDialogContentsView, "Transcript: transcript editing and speech filter controls"},
+        {4, QStyle::SP_FileDialogInfoView, "Properties: clip and track properties"},
+        {5, QStyle::SP_MediaPlay, "Preview: editor preview display controls"},
+        {6, QStyle::SP_DialogSaveButton, "Output: render settings and export"},
+        {7, QStyle::SP_ComputerIcon, "System: playback, decoder, cache, and benchmark information"},
+    };
+
+    for (const TabSpec& spec : specs) {
+        m_inspectorTabs->setTabIcon(spec.index, style()->standardIcon(spec.icon));
+        m_inspectorTabs->setTabText(spec.index, QString());
+        bar->setTabToolTip(spec.index, QString::fromUtf8(spec.tooltip));
+    }
+
+    bar->setStyleSheet(QStringLiteral(
+        "QTabBar::tab {"
+        " width: 34px;"
+        " height: 34px;"
+        " margin: 2px 0;"
+        " padding: 0px;"
+        " }"
+        "QTabBar::tab:selected {"
+        " background: palette(base);"
+        " border: 1px solid palette(mid);"
+        " border-right: 0px;"
+        " border-top-left-radius: 6px;"
+        " border-bottom-left-radius: 6px;"
+        " }"
+        "QTabBar::tab:!selected {"
+        " background: palette(button);"
+        " border: 1px solid palette(midlight);"
+        " border-right: 0px;"
+        " border-top-left-radius: 6px;"
+        " border-bottom-left-radius: 6px;"
+        " opacity: 0.8;"
+        " }"));
 }
 
 QWidget *InspectorPane::buildGradingTab()

@@ -8,6 +8,8 @@
 #include "control_server.h"
 #include "debug_controls.h"
 #include "editor_shared.h"
+#include "gl_frame_texture_shared.h"
+#include "media_pipeline_shared.h"
 #include "audio_engine.h"
 #include "timeline_widget.h"
 #include "render.h"
@@ -50,7 +52,6 @@
 #include <QOpenGLBuffer>
 #include <QOpenGLContext>
 #include <QOpenGLFunctions>
-#include <QOpenGLPixelTransferOptions>
 #include <QOpenGLShaderProgram>
 #include <QOpenGLWidget>
 #include <QPainter>
@@ -87,15 +88,6 @@
 #include <QtGui/private/qrhigles2_p.h>
 #include <cmath>
 
-extern "C" {
-#include <libavutil/frame.h>
-#include <libavutil/hwcontext.h>
-#include <libavutil/hwcontext_cuda.h>
-}
-
-#include <cuda.h>
-#include <cudaGL.h>
-
 using namespace editor;
 
 namespace {
@@ -129,124 +121,6 @@ namespace {
             return;
         }
         qDebug() << "[PLAYBACK][WARN]" << playbackTraceMs() << event << "-" << detail;
-    }
-
-    bool frameUsesCudaZeroCopyCandidate(const FrameHandle& frame)
-    {
-        return frame.hasHardwareFrame() && frame.hardwareSwPixelFormat() == AV_PIX_FMT_NV12;
-    }
-
-    bool uploadCudaNv12FrameToTextures(const FrameHandle& frame, GLuint textureId, GLuint uvTextureId)
-    {
-        if (!textureId || !uvTextureId || !frameUsesCudaZeroCopyCandidate(frame)) {
-            return false;
-        }
-
-        const AVFrame* hwFrame = frame.hardwareFrame();
-        if (!hwFrame || !hwFrame->hw_frames_ctx) {
-            return false;
-        }
-
-        auto* framesContext = reinterpret_cast<AVHWFramesContext*>(hwFrame->hw_frames_ctx->data);
-        if (!framesContext || !framesContext->device_ctx) {
-            return false;
-        }
-        auto* deviceContext = framesContext->device_ctx;
-        if (!deviceContext || deviceContext->type != AV_HWDEVICE_TYPE_CUDA) {
-            return false;
-        }
-        auto* cudaDeviceContext = reinterpret_cast<AVCUDADeviceContext*>(deviceContext->hwctx);
-        if (!cudaDeviceContext) {
-            return false;
-        }
-
-        if (cuCtxPushCurrent(cudaDeviceContext->cuda_ctx) != CUDA_SUCCESS) {
-            return false;
-        }
-
-        auto restoreContext = []() {
-            CUcontext popped = nullptr;
-            cuCtxPopCurrent(&popped);
-        };
-
-        const int width = hwFrame->width;
-        const int height = hwFrame->height;
-        if (width <= 0 || height <= 0) {
-            restoreContext();
-            return false;
-        }
-
-        CUgraphicsResource yResource = nullptr;
-        CUgraphicsResource uvResource = nullptr;
-        CUresult result = cuGraphicsGLRegisterImage(&yResource, textureId, GL_TEXTURE_2D,
-                                                    CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD);
-        if (result != CUDA_SUCCESS) {
-            restoreContext();
-            return false;
-        }
-        result = cuGraphicsGLRegisterImage(&uvResource, uvTextureId, GL_TEXTURE_2D,
-                                           CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD);
-        if (result != CUDA_SUCCESS) {
-            cuGraphicsUnregisterResource(yResource);
-            restoreContext();
-            return false;
-        }
-
-        CUgraphicsResource resources[2] = {yResource, uvResource};
-        result = cuGraphicsMapResources(2, resources, cudaDeviceContext->stream);
-        if (result != CUDA_SUCCESS) {
-            cuGraphicsUnregisterResource(uvResource);
-            cuGraphicsUnregisterResource(yResource);
-            restoreContext();
-            return false;
-        }
-
-        CUarray yArray = nullptr;
-        CUarray uvArray = nullptr;
-        result = cuGraphicsSubResourceGetMappedArray(&yArray, yResource, 0, 0);
-        if (result == CUDA_SUCCESS) {
-            result = cuGraphicsSubResourceGetMappedArray(&uvArray, uvResource, 0, 0);
-        }
-
-        if (result == CUDA_SUCCESS) {
-            CUDA_MEMCPY2D copy = {};
-            copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-            copy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
-
-            copy.srcDevice = reinterpret_cast<CUdeviceptr>(hwFrame->data[0]);
-            copy.srcPitch = static_cast<size_t>(hwFrame->linesize[0]);
-            copy.dstArray = yArray;
-            copy.WidthInBytes = static_cast<size_t>(width);
-            copy.Height = static_cast<size_t>(height);
-            result = cuMemcpy2DAsync(&copy, cudaDeviceContext->stream);
-
-            if (result == CUDA_SUCCESS) {
-                CUDA_MEMCPY2D uvCopy = {};
-                uvCopy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-                uvCopy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
-                uvCopy.srcDevice = reinterpret_cast<CUdeviceptr>(hwFrame->data[1]);
-                uvCopy.srcPitch = static_cast<size_t>(hwFrame->linesize[1]);
-                uvCopy.dstArray = uvArray;
-                uvCopy.WidthInBytes = static_cast<size_t>(width);
-                uvCopy.Height = static_cast<size_t>(height / 2);
-                result = cuMemcpy2DAsync(&uvCopy, cudaDeviceContext->stream);
-            }
-        }
-
-        if (result == CUDA_SUCCESS) {
-            result = cuStreamSynchronize(cudaDeviceContext->stream);
-        }
-
-        cuGraphicsUnmapResources(2, resources, cudaDeviceContext->stream);
-        cuGraphicsUnregisterResource(uvResource);
-        cuGraphicsUnregisterResource(yResource);
-        restoreContext();
-
-        if (result != CUDA_SUCCESS) {
-            return false;
-        }
-
-        return true;
     }
 
     struct PlaybackStaleRunState {
@@ -1405,14 +1279,7 @@ void PreviewWindow::ensurePipeline() {
 
 void PreviewWindow::releaseGlResources() {
     for (auto it = m_textureCache.begin(); it != m_textureCache.end(); ++it) {
-        if (it.value().textureId != 0) {
-            glDeleteTextures(1, &it.value().textureId);
-            it.value().textureId = 0;
-        }
-        if (it.value().auxTextureId != 0) {
-            glDeleteTextures(1, &it.value().auxTextureId);
-            it.value().auxTextureId = 0;
-        }
+        editor::destroyGlTextureEntry(&it.value());
     }
     m_textureCache.clear();
     if (m_quadBuffer.isCreated()) {
@@ -1421,162 +1288,35 @@ void PreviewWindow::releaseGlResources() {
     m_shaderProgram.reset();
 }
 
-QString PreviewWindow::textureCacheKey(const FrameHandle& frame) const {
-    return QStringLiteral("%1|%2").arg(frame.sourcePath()).arg(frame.frameNumber());
-}
-
-bool PreviewWindow::uploadCudaNv12FrameToTextures(const FrameHandle& frame, TextureCacheEntry& entry) {
-    if (!frameUsesCudaZeroCopyCandidate(frame)) {
-        return false;
-    }
-
-    const QSize frameSize = frame.size();
-    if (!frameSize.isValid()) {
-        return false;
-    }
-
-    const int width = frameSize.width();
-    const int height = frameSize.height();
-    const int uvWidth = qMax(1, (width + 1) / 2);
-    const int uvHeight = qMax(1, (height + 1) / 2);
-    const bool needsAllocation =
-        entry.textureId == 0 ||
-        entry.auxTextureId == 0 ||
-        entry.size != frameSize ||
-        !entry.usesYuvTextures;
-
-    if (needsAllocation) {
-        if (entry.textureId != 0) {
-            glDeleteTextures(1, &entry.textureId);
-            entry.textureId = 0;
-        }
-        if (entry.auxTextureId != 0) {
-            glDeleteTextures(1, &entry.auxTextureId);
-            entry.auxTextureId = 0;
-        }
-
-        glGenTextures(1, &entry.textureId);
-        glBindTexture(GL_TEXTURE_2D, entry.textureId);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, nullptr);
-
-        glGenTextures(1, &entry.auxTextureId);
-        glBindTexture(GL_TEXTURE_2D, entry.auxTextureId);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, uvWidth, uvHeight, 0, GL_RG, GL_UNSIGNED_BYTE, nullptr);
-        glBindTexture(GL_TEXTURE_2D, 0);
-    }
-
-    if (!::uploadCudaNv12FrameToTextures(frame, entry.textureId, entry.auxTextureId)) {
-        return false;
-    }
-
-    entry.size = frameSize;
-    entry.usesYuvTextures = true;
-    return true;
-}
-
 GLuint PreviewWindow::textureForFrame(const FrameHandle& frame) {
     if (frame.isNull()) {
         return 0;
     }
 
-    const QString key = textureCacheKey(frame);
+    const QString key = editor::textureCacheKey(frame);
     const qint64 decodeTimestamp = frame.data() ? frame.data()->decodeTimestamp : 0;
-    TextureCacheEntry entry = m_textureCache.value(key);
+    editor::GlTextureCacheEntry entry = m_textureCache.value(key);
     if (entry.textureId != 0 && entry.decodeTimestamp == decodeTimestamp) {
         entry.lastUsedMs = nowMs();
         m_textureCache.insert(key, entry);
         return entry.textureId;
     }
 
-    if (entry.textureId != 0) {
-        glDeleteTextures(1, &entry.textureId);
-        entry.textureId = 0;
-    }
-    if (entry.auxTextureId != 0) {
-        glDeleteTextures(1, &entry.auxTextureId);
-        entry.auxTextureId = 0;
-    }
-    entry.usesYuvTextures = false;
+    editor::destroyGlTextureEntry(&entry);
 
-    if (frameUsesCudaZeroCopyCandidate(frame) && uploadCudaNv12FrameToTextures(frame, entry)) {
+    if (editor::uploadFrameToGlTextureEntry(frame, &entry)) {
         entry.decodeTimestamp = decodeTimestamp;
         entry.lastUsedMs = nowMs();
         m_textureCache.insert(key, entry);
         trimTextureCache();
         return entry.textureId;
     }
-
-    if (!frame.hasCpuImage()) {
-        return 0;
-    }
-
-    QImage uploadImage = frame.cpuImage();
-    if (uploadImage.format() != QImage::Format_ARGB32_Premultiplied) {
-        uploadImage = uploadImage.convertToFormat(QImage::Format_ARGB32_Premultiplied);
-    }
-
-    GLuint textureId = 0;
-    glGenTextures(1, &textureId);
-    if (textureId == 0) {
-        return 0;
-    }
-    glBindTexture(GL_TEXTURE_2D, textureId);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D,
-                 0,
-                 GL_RGBA8,
-                 uploadImage.width(),
-                 uploadImage.height(),
-                 0,
-                 GL_BGRA,
-                 GL_UNSIGNED_BYTE,
-                 uploadImage.constBits());
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    entry.textureId = textureId;
-    entry.auxTextureId = 0;
-    entry.decodeTimestamp = decodeTimestamp;
-    entry.lastUsedMs = nowMs();
-    entry.size = uploadImage.size();
-    entry.usesYuvTextures = false;
-    m_textureCache.insert(key, entry);
-    trimTextureCache();
-    return textureId;
+    return 0;
 }
 
 void PreviewWindow::trimTextureCache() {
     static constexpr int kMaxTextureCacheEntries = 180;
-    if (m_textureCache.size() <= kMaxTextureCacheEntries) {
-        return;
-    }
-
-    QVector<QString> keys = m_textureCache.keys().toVector();
-    std::sort(keys.begin(), keys.end(), [this](const QString& a, const QString& b) {
-        return m_textureCache.value(a).lastUsedMs < m_textureCache.value(b).lastUsedMs;
-    });
-
-    const int removeCount = m_textureCache.size() - kMaxTextureCacheEntries;
-    for (int i = 0; i < removeCount; ++i) {
-        TextureCacheEntry entry = m_textureCache.take(keys[i]);
-        if (entry.textureId != 0) {
-            glDeleteTextures(1, &entry.textureId);
-        }
-        if (entry.auxTextureId != 0) {
-            glDeleteTextures(1, &entry.auxTextureId);
-        }
-    }
+    editor::trimGlTextureCache(&m_textureCache, kMaxTextureCacheEntries);
 }
 
 bool PreviewWindow::isSampleWithinClip(const TimelineClip& clip, int64_t samplePosition) const {
@@ -1601,12 +1341,12 @@ QRectF PreviewWindow::renderFrameLayerGL(const QRect& targetRect, const Timeline
         return QRectF();
     }
 
-    const QString cacheKey = textureCacheKey(frame);
+    const QString cacheKey = editor::textureCacheKey(frame);
     const GLuint textureId = textureForFrame(frame);
     if (textureId == 0) {
         return QRectF();
     }
-    const TextureCacheEntry entry = m_textureCache.value(cacheKey);
+    const editor::GlTextureCacheEntry entry = m_textureCache.value(cacheKey);
 
     const QRect fitted = fitRect(frame.size(), targetRect);
     const TimelineClip::TransformKeyframe transform = evaluateClipTransformAtPosition(clip, m_currentFramePosition);
@@ -1977,16 +1717,12 @@ void PreviewWindow::requestFramesForCurrentPosition() {
             continue;
         }
         if (isSampleWithinClip(clip, m_currentSample)) {
-            if (!m_bypassGrading) {
-                const TimelineClip::GradingKeyframe grade =
-                    evaluateClipGradingAtPosition(clip, m_currentFramePosition);
-                if (grade.opacity <= 0.0001) {
-                    playbackTrace(QStringLiteral("PreviewWindow::requestFramesForCurrentPosition.skip"),
-                                  QStringLiteral("reason=zero-opacity clip=%1 frame=%2")
-                                      .arg(clip.id)
-                                      .arg(m_currentFramePosition, 0, 'f', 3));
-                    continue;
-                }
+            if (!editor::clipIsActiveAtTimelineFrame(clip, m_currentFramePosition, m_bypassGrading)) {
+                playbackTrace(QStringLiteral("PreviewWindow::requestFramesForCurrentPosition.skip"),
+                              QStringLiteral("reason=zero-opacity clip=%1 frame=%2")
+                                  .arg(clip.id)
+                                  .arg(m_currentFramePosition, 0, 'f', 3));
+                continue;
             }
             activeClips.push_back(&clip);
         }

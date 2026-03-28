@@ -128,6 +128,10 @@ private:
     QColor clipColorForId(const QString &clipId) const;
     bool parseSyncActionText(const QString &text, RenderSyncAction *actionOut) const;
     void refreshSyncInspector();
+    void onSyncTableSelectionChanged();
+    void onSyncTableItemChanged(QTableWidgetItem* item);
+    void onSyncTableItemDoubleClicked(QTableWidgetItem* item);
+    void onSyncTableCustomContextMenu(const QPoint& pos);
     void refreshClipInspector();
     void refreshOutputInspector();
     void applyOutputRangeFromInspector();
@@ -299,6 +303,8 @@ private:
     int64_t m_pendingKeyframeClickTimelineFrame = -1;
     QTimer m_gradingClickSeekTimer;
     int64_t m_pendingGradingClickTimelineFrame = -1;
+    QTimer m_syncClickSeekTimer;
+    int64_t m_pendingSyncClickTimelineFrame = -1;
 
     QString m_currentProjectId;
 

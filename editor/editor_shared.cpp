@@ -572,6 +572,32 @@ int64_t sourceFrameForClipAtTimelinePosition(const TimelineClip& clip,
                                        clip.sourceInFrame + static_cast<int64_t>(sourceFrameOffset)));
 }
 
+int64_t sourceSampleForClipAtTimelineSample(const TimelineClip& clip,
+                                            int64_t timelineSample,
+                                            const QVector<RenderSyncMarker>& markers) {
+    const int64_t clipStartSample = clipTimelineStartSamples(clip);
+    const int64_t localTimelineSample = qMax<int64_t>(0, timelineSample - clipStartSample);
+    const int64_t maxLocalTimelineSample =
+        qMax<int64_t>(0, frameToSamples(qMax<int64_t>(0, clip.durationFrames)) - 1);
+    const qreal boundedLocalTimelineSample =
+        static_cast<qreal>(qMin<int64_t>(localTimelineSample, maxLocalTimelineSample));
+    const qreal localTimelineFramePosition = boundedLocalTimelineSample / static_cast<qreal>(kSamplesPerFrame);
+    const int64_t steppedLocalTimelineFrame =
+        qMax<int64_t>(0, static_cast<int64_t>(std::floor(localTimelineFramePosition)));
+    const qreal sampleOffsetWithinFrame =
+        boundedLocalTimelineSample - static_cast<qreal>(frameToSamples(steppedLocalTimelineFrame));
+    const int64_t adjustedLocalFrame =
+        adjustedClipLocalFrameAtTimelineFrame(clip, steppedLocalTimelineFrame, markers);
+    const qreal sourceSampleOffset =
+        std::floor((static_cast<qreal>(frameToSamples(adjustedLocalFrame)) + sampleOffsetWithinFrame) *
+                   qMax<qreal>(0.001, clip.playbackRate));
+    const int64_t sourceSample =
+        clipSourceInSamples(clip) + static_cast<int64_t>(sourceSampleOffset);
+    const int64_t maxSourceSample =
+        clipSourceInSamples(clip) + qMax<int64_t>(0, frameToSamples(qMax<int64_t>(0, clip.sourceDurationFrames)) - 1);
+    return qMax<int64_t>(0, qMin<int64_t>(sourceSample, maxSourceSample));
+}
+
 MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames) {
     MediaProbeResult result;
     result.durationFrames = fallbackFrames;

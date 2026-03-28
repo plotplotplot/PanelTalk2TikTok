@@ -12,6 +12,7 @@ class QFontComboBox;
 class QTableWidget;
 class QPushButton;
 class QLineEdit;
+class QIcon;
 
 class InspectorPane final : public QWidget
 {
@@ -124,6 +125,7 @@ private:
     QWidget *buildOutputTab();
     QWidget *buildPreviewTab();
     QWidget *buildProfileTab();
+    void configureInspectorTabs();
 
 private:
     QTabWidget *m_inspectorTabs = nullptr;

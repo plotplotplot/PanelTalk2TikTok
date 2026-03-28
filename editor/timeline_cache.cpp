@@ -1,5 +1,6 @@
 #include "timeline_cache.h"
 #include "debug_controls.h"
+#include "media_pipeline_shared.h"
 
 #include <QDebug>
 #include <QDateTime>
@@ -1232,21 +1233,15 @@ void TimelineCache::schedulePredictiveLoads() {
     }
 
     const int step = dir == Direction::Forward ? 1 : -1;
-    for (int i = 1; i <= lookahead && scheduledThisTick < maxPrefetchPerTick; ++i) {
-        int64_t currentTimelineFrame = playhead;
-        for (int advance = 0; advance < i; ++advance) {
-            // Compute next valid frame considering export ranges (speech filter gaps)
-            int64_t nextTimelineFrame = nextValidFrame(currentTimelineFrame, step, exportRanges);
-            if (nextTimelineFrame < 0) {
-                currentTimelineFrame = -1;
-                break;
-            }
-            currentTimelineFrame = nextTimelineFrame;
-        }
-        if (currentTimelineFrame < 0) {
-            break;
-        }
-
+    QVector<editor::SequencePrefetchClip> sequenceClips;
+    sequenceClips.reserve(m_clips.size());
+    for (auto it = m_clips.cbegin(); it != m_clips.cend(); ++it) {
+        sequenceClips.push_back(editor::SequencePrefetchClip{it.value().clip, it.value().decodePath});
+    }
+    const QVector<int64_t> futureTimelineFrames =
+        editor::collectLookaheadTimelineFrames(playhead, lookahead, step, exportRanges);
+    for (int i = 0; i < futureTimelineFrames.size() && scheduledThisTick < maxPrefetchPerTick; ++i) {
+        const int64_t currentTimelineFrame = futureTimelineFrames[i];
         QVector<ClipInfo> activeClips;
         activeClips.reserve(m_clips.size());
         for (auto it = m_clips.cbegin(); it != m_clips.cend(); ++it) {
@@ -1273,13 +1268,96 @@ void TimelineCache::schedulePredictiveLoads() {
                       return aDistance < bDistance;
                   });
 
-        for (const ClipInfo& info : activeClips) {
-            const QString& id = info.clip.id;
-            if (currentTimelineFrame < info.clip.startFrame ||
-                currentTimelineFrame >= info.clip.startFrame + info.clip.durationFrames) {
+        const QVector<editor::SequencePrefetchRequest> requests =
+            editor::collectSequencePrefetchRequestsAtTimelineFrame(sequenceClips,
+                                                                   static_cast<qreal>(currentTimelineFrame),
+                                                                   m_renderSyncMarkers,
+                                                                   false,
+                                                                   qMax(20, 44 - ((i + 1) * 2)));
+        QSet<QString> scheduledSequenceClipIds;
+
+        for (const editor::SequencePrefetchRequest& prefetch : requests) {
+            const QString& id = prefetch.clipId;
+            const int64_t targetFrame = prefetch.sourceFrame;
+            if (m_decoder->pendingRequestCount() >= maxPrefetchQueueDepth ||
+                m_inflightPrefetches.load() >= maxInflightPrefetch) {
+                return;
+            }
+
+            ClipCache* cache = m_caches.value(id);
+            if (cache && cache->contains(targetFrame)) {
                 continue;
             }
 
+            const QString key = requestKey(id, targetFrame);
+            {
+                QMutexLocker pendingLock(&m_pendingMutex);
+                if (m_pendingVisibleRequests.contains(key) || m_pendingPrefetchRequests.contains(key)) {
+                    continue;
+                }
+                m_pendingPrefetchRequests.insert(key);
+                m_inflightPrefetches.fetch_add(1);
+            }
+            scheduledSequenceClipIds.insert(id);
+
+            lock.unlock();
+            m_prefetches++;
+            scheduledThisTick++;
+            QPointer<TimelineCache> self(this);
+            const std::shared_ptr<std::atomic<bool>> aliveToken = m_aliveToken;
+            cacheTrace(QStringLiteral("TimelineCache::prefetch.dispatch"),
+                       QStringLiteral("clip=%1 frame=%2 priority=%3")
+                           .arg(id)
+                           .arg(targetFrame)
+                           .arg(prefetch.priority));
+
+            if (prefetch.decodePath.isEmpty()) {
+                continue;
+            }
+            m_decoder->requestFrame(prefetch.decodePath, targetFrame, prefetch.priority, 5000,
+                DecodeRequestKind::Prefetch,
+                [self, aliveToken, id, targetFrame, key](FrameHandle frame) {
+                    if (!aliveToken->load() || !self) {
+                        return;
+                    }
+                    QMetaObject::invokeMethod(self, [self, aliveToken, id, targetFrame, key, frame]() {
+                        if (!aliveToken->load() || !self) {
+                            return;
+                        }
+                        {
+                            QMutexLocker pendingLock(&self->m_pendingMutex);
+                            self->m_pendingPrefetchRequests.remove(key);
+                            self->m_inflightPrefetches.fetch_sub(1);
+                        }
+                        if (!frame.isNull()) {
+                            ClipCache* cache = self->getOrCreateClipCache(id);
+                            if (cache) {
+                                cache->insert(targetFrame, frame);
+                            }
+                        }
+                        cacheTrace(QStringLiteral("TimelineCache::prefetch.complete"),
+                                   QStringLiteral("clip=%1 frame=%2 null=%3")
+                                       .arg(id)
+                                       .arg(targetFrame)
+                                       .arg(frame.isNull()));
+                    }, Qt::QueuedConnection);
+                });
+            lock.relock();
+            if (scheduledThisTick >= maxPrefetchPerTick) {
+                break;
+            }
+        }
+
+        for (const ClipInfo& info : activeClips) {
+            if (scheduledThisTick >= maxPrefetchPerTick) {
+                break;
+            }
+            if (info.clip.sourceKind == MediaSourceKind::ImageSequence ||
+                scheduledSequenceClipIds.contains(info.clip.id)) {
+                continue;
+            }
+
+            const QString& id = info.clip.id;
             const int64_t targetFrame =
                 sourceFrameForClipAtTimelinePosition(info.clip,
                                                      static_cast<qreal>(currentTimelineFrame),
@@ -1304,10 +1382,7 @@ void TimelineCache::schedulePredictiveLoads() {
                 m_inflightPrefetches.fetch_add(1);
             }
 
-            const bool sequenceClip = info.clip.sourceKind == MediaSourceKind::ImageSequence;
-            const int priority = qMax(sequenceClip ? 20 : 12,
-                                      (sequenceClip ? 44 : 30) - (i * (sequenceClip ? 2 : 1)));
-
+            const int priority = qMax(12, 30 - (i + 1));
             lock.unlock();
             m_prefetches++;
             scheduledThisTick++;
@@ -1351,9 +1426,6 @@ void TimelineCache::schedulePredictiveLoads() {
                     }, Qt::QueuedConnection);
                 });
             lock.relock();
-            if (scheduledThisTick >= maxPrefetchPerTick) {
-                break;
-            }
         }
     }
 }

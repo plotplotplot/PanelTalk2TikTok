@@ -1,4 +1,5 @@
 #include "editor.h"
+#include "keyframe_table_shared.h"
 #include "clip_serialization.h"
 
 #include <QApplication>
@@ -115,6 +116,17 @@ EditorWindow::EditorWindow(quint16 controlPort)
     m_syncTable = m_inspectorPane->syncTable();
     m_syncInspectorClipLabel = m_inspectorPane->syncInspectorClipLabel();
     m_syncInspectorDetailsLabel = m_inspectorPane->syncInspectorDetailsLabel();
+    if (m_syncTable) {
+        connect(m_syncTable, &QTableWidget::itemSelectionChanged,
+                this, &EditorWindow::onSyncTableSelectionChanged);
+        connect(m_syncTable, &QTableWidget::itemChanged,
+                this, &EditorWindow::onSyncTableItemChanged);
+        connect(m_syncTable, &QTableWidget::itemDoubleClicked,
+                this, &EditorWindow::onSyncTableItemDoubleClicked);
+        m_syncTable->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(m_syncTable, &QWidget::customContextMenuRequested,
+                this, &EditorWindow::onSyncTableCustomContextMenu);
+    }
     m_gradingPathLabel = m_inspectorPane->gradingPathLabel();
     m_brightnessSpin = m_inspectorPane->brightnessSpin();
     m_contrastSpin = m_inspectorPane->contrastSpin();
@@ -232,6 +244,7 @@ EditorWindow::EditorWindow(quint16 controlPort)
     initializeDeferredTimelineSeek(&m_transcriptClickSeekTimer, &m_pendingTranscriptClickTimelineFrame);
     initializeDeferredTimelineSeek(&m_keyframeClickSeekTimer, &m_pendingKeyframeClickTimelineFrame);
     initializeDeferredTimelineSeek(&m_gradingClickSeekTimer, &m_pendingGradingClickTimelineFrame);
+    initializeDeferredTimelineSeek(&m_syncClickSeekTimer, &m_pendingSyncClickTimelineFrame);
 
     m_fastCurrentFrame.store(0);
     m_fastPlaybackActive.store(false);
@@ -1036,6 +1049,7 @@ QWidget *EditorWindow::buildEditorPane()
         if (m_audioEngine) {
             m_audioEngine->setTimelineClips(m_timeline->clips());
             m_audioEngine->setExportRanges(effectivePlaybackRanges());
+            m_audioEngine->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
             m_audioEngine->setSpeechFilterFadeSamples(m_speechFilterFadeSamples);
         }
         refreshClipInspector();
@@ -1056,6 +1070,9 @@ QWidget *EditorWindow::buildEditorPane()
     };
     m_timeline->renderSyncMarkersChanged = [this]() {
         m_preview->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
+        if (m_audioEngine) {
+            m_audioEngine->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
+        }
         refreshSyncInspector();
         m_inspectorPane->refresh();
         scheduleSaveState();
@@ -1528,6 +1545,7 @@ void EditorWindow::applyStateJson(const QJsonObject &root)
     if (m_audioEngine) {
         m_audioEngine->setTimelineClips(m_timeline->clips());
         m_audioEngine->setExportRanges(effectivePlaybackRanges());
+        m_audioEngine->setRenderSyncMarkers(m_timeline->renderSyncMarkers());
         m_audioEngine->setSpeechFilterFadeSamples(m_speechFilterFadeSamples);
         m_audioEngine->seek(currentFrame);
     }
@@ -1662,18 +1680,39 @@ void EditorWindow::refreshSyncInspector()
 {
     m_syncInspectorClipLabel->setText(QStringLiteral("Sync"));
     m_updatingSyncInspector = true;
+    const QSet<int64_t> selectedFrames =
+        editor::collectSelectedFrameRoles(m_syncTable);
     m_syncTable->clearContents();
     m_syncTable->setRowCount(0);
-    
-    if (!m_timeline || m_timeline->renderSyncMarkers().isEmpty()) {
-        m_syncInspectorDetailsLabel->setText(QStringLiteral("No render sync markers in the timeline."));
+
+    const TimelineClip* selectedClip = m_timeline ? m_timeline->selectedClip() : nullptr;
+    if (!selectedClip) {
+        m_syncInspectorDetailsLabel->setText(QStringLiteral("Select a clip to inspect its sync markers."));
         m_updatingSyncInspector = false;
         return;
     }
 
-    const QVector<RenderSyncMarker> markers = m_timeline->renderSyncMarkers();
+    m_syncInspectorClipLabel->setText(QStringLiteral("Sync\n%1").arg(selectedClip->label));
+
+    QVector<RenderSyncMarker> markers;
+    if (m_timeline) {
+        const QVector<RenderSyncMarker> allMarkers = m_timeline->renderSyncMarkers();
+        markers.reserve(allMarkers.size());
+        for (const RenderSyncMarker& marker : allMarkers) {
+            if (marker.clipId == selectedClip->id) {
+                markers.push_back(marker);
+            }
+        }
+    }
+
+    if (markers.isEmpty()) {
+        m_syncInspectorDetailsLabel->setText(QStringLiteral("No render sync markers for the selected clip."));
+        m_updatingSyncInspector = false;
+        return;
+    }
+
     m_syncInspectorDetailsLabel->setText(
-        QStringLiteral("%1 sync markers across the timeline. Edit Frame, Count, or Action directly.")
+        QStringLiteral("%1 sync markers for the selected clip. Edit Frame, Count, or Action directly.")
             .arg(markers.size()));
     m_syncTable->setRowCount(markers.size());
     
@@ -1685,8 +1724,6 @@ void EditorWindow::refreshSyncInspector()
         const QString clipLabel = clipLabelForId(marker.clipId);
         
         auto *clipItem = new QTableWidgetItem(QString());
-        clipItem->setData(Qt::UserRole, marker.clipId);
-        clipItem->setData(Qt::UserRole + 1, QVariant::fromValue(static_cast<qint64>(marker.frame)));
         clipItem->setFlags(clipItem->flags() & ~Qt::ItemIsEditable);
         clipItem->setToolTip(clipLabel);
         
@@ -1694,8 +1731,10 @@ void EditorWindow::refreshSyncInspector()
         auto *countItem = new QTableWidgetItem(QString::number(marker.count));
         auto *actionItem = new QTableWidgetItem(
             marker.action == RenderSyncAction::DuplicateFrame ? QStringLiteral("Duplicate") : QStringLiteral("Skip"));
-        
+
         for (QTableWidgetItem *item : {clipItem, frameItem, countItem, actionItem}) {
+            item->setData(Qt::UserRole, QVariant::fromValue(static_cast<qint64>(marker.frame)));
+            item->setData(Qt::UserRole + 1, marker.clipId);
             item->setBackground(rowBackground);
             item->setForeground(rowForeground);
         }
@@ -1705,7 +1744,178 @@ void EditorWindow::refreshSyncInspector()
         m_syncTable->setItem(i, 2, countItem);
         m_syncTable->setItem(i, 3, actionItem);
     }
+    editor::restoreSelectionByFrameRole(m_syncTable, selectedFrames);
     m_updatingSyncInspector = false;
+}
+
+void EditorWindow::onSyncTableSelectionChanged()
+{
+    if (m_updatingSyncInspector || !m_syncTable) {
+        return;
+    }
+    const int64_t primaryFrame = editor::primarySelectedFrameRole(m_syncTable);
+    if (primaryFrame < 0) {
+        return;
+    }
+    scheduleDeferredTimelineSeek(&m_syncClickSeekTimer,
+                                 &m_pendingSyncClickTimelineFrame,
+                                 primaryFrame);
+}
+
+void EditorWindow::onSyncTableItemChanged(QTableWidgetItem* item)
+{
+    if (m_updatingSyncInspector || !item || !m_timeline || !m_syncTable) {
+        return;
+    }
+
+    const int row = item->row();
+    if (row < 0 || row >= m_syncTable->rowCount()) {
+        return;
+    }
+
+    auto tableText = [this, row](int column) -> QString {
+        QTableWidgetItem* tableItem = m_syncTable->item(row, column);
+        return tableItem ? tableItem->text().trimmed() : QString();
+    };
+
+    const QString clipId = m_syncTable->item(row, 0)
+                               ? m_syncTable->item(row, 0)->data(Qt::UserRole + 1).toString()
+                               : QString();
+    const int64_t originalFrame = m_syncTable->item(row, 0)
+                                      ? m_syncTable->item(row, 0)->data(Qt::UserRole).toLongLong()
+                                      : -1;
+    if (clipId.isEmpty() || originalFrame < 0) {
+        refreshSyncInspector();
+        return;
+    }
+
+    bool ok = false;
+    RenderSyncMarker edited;
+    edited.clipId = clipId;
+    edited.frame = tableText(1).toLongLong(&ok);
+    if (!ok) { refreshSyncInspector(); return; }
+    edited.count = tableText(2).toInt(&ok);
+    if (!ok) { refreshSyncInspector(); return; }
+    edited.count = qMax(1, edited.count);
+    if (!parseSyncActionText(tableText(3), &edited.action)) {
+        refreshSyncInspector();
+        return;
+    }
+
+    QVector<RenderSyncMarker> markers = m_timeline->renderSyncMarkers();
+    bool replaced = false;
+    for (RenderSyncMarker& marker : markers) {
+        if (marker.clipId == clipId && marker.frame == originalFrame) {
+            marker = edited;
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced) {
+        refreshSyncInspector();
+        return;
+    }
+
+    std::sort(markers.begin(), markers.end(), [](const RenderSyncMarker& a, const RenderSyncMarker& b) {
+        if (a.frame == b.frame) {
+            return a.clipId < b.clipId;
+        }
+        return a.frame < b.frame;
+    });
+    m_timeline->setRenderSyncMarkers(markers);
+    refreshSyncInspector();
+    scheduleSaveState();
+}
+
+void EditorWindow::onSyncTableItemDoubleClicked(QTableWidgetItem* item)
+{
+    Q_UNUSED(item);
+    cancelDeferredTimelineSeek(&m_syncClickSeekTimer, &m_pendingSyncClickTimelineFrame);
+}
+
+void EditorWindow::onSyncTableCustomContextMenu(const QPoint& pos)
+{
+    if (!m_syncTable || !m_timeline) {
+        return;
+    }
+
+    int row = -1;
+    QTableWidgetItem* item = editor::ensureContextRowSelected(m_syncTable, pos, &row);
+    if (!item) {
+        return;
+    }
+
+    const QString clipId = item->data(Qt::UserRole + 1).toString();
+    const int64_t frame = item->data(Qt::UserRole).toLongLong();
+    if (clipId.isEmpty() || frame < 0) {
+        return;
+    }
+
+    QMenu menu;
+    QAction* copyToCurrentPlayheadAction = menu.addAction(QStringLiteral("Copy to Current Playhead"));
+    copyToCurrentPlayheadAction->setEnabled(frame != m_timeline->currentFrame());
+    QAction* deleteAction = menu.addAction(QStringLiteral("Delete"));
+    QAction* chosen = menu.exec(m_syncTable->viewport()->mapToGlobal(pos));
+    if (!chosen) {
+        return;
+    }
+
+    if (chosen == deleteAction) {
+        QVector<RenderSyncMarker> markers = m_timeline->renderSyncMarkers();
+        const auto newEnd = std::remove_if(markers.begin(),
+                                           markers.end(),
+                                           [&](const RenderSyncMarker& marker) {
+                                               return marker.clipId == clipId && marker.frame == frame;
+                                           });
+        if (newEnd == markers.end()) {
+            return;
+        }
+        markers.erase(newEnd, markers.end());
+        m_timeline->setRenderSyncMarkers(markers);
+        refreshSyncInspector();
+        scheduleSaveState();
+        return;
+    }
+
+    if (chosen != copyToCurrentPlayheadAction || !copyToCurrentPlayheadAction->isEnabled()) {
+        return;
+    }
+
+    QVector<RenderSyncMarker> markers = m_timeline->renderSyncMarkers();
+    RenderSyncMarker sourceMarker;
+    bool foundSource = false;
+    for (const RenderSyncMarker& marker : markers) {
+        if (marker.clipId == clipId && marker.frame == frame) {
+            sourceMarker = marker;
+            foundSource = true;
+            break;
+        }
+    }
+    if (!foundSource) {
+        return;
+    }
+
+    sourceMarker.frame = m_timeline->currentFrame();
+    bool replaced = false;
+    for (RenderSyncMarker& marker : markers) {
+        if (marker.clipId == sourceMarker.clipId && marker.frame == sourceMarker.frame) {
+            marker = sourceMarker;
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced) {
+        markers.push_back(sourceMarker);
+    }
+    std::sort(markers.begin(), markers.end(), [](const RenderSyncMarker& a, const RenderSyncMarker& b) {
+        if (a.frame == b.frame) {
+            return a.clipId < b.clipId;
+        }
+        return a.frame < b.frame;
+    });
+    m_timeline->setRenderSyncMarkers(markers);
+    refreshSyncInspector();
+    scheduleSaveState();
 }
 
 void EditorWindow::refreshClipInspector()

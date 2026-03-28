@@ -2,6 +2,8 @@
 
 #include "async_decoder.h"
 #include "debug_controls.h"
+#include "gl_frame_texture_shared.h"
+#include "media_pipeline_shared.h"
 #include "render_cpu_fallback.h"
 
 #include <QDir>
@@ -18,9 +20,7 @@
 #include <QOpenGLContext>
 #include <QOpenGLFramebufferObject>
 #include <QOpenGLFunctions>
-#include <QOpenGLPixelTransferOptions>
 #include <QOpenGLShaderProgram>
-#include <QOpenGLTexture>
 #include <QPainter>
 #include <QTextDocument>
 #include <QSurfaceFormat>
@@ -143,7 +143,8 @@ void accumulateClipStageStats(QHash<QString, RenderClipStageStats>* clipStageSta
 }
 
 QJsonObject buildRenderStageTable(const QHash<QString, RenderClipStageStats>& clipStageStats,
-                                  qint64 totalRenderStageMs) {
+                                  qint64 totalRenderStageMs,
+                                  int64_t completedFrames) {
     QJsonArray columns{
         QStringLiteral("clip"),
         QStringLiteral("frames"),
@@ -187,6 +188,32 @@ QJsonObject buildRenderStageTable(const QHash<QString, RenderClipStageStats>& cl
             {QStringLiteral("composite_ms_per_frame"), static_cast<double>(stats.compositeMs) / frames},
             {QStringLiteral("stage_ms"), stageMs},
             {QStringLiteral("stage_ms_per_frame"), static_cast<double>(stageMs) / frames},
+            {QStringLiteral("stage_share_pct"), sharePct}
+        });
+    }
+
+    qint64 attributedStageMs = 0;
+    for (const RenderClipStageStats& stats : rows) {
+        attributedStageMs += stats.decodeMs + stats.textureMs + stats.compositeMs;
+    }
+    const qint64 overheadMs = qMax<qint64>(0, totalRenderStageMs - attributedStageMs);
+    if (overheadMs > 0) {
+        const double frames = static_cast<double>(qMax<int64_t>(1, completedFrames));
+        const double sharePct = totalRenderStageMs > 0
+            ? (100.0 * static_cast<double>(overheadMs) / static_cast<double>(totalRenderStageMs))
+            : 0.0;
+        jsonRows.push_back(QJsonObject{
+            {QStringLiteral("id"), QStringLiteral("__frame_overhead__")},
+            {QStringLiteral("clip"), QStringLiteral("__frame_overhead__")},
+            {QStringLiteral("frames"), static_cast<qint64>(completedFrames)},
+            {QStringLiteral("decode_ms"), static_cast<qint64>(0)},
+            {QStringLiteral("decode_ms_per_frame"), 0.0},
+            {QStringLiteral("texture_ms"), static_cast<qint64>(0)},
+            {QStringLiteral("texture_ms_per_frame"), 0.0},
+            {QStringLiteral("composite_ms"), overheadMs},
+            {QStringLiteral("composite_ms_per_frame"), static_cast<double>(overheadMs) / frames},
+            {QStringLiteral("stage_ms"), overheadMs},
+            {QStringLiteral("stage_ms_per_frame"), static_cast<double>(overheadMs) / frames},
             {QStringLiteral("stage_share_pct"), sharePct}
         });
     }
@@ -256,31 +283,79 @@ void enqueueRenderSequenceLookahead(const RenderRequest& request,
 
     const int lookaheadFrames = qMax(editor::debugLeadPrefetchCount(),
                                      editor::debugPlaybackWindowAhead());
-    for (int offset = 1; offset <= lookaheadFrames; ++offset) {
-        const int64_t futureTimelineFrame = timelineFrame + offset;
+    QVector<editor::SequencePrefetchClip> sequenceClips;
+    sequenceClips.reserve(orderedClips.size());
+    for (const TimelineClip& clip : orderedClips) {
+        sequenceClips.push_back(editor::SequencePrefetchClip{clip, clip.filePath});
+    }
+    const QVector<int64_t> futureTimelineFrames =
+        editor::collectLookaheadTimelineFrames(timelineFrame,
+                                               lookaheadFrames,
+                                               1,
+                                               {});
+    for (int offset = 0; offset < futureTimelineFrames.size(); ++offset) {
+        const int64_t futureTimelineFrame = futureTimelineFrames[offset];
         const int priority = qMax(8, 128 - (offset * 4));
-        for (const TimelineClip& clip : orderedClips) {
-            if (!isImageSequencePath(clip.filePath)) {
-                continue;
-            }
-            if (futureTimelineFrame < clip.startFrame ||
-                futureTimelineFrame >= clip.startFrame + clip.durationFrames) {
-                continue;
-            }
-            if (evaluateClipGradingAtPosition(clip, static_cast<qreal>(futureTimelineFrame)).opacity <= 0.0001) {
-                continue;
-            }
-            const int64_t sourceFrame =
-                sourceFrameForClipAtTimelinePosition(clip,
-                                                     static_cast<qreal>(futureTimelineFrame),
-                                                     request.renderSyncMarkers);
-            const RenderAsyncFrameKey key{clip.filePath, sourceFrame};
+        const QVector<editor::SequencePrefetchRequest> requests =
+            editor::collectSequencePrefetchRequestsAtTimelineFrame(sequenceClips,
+                                                                   static_cast<qreal>(futureTimelineFrame),
+                                                                   request.renderSyncMarkers,
+                                                                   false,
+                                                                   priority);
+        for (const editor::SequencePrefetchRequest& prefetch : requests) {
+            const RenderAsyncFrameKey key{prefetch.decodePath, prefetch.sourceFrame};
             if (asyncFrameCache.contains(key)) {
                 continue;
             }
-            asyncDecoder->requestFrame(clip.filePath,
-                                       sourceFrame,
-                                       priority,
+            asyncDecoder->requestFrame(prefetch.decodePath,
+                                       prefetch.sourceFrame,
+                                       prefetch.priority,
+                                       30000,
+                                       editor::DecodeRequestKind::Prefetch,
+                                       {});
+        }
+    }
+}
+
+void prewarmRenderSequenceSegment(const RenderRequest& request,
+                                  int64_t segmentStartFrame,
+                                  int64_t segmentEndFrame,
+                                  const QVector<TimelineClip>& orderedClips,
+                                  editor::AsyncDecoder* asyncDecoder,
+                                  const QHash<RenderAsyncFrameKey, editor::FrameHandle>& asyncFrameCache) {
+    if (!asyncDecoder || !editor::debugLeadPrefetchEnabled()) {
+        return;
+    }
+
+    const int prewarmFrames = qMax(editor::debugPlaybackWindowAhead() * 2,
+                                   editor::debugLeadPrefetchCount() * 4);
+    const int lookaheadFrames = static_cast<int>(qMin<int64_t>(segmentEndFrame - segmentStartFrame + 1,
+                                                               qMax<int64_t>(1, prewarmFrames)));
+    QVector<editor::SequencePrefetchClip> sequenceClips;
+    sequenceClips.reserve(orderedClips.size());
+    for (const TimelineClip& clip : orderedClips) {
+        sequenceClips.push_back(editor::SequencePrefetchClip{clip, clip.filePath});
+    }
+    const QVector<int64_t> prewarmTimelineFrames =
+        editor::collectLookaheadTimelineFrames(segmentStartFrame - 1,
+                                               lookaheadFrames,
+                                               1,
+                                               {});
+    for (int64_t prewarmTimelineFrame : prewarmTimelineFrames) {
+        const QVector<editor::SequencePrefetchRequest> requests =
+            editor::collectSequencePrefetchRequestsAtTimelineFrame(sequenceClips,
+                                                                   static_cast<qreal>(prewarmTimelineFrame),
+                                                                   request.renderSyncMarkers,
+                                                                   false,
+                                                                   192);
+        for (const editor::SequencePrefetchRequest& prefetch : requests) {
+            const RenderAsyncFrameKey key{prefetch.decodePath, prefetch.sourceFrame};
+            if (asyncFrameCache.contains(key)) {
+                continue;
+            }
+            asyncDecoder->requestFrame(prefetch.decodePath,
+                                       prefetch.sourceFrame,
+                                       prefetch.priority,
                                        30000,
                                        editor::DecodeRequestKind::Prefetch,
                                        {});
@@ -356,116 +431,6 @@ editor::FrameHandle decodeRenderFrame(const QString& path,
         it = decoders.insert(path, ctx);
     }
     return it.value()->decodeFrame(frameNumber);
-}
-
-bool frameUsesCudaZeroCopyCandidate(const editor::FrameHandle& frame) {
-    return frame.hasHardwareFrame() && frame.hardwareSwPixelFormat() == AV_PIX_FMT_NV12;
-}
-
-bool uploadCudaNv12FrameToTextures(const editor::FrameHandle& frame, GLuint textureId, GLuint uvTextureId) {
-    if (!textureId || !uvTextureId || !frameUsesCudaZeroCopyCandidate(frame)) {
-        return false;
-    }
-
-    const AVFrame* hwFrame = frame.hardwareFrame();
-    if (!hwFrame || !hwFrame->hw_frames_ctx) {
-        return false;
-    }
-
-    auto* framesContext = reinterpret_cast<AVHWFramesContext*>(hwFrame->hw_frames_ctx->data);
-    if (!framesContext || !framesContext->device_ctx) {
-        return false;
-    }
-    auto* deviceContext = framesContext->device_ctx;
-    if (!deviceContext || deviceContext->type != AV_HWDEVICE_TYPE_CUDA) {
-        return false;
-    }
-    auto* cudaDeviceContext = reinterpret_cast<AVCUDADeviceContext*>(deviceContext->hwctx);
-    if (!cudaDeviceContext) {
-        return false;
-    }
-
-    if (cuCtxPushCurrent(cudaDeviceContext->cuda_ctx) != CUDA_SUCCESS) {
-        return false;
-    }
-
-    auto restoreContext = []() {
-        CUcontext popped = nullptr;
-        cuCtxPopCurrent(&popped);
-    };
-
-    const int width = hwFrame->width;
-    const int height = hwFrame->height;
-    if (width <= 0 || height <= 0) {
-        restoreContext();
-        return false;
-    }
-
-    CUgraphicsResource yResource = nullptr;
-    CUgraphicsResource uvResource = nullptr;
-    CUresult result = cuGraphicsGLRegisterImage(&yResource, textureId, GL_TEXTURE_2D,
-                                                CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD);
-    if (result != CUDA_SUCCESS) {
-        restoreContext();
-        return false;
-    }
-    result = cuGraphicsGLRegisterImage(&uvResource, uvTextureId, GL_TEXTURE_2D,
-                                       CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD);
-    if (result != CUDA_SUCCESS) {
-        cuGraphicsUnregisterResource(yResource);
-        restoreContext();
-        return false;
-    }
-
-    CUgraphicsResource resources[2] = {yResource, uvResource};
-    result = cuGraphicsMapResources(2, resources, cudaDeviceContext->stream);
-    if (result != CUDA_SUCCESS) {
-        cuGraphicsUnregisterResource(uvResource);
-        cuGraphicsUnregisterResource(yResource);
-        restoreContext();
-        return false;
-    }
-
-    CUarray yArray = nullptr;
-    CUarray uvArray = nullptr;
-    result = cuGraphicsSubResourceGetMappedArray(&yArray, yResource, 0, 0);
-    if (result == CUDA_SUCCESS) {
-        result = cuGraphicsSubResourceGetMappedArray(&uvArray, uvResource, 0, 0);
-    }
-
-    if (result == CUDA_SUCCESS) {
-        CUDA_MEMCPY2D copy = {};
-        copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-        copy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
-        copy.srcDevice = reinterpret_cast<CUdeviceptr>(hwFrame->data[0]);
-        copy.srcPitch = static_cast<size_t>(hwFrame->linesize[0]);
-        copy.dstArray = yArray;
-        copy.WidthInBytes = static_cast<size_t>(width);
-        copy.Height = static_cast<size_t>(height);
-        result = cuMemcpy2DAsync(&copy, cudaDeviceContext->stream);
-
-        if (result == CUDA_SUCCESS) {
-            CUDA_MEMCPY2D uvCopy = {};
-            uvCopy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-            uvCopy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
-            uvCopy.srcDevice = reinterpret_cast<CUdeviceptr>(hwFrame->data[1]);
-            uvCopy.srcPitch = static_cast<size_t>(hwFrame->linesize[1]);
-            uvCopy.dstArray = uvArray;
-            uvCopy.WidthInBytes = static_cast<size_t>(width);
-            uvCopy.Height = static_cast<size_t>(height / 2);
-            result = cuMemcpy2DAsync(&uvCopy, cudaDeviceContext->stream);
-        }
-    }
-
-    if (result == CUDA_SUCCESS) {
-        result = cuStreamSynchronize(cudaDeviceContext->stream);
-    }
-
-    cuGraphicsUnmapResources(2, resources, cudaDeviceContext->stream);
-    cuGraphicsUnregisterResource(uvResource);
-    cuGraphicsUnregisterResource(yResource);
-    restoreContext();
-    return result == CUDA_SUCCESS;
 }
 
 QString avErrToString(int errnum) {
@@ -741,6 +706,7 @@ struct DecodedAudioClip {
 
 struct AudioExportState {
     QVector<TimelineClip> clips;
+    QVector<RenderSyncMarker> renderSyncMarkers;
     QHash<QString, DecodedAudioClip> cache;
     AVStream* stream = nullptr;
     AVCodecContext* codecCtx = nullptr;
@@ -884,6 +850,7 @@ DecodedAudioClip decodeClipAudio(const QString& path) {
 }
 
 void mixAudioChunk(const QVector<TimelineClip>& clips,
+                   const QVector<RenderSyncMarker>& renderSyncMarkers,
                    const QHash<QString, DecodedAudioClip>& audioCache,
                    float* output,
                    int frames,
@@ -916,9 +883,13 @@ void mixAudioChunk(const QVector<TimelineClip>& clips,
         const int64_t mixEnd = qMin<int64_t>(chunkEndSample, clipEndSample);
         for (int64_t samplePos = mixStart; samplePos < mixEnd; ++samplePos) {
             const int outFrame = static_cast<int>(samplePos - chunkStartSample);
-            const int inFrame = static_cast<int>(sourceInSample + (samplePos - clipStartSample));
+            const int64_t inFrame =
+                sourceSampleForClipAtTimelineSample(clip, samplePos, renderSyncMarkers);
+            if (inFrame < 0 || inFrame >= (audio.samples.size() / kRenderAudioChannels)) {
+                continue;
+            }
             const int outIndex = outFrame * kRenderAudioChannels;
-            const int inIndex = inFrame * kRenderAudioChannels;
+            const int inIndex = static_cast<int>(inFrame * kRenderAudioChannels);
             output[outIndex] = qBound(-1.0f, output[outIndex] + audio.samples[inIndex], 1.0f);
             output[outIndex + 1] = qBound(-1.0f, output[outIndex + 1] + audio.samples[inIndex + 1], 1.0f);
         }
@@ -1028,6 +999,7 @@ bool initializeExportAudio(const RenderRequest& request,
     state->stream->time_base = state->codecCtx->time_base;
     state->clips = audioClips;
     state->cache = audioCache;
+    state->renderSyncMarkers = request.renderSyncMarkers;
     state->enabled = true;
     return true;
 }
@@ -1134,7 +1106,12 @@ bool encodeExportAudio(const QVector<ExportRangeSegment>& exportRanges,
             const int framesThisChunk =
                 static_cast<int>(qMin<int64_t>(mixChunkFrames, segmentTotalSamples - producedSamples));
             const int64_t chunkStartSample = frameToSamples(exportStart) + producedSamples;
-            mixAudioChunk(state.clips, state.cache, mixBuffer.data(), framesThisChunk, chunkStartSample);
+            mixAudioChunk(state.clips,
+                          state.renderSyncMarkers,
+                          state.cache,
+                          mixBuffer.data(),
+                          framesThisChunk,
+                          chunkStartSample);
 
             const int estimatedOutSamples = swr_get_out_samples(swr, framesThisChunk);
             uint8_t** convertedData = nullptr;
@@ -1529,12 +1506,12 @@ public:
 
             QElapsedTimer textureTimer;
             textureTimer.start();
-            TextureCacheEntry* textureEntry = textureForFrame(frame);
+            editor::GlTextureCacheEntry* textureEntry = textureForFrame(frame);
             const qint64 textureElapsed = textureTimer.elapsed();
             if (textureMs) {
                 *textureMs += textureElapsed;
             }
-            if (!textureEntry || !textureEntry->texture) {
+            if (!textureEntry || textureEntry->textureId == 0) {
                 recordRenderSkip(skippedClips, skippedReasonCounts, clip, QStringLiteral("texture_upload_failed"), timelineFrame, localFrame);
                 continue;
             }
@@ -1568,10 +1545,10 @@ public:
             m_shaderProgram->setUniformValue("u_texture_mode", textureEntry->usesYuvTextures ? 1.0f : 0.0f);
 
             glActiveTexture(GL_TEXTURE0);
-            textureEntry->texture->bind();
+            glBindTexture(GL_TEXTURE_2D, textureEntry->textureId);
             glActiveTexture(GL_TEXTURE1);
-            if (textureEntry->usesYuvTextures && textureEntry->auxTexture) {
-                textureEntry->auxTexture->bind();
+            if (textureEntry->usesYuvTextures && textureEntry->auxTextureId != 0) {
+                glBindTexture(GL_TEXTURE_2D, textureEntry->auxTextureId);
             } else {
                 glBindTexture(GL_TEXTURE_2D, 0);
             }
@@ -1587,13 +1564,9 @@ public:
             m_shaderProgram->disableAttributeArray(texCoordLoc);
             m_quadBuffer.release();
             glActiveTexture(GL_TEXTURE1);
-            if (textureEntry->usesYuvTextures && textureEntry->auxTexture) {
-                textureEntry->auxTexture->release();
-            } else {
-                glBindTexture(GL_TEXTURE_2D, 0);
-            }
+            glBindTexture(GL_TEXTURE_2D, 0);
             glActiveTexture(GL_TEXTURE0);
-            textureEntry->texture->release();
+            glBindTexture(GL_TEXTURE_2D, 0);
             const qint64 compositeElapsed = compositeTimer.elapsed();
             if (compositeMs) {
                 *compositeMs += compositeElapsed;
@@ -1712,27 +1685,19 @@ public:
     }
 
 private:
-    struct TextureCacheEntry {
-        QOpenGLTexture* texture = nullptr;
-        QOpenGLTexture* auxTexture = nullptr;
-        qint64 decodeTimestamp = 0;
-        qint64 lastUsedMs = 0;
-        QSize size;
-        bool usesYuvTextures = false;
-    };
-
     void releaseResources() {
         if (!m_context || !m_surface) {
             return;
         }
         if (m_context->makeCurrent(m_surface.get())) {
             for (auto it = m_textureCache.begin(); it != m_textureCache.end(); ++it) {
-                delete it->texture;
-                it->texture = nullptr;
-                delete it->auxTexture;
-                it->auxTexture = nullptr;
+                editor::destroyGlTextureEntry(&it.value());
             }
             m_textureCache.clear();
+            for (auto it = m_reusableTextureCache.begin(); it != m_reusableTextureCache.end(); ++it) {
+                editor::destroyGlTextureEntry(&it.value());
+            }
+            m_reusableTextureCache.clear();
             m_fbo.reset();
             m_nv12YFbo.reset();
             m_nv12UvFbo.reset();
@@ -1746,102 +1711,45 @@ private:
         }
     }
 
-    QString textureCacheKey(const editor::FrameHandle& frame) const {
-        return QStringLiteral("%1|%2").arg(frame.sourcePath()).arg(frame.frameNumber());
-    }
+    editor::GlTextureCacheEntry* textureForFrame(const editor::FrameHandle& frame) {
+        if (editor::shouldUseReusableTextureCache(frame)) {
+            const QString reusableKey = editor::reusableTextureCacheKey(frame);
+            editor::GlTextureCacheEntry& reusableEntry = m_reusableTextureCache[reusableKey];
+            if (!editor::uploadFrameToGlTextureEntry(frame, &reusableEntry)) {
+                editor::destroyGlTextureEntry(&reusableEntry);
+                return nullptr;
+            }
+            return &reusableEntry;
+        }
 
-    TextureCacheEntry* textureForFrame(const editor::FrameHandle& frame) {
-        const QString key = textureCacheKey(frame);
+        const QString key = editor::textureCacheKey(frame);
         const qint64 decodeTimestamp = frame.data() ? frame.data()->decodeTimestamp : 0;
         auto it = m_textureCache.find(key);
-        if (it != m_textureCache.end() && it->decodeTimestamp == decodeTimestamp && it->texture) {
+        if (it != m_textureCache.end() &&
+            it->textureId != 0 &&
+            it->decodeTimestamp == decodeTimestamp) {
             it->lastUsedMs = QDateTime::currentMSecsSinceEpoch();
             return &it.value();
         }
-        if (it != m_textureCache.end() && it->texture) {
-            delete it->texture;
-            it->texture = nullptr;
-        }
-        if (it != m_textureCache.end() && it->auxTexture) {
-            delete it->auxTexture;
-            it->auxTexture = nullptr;
-        }
-
-        TextureCacheEntry entry;
-        if (frameUsesCudaZeroCopyCandidate(frame)) {
-            const QSize frameSize = frame.size();
-            const int width = frameSize.width();
-            const int height = frameSize.height();
-            const int uvWidth = qMax(1, width / 2);
-            const int uvHeight = qMax(1, height / 2);
-            entry.texture = new QOpenGLTexture(QOpenGLTexture::Target2D);
-            entry.texture->setFormat(QOpenGLTexture::R8_UNorm);
-            entry.texture->setSize(width, height);
-            entry.texture->allocateStorage(QOpenGLTexture::Red, QOpenGLTexture::UInt8);
-            entry.texture->setMinMagFilters(QOpenGLTexture::Linear, QOpenGLTexture::Linear);
-            entry.texture->setWrapMode(QOpenGLTexture::ClampToEdge);
-            entry.auxTexture = new QOpenGLTexture(QOpenGLTexture::Target2D);
-            entry.auxTexture->setFormat(QOpenGLTexture::RG8_UNorm);
-            entry.auxTexture->setSize(uvWidth, uvHeight);
-            entry.auxTexture->allocateStorage(QOpenGLTexture::RG, QOpenGLTexture::UInt8);
-            entry.auxTexture->setMinMagFilters(QOpenGLTexture::Linear, QOpenGLTexture::Linear);
-            entry.auxTexture->setWrapMode(QOpenGLTexture::ClampToEdge);
-            if (!entry.texture->isCreated() || !entry.auxTexture->isCreated() ||
-                !uploadCudaNv12FrameToTextures(frame, entry.texture->textureId(), entry.auxTexture->textureId())) {
-                delete entry.texture;
-                delete entry.auxTexture;
-                return nullptr;
-            }
-            entry.usesYuvTextures = true;
-            entry.size = frameSize;
-        } else {
-            if (!frame.hasCpuImage()) {
-                return nullptr;
-            }
-            QImage uploadImage = frame.cpuImage();
-            if (uploadImage.format() != QImage::Format_ARGB32_Premultiplied) {
-                uploadImage = uploadImage.convertToFormat(QImage::Format_ARGB32_Premultiplied);
-            }
-
-            entry.texture = new QOpenGLTexture(QOpenGLTexture::Target2D);
-            entry.texture->setFormat(QOpenGLTexture::RGBA8_UNorm);
-            entry.texture->setSize(uploadImage.width(), uploadImage.height());
-            entry.texture->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt8);
-            QOpenGLPixelTransferOptions uploadOptions;
-            uploadOptions.setAlignment(4);
-            entry.texture->setData(QOpenGLTexture::BGRA,
-                                   QOpenGLTexture::UInt8,
-                                   uploadImage.constBits(),
-                                   &uploadOptions);
-            if (!entry.texture->isCreated()) {
-                delete entry.texture;
-                return nullptr;
-            }
-            entry.texture->setMinMagFilters(QOpenGLTexture::Linear, QOpenGLTexture::Linear);
-            entry.texture->setWrapMode(QOpenGLTexture::ClampToEdge);
-            entry.size = uploadImage.size();
+        editor::GlTextureCacheEntry entry = it != m_textureCache.end()
+                                                ? it.value()
+                                                : editor::GlTextureCacheEntry{};
+        editor::destroyGlTextureEntry(&entry);
+        if (!editor::uploadFrameToGlTextureEntry(frame, &entry)) {
+            editor::destroyGlTextureEntry(&entry);
+            return nullptr;
         }
         entry.decodeTimestamp = decodeTimestamp;
-        entry.lastUsedMs = QDateTime::currentMSecsSinceEpoch();
         m_textureCache.insert(key, entry);
         return &m_textureCache[key];
     }
 
     void trimTextureCache() {
         static constexpr int kMaxTextureCacheEntries = 180;
-        if (m_textureCache.size() <= kMaxTextureCacheEntries) {
-            return;
-        }
-        QVector<QString> keys = m_textureCache.keys().toVector();
-        std::sort(keys.begin(), keys.end(), [this](const QString& a, const QString& b) {
-            return m_textureCache[a].lastUsedMs < m_textureCache[b].lastUsedMs;
-        });
-        const int removeCount = m_textureCache.size() - kMaxTextureCacheEntries;
-        for (int i = 0; i < removeCount; ++i) {
-            TextureCacheEntry entry = m_textureCache.take(keys[i]);
-            delete entry.texture;
-            delete entry.auxTexture;
-        }
+        editor::trimGlTextureCache(&m_textureCache, kMaxTextureCacheEntries);
+
+        static constexpr int kMaxReusableTextureCacheEntries = 32;
+        editor::trimGlTextureCache(&m_reusableTextureCache, kMaxReusableTextureCacheEntries);
     }
 
     QSize m_outputSize;
@@ -1854,7 +1762,8 @@ private:
     std::unique_ptr<QOpenGLShaderProgram> m_nv12YShaderProgram;
     std::unique_ptr<QOpenGLShaderProgram> m_nv12UvShaderProgram;
     QOpenGLBuffer m_quadBuffer;
-    QHash<QString, TextureCacheEntry> m_textureCache;
+    QHash<QString, editor::GlTextureCacheEntry> m_textureCache;
+    QHash<QString, editor::GlTextureCacheEntry> m_reusableTextureCache;
 };
 
 QImage renderTimelineFrame(const RenderRequest& request,
@@ -2285,6 +2194,12 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
         const ExportRangeSegment& range = exportRanges[segmentIndex];
         const int64_t exportStart = qMax<int64_t>(0, range.startFrame);
         const int64_t exportEnd = qMax(exportStart, range.endFrame);
+        prewarmRenderSequenceSegment(request,
+                                     exportStart,
+                                     exportEnd,
+                                     orderedClips,
+                                     &asyncDecoder,
+                                     asyncFrameCache);
         for (int64_t timelineFrame = exportStart; timelineFrame <= exportEnd; ++timelineFrame) {
             enqueueRenderSequenceLookahead(request,
                                           timelineFrame,
@@ -2326,7 +2241,7 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
                 progress.maxFrameConvertStageMs = maxFrameConvertStageMs;
                 progress.skippedClips = lastSkippedClips;
                 progress.skippedClipReasonCounts = skippedReasonCounts;
-                progress.renderStageTable = buildRenderStageTable(clipStageStats, totalRenderStageMs);
+                progress.renderStageTable = buildRenderStageTable(clipStageStats, totalRenderStageMs, framesCompleted);
                 progress.worstFrameTable = buildWorstFrameTable(worstFrames);
                 if (!progressCallback(progress)) {
                     result.cancelled = true;
@@ -2417,7 +2332,7 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
                 progress.maxFrameConvertStageMs = maxFrameConvertStageMs;
                 progress.skippedClips = lastSkippedClips;
                 progress.skippedClipReasonCounts = skippedReasonCounts;
-                progress.renderStageTable = buildRenderStageTable(clipStageStats, totalRenderStageMs);
+                progress.renderStageTable = buildRenderStageTable(clipStageStats, totalRenderStageMs, framesCompleted);
                 progress.worstFrameTable = buildWorstFrameTable(worstFrames);
                 progress.previewFrame = rendered;
                 if (!progressCallback(progress)) {
@@ -2547,7 +2462,7 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
         result.maxFrameConvertStageMs = maxFrameConvertStageMs;
         result.skippedClips = lastSkippedClips;
         result.skippedClipReasonCounts = skippedReasonCounts;
-        result.renderStageTable = buildRenderStageTable(clipStageStats, totalRenderStageMs);
+        result.renderStageTable = buildRenderStageTable(clipStageStats, totalRenderStageMs, framesCompleted);
         result.worstFrameTable = buildWorstFrameTable(worstFrames);
         return result;
     }
@@ -2572,7 +2487,7 @@ RenderResult renderTimelineToFile(const RenderRequest& request,
     result.maxFrameConvertStageMs = maxFrameConvertStageMs;
     result.skippedClips = lastSkippedClips;
     result.skippedClipReasonCounts = skippedReasonCounts;
-    result.renderStageTable = buildRenderStageTable(clipStageStats, totalRenderStageMs);
+    result.renderStageTable = buildRenderStageTable(clipStageStats, totalRenderStageMs, framesCompleted);
     result.worstFrameTable = buildWorstFrameTable(worstFrames);
     result.message = QStringLiteral("Rendered %1 video frames to %2%3")
                          .arg(framesCompleted)
