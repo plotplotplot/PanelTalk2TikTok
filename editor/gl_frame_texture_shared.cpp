@@ -119,6 +119,121 @@ bool uploadCudaNv12FrameToTextures(const FrameHandle& frame, GLuint textureId, G
     return result == CUDA_SUCCESS;
 }
 
+namespace {
+bool ensureCudaGraphicsResources(GLuint textureId,
+                                 GLuint uvTextureId,
+                                 GlTextureCacheEntry* entry) {
+    if (!entry || !textureId || !uvTextureId) {
+        return false;
+    }
+    if (entry->cudaYResource && entry->cudaUvResource) {
+        return true;
+    }
+    if (cuGraphicsGLRegisterImage(&entry->cudaYResource,
+                                  textureId,
+                                  GL_TEXTURE_2D,
+                                  CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD) != CUDA_SUCCESS) {
+        entry->cudaYResource = nullptr;
+        return false;
+    }
+    if (cuGraphicsGLRegisterImage(&entry->cudaUvResource,
+                                  uvTextureId,
+                                  GL_TEXTURE_2D,
+                                  CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD) != CUDA_SUCCESS) {
+        cuGraphicsUnregisterResource(entry->cudaYResource);
+        entry->cudaYResource = nullptr;
+        entry->cudaUvResource = nullptr;
+        return false;
+    }
+    return true;
+}
+
+bool uploadCudaNv12FrameToRegisteredTextures(const FrameHandle& frame, GlTextureCacheEntry* entry) {
+    if (!entry || !entry->textureId || !entry->auxTextureId || !frameUsesCudaZeroCopyCandidate(frame)) {
+        return false;
+    }
+
+    const AVFrame* hwFrame = frame.hardwareFrame();
+    if (!hwFrame || !hwFrame->hw_frames_ctx) {
+        return false;
+    }
+
+    auto* framesContext = reinterpret_cast<AVHWFramesContext*>(hwFrame->hw_frames_ctx->data);
+    if (!framesContext || !framesContext->device_ctx) {
+        return false;
+    }
+    auto* deviceContext = framesContext->device_ctx;
+    if (!deviceContext || deviceContext->type != AV_HWDEVICE_TYPE_CUDA) {
+        return false;
+    }
+    auto* cudaDeviceContext = reinterpret_cast<AVCUDADeviceContext*>(deviceContext->hwctx);
+    if (!cudaDeviceContext) {
+        return false;
+    }
+
+    if (cuCtxPushCurrent(cudaDeviceContext->cuda_ctx) != CUDA_SUCCESS) {
+        return false;
+    }
+
+    auto restoreContext = []() {
+        CUcontext popped = nullptr;
+        cuCtxPopCurrent(&popped);
+    };
+
+    const int width = hwFrame->width;
+    const int height = hwFrame->height;
+    if (width <= 0 || height <= 0) {
+        restoreContext();
+        return false;
+    }
+
+    if (!ensureCudaGraphicsResources(entry->textureId, entry->auxTextureId, entry)) {
+        restoreContext();
+        return false;
+    }
+
+    CUgraphicsResource resources[2] = { entry->cudaYResource, entry->cudaUvResource };
+    CUresult result = cuGraphicsMapResources(2, resources, 0);
+    if (result != CUDA_SUCCESS) {
+        restoreContext();
+        return false;
+    }
+
+    CUarray yArray = nullptr;
+    CUarray uvArray = nullptr;
+    result = cuGraphicsSubResourceGetMappedArray(&yArray, entry->cudaYResource, 0, 0);
+    if (result == CUDA_SUCCESS) {
+        result = cuGraphicsSubResourceGetMappedArray(&uvArray, entry->cudaUvResource, 0, 0);
+    }
+    if (result == CUDA_SUCCESS) {
+        CUDA_MEMCPY2D yCopy{};
+        yCopy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        yCopy.srcDevice = reinterpret_cast<CUdeviceptr>(hwFrame->data[0]);
+        yCopy.srcPitch = static_cast<size_t>(hwFrame->linesize[0]);
+        yCopy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+        yCopy.dstArray = yArray;
+        yCopy.WidthInBytes = static_cast<size_t>(width);
+        yCopy.Height = static_cast<size_t>(height);
+        result = cuMemcpy2D(&yCopy);
+    }
+    if (result == CUDA_SUCCESS) {
+        CUDA_MEMCPY2D uvCopy{};
+        uvCopy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        uvCopy.srcDevice = reinterpret_cast<CUdeviceptr>(hwFrame->data[1]);
+        uvCopy.srcPitch = static_cast<size_t>(hwFrame->linesize[1]);
+        uvCopy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+        uvCopy.dstArray = uvArray;
+        uvCopy.WidthInBytes = static_cast<size_t>(qMax(1, width / 2) * 2);
+        uvCopy.Height = static_cast<size_t>(qMax(1, height / 2));
+        result = cuMemcpy2D(&uvCopy);
+    }
+
+    cuGraphicsUnmapResources(2, resources, 0);
+    restoreContext();
+    return result == CUDA_SUCCESS;
+}
+} // namespace
+
 QString textureCacheKey(const FrameHandle& frame) {
     return QStringLiteral("%1|%2").arg(frame.sourcePath()).arg(frame.frameNumber());
 }
@@ -136,6 +251,14 @@ bool shouldUseReusableTextureCache(const FrameHandle& frame) {
 void destroyGlTextureEntry(GlTextureCacheEntry* entry) {
     if (!entry) {
         return;
+    }
+    if (entry->cudaYResource) {
+        cuGraphicsUnregisterResource(entry->cudaYResource);
+        entry->cudaYResource = nullptr;
+    }
+    if (entry->cudaUvResource) {
+        cuGraphicsUnregisterResource(entry->cudaUvResource);
+        entry->cudaUvResource = nullptr;
     }
     if (entry->textureId != 0) {
         glDeleteTextures(1, &entry->textureId);
@@ -190,7 +313,7 @@ bool uploadFrameToGlTextureEntry(const FrameHandle& frame, GlTextureCacheEntry* 
             entry->size = frameSize;
             entry->usesYuvTextures = true;
         }
-        if (!uploadCudaNv12FrameToTextures(frame, entry->textureId, entry->auxTextureId)) {
+        if (!uploadCudaNv12FrameToRegisteredTextures(frame, entry)) {
             destroyGlTextureEntry(entry);
             return false;
         }

@@ -8,6 +8,8 @@
 #include <QString>
 #include <QtGui/qopengl.h>
 
+#include <cuda.h>
+
 namespace editor {
 
 struct GlTextureCacheEntry {
@@ -17,6 +19,8 @@ struct GlTextureCacheEntry {
     qint64 lastUsedMs = 0;
     QSize size;
     bool usesYuvTextures = false;
+    CUgraphicsResource cudaYResource = nullptr;
+    CUgraphicsResource cudaUvResource = nullptr;
 };
 
 bool frameUsesCudaZeroCopyCandidate(const FrameHandle& frame);
