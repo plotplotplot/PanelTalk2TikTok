@@ -3,6 +3,10 @@
 #include <QtGui/private/qrhi_p.h>
 #include <QDateTime>
 
+extern "C" {
+#include <libavutil/frame.h>
+}
+
 namespace editor {
 
 // ============================================================================
@@ -15,6 +19,9 @@ FrameData::~FrameData() {
     if (gpuTexture && gpuTextureOwned.load() == 1) {
         // Mark for deferred deletion on render thread
         // (Actual cleanup happens in render loop)
+    }
+    if (hardwareFrame) {
+        av_frame_free(&hardwareFrame);
     }
 }
 
@@ -41,6 +48,29 @@ size_t FrameData::memoryUsage() const {
     }
     
     return total;
+}
+
+static size_t hardwareFrameEstimateBytes(const FrameData* data) {
+    if (!data || !data->hardwareFrame || !data->size.isValid()) {
+        return 0;
+    }
+
+    const size_t width = static_cast<size_t>(qMax(0, data->size.width()));
+    const size_t height = static_cast<size_t>(qMax(0, data->size.height()));
+    if (width == 0 || height == 0) {
+        return 0;
+    }
+
+    switch (data->hardwareSwPixelFormat) {
+        case AV_PIX_FMT_NV12:
+        case AV_PIX_FMT_YUV420P:
+            return (width * height * 3) / 2;
+        case AV_PIX_FMT_P010:
+        case AV_PIX_FMT_P016:
+            return width * height * 3;
+        default:
+            return width * height * 4;
+    }
 }
 
 // ============================================================================
@@ -70,6 +100,31 @@ FrameHandle FrameHandle::createGpuFrame(QRhiTexture* texture, int64_t frameNum, 
     handle.d->frameNumber = frameNum;
     handle.d->sourcePath = path;
     handle.d->size = QSize(texture->pixelSize().width(), texture->pixelSize().height());
+    handle.d->decodeTimestamp = QDateTime::currentMSecsSinceEpoch();
+    return handle;
+}
+
+FrameHandle FrameHandle::createHardwareFrame(const AVFrame* frame,
+                                             int64_t frameNum,
+                                             const QString& path,
+                                             int swPixelFormat) {
+    FrameHandle handle;
+    if (!frame) {
+        return handle;
+    }
+
+    AVFrame* cloned = av_frame_clone(frame);
+    if (!cloned) {
+        return handle;
+    }
+
+    handle.d = new FrameData();
+    handle.d->hardwareFrame = cloned;
+    handle.d->hardwarePixelFormat = frame->format;
+    handle.d->hardwareSwPixelFormat = swPixelFormat;
+    handle.d->frameNumber = frameNum;
+    handle.d->sourcePath = path;
+    handle.d->size = QSize(frame->width, frame->height);
     handle.d->decodeTimestamp = QDateTime::currentMSecsSinceEpoch();
     return handle;
 }
@@ -117,6 +172,35 @@ bool FrameHandle::operator==(const FrameHandle& other) const {
     if (!d || !other.d) return false;
     return d->sourcePath == other.d->sourcePath && 
            d->frameNumber == other.d->frameNumber;
+}
+
+size_t FrameHandle::cpuMemoryUsage() const {
+    if (!d) {
+        return 0;
+    }
+    return d->cpuImage.isNull() ? 0 : d->cpuImage.sizeInBytes();
+}
+
+size_t FrameHandle::gpuMemoryUsage() const {
+    if (!d) {
+        return 0;
+    }
+
+    size_t total = 0;
+    if (d->gpuTexture) {
+        QRhiTexture::Format fmt = d->gpuTexture->format();
+        int bpp = 4;
+        switch (fmt) {
+            case QRhiTexture::RGBA8: bpp = 4; break;
+            case QRhiTexture::BGRA8: bpp = 4; break;
+            case QRhiTexture::R8: bpp = 1; break;
+            case QRhiTexture::RG8: bpp = 2; break;
+            default: bpp = 4; break;
+        }
+        total += static_cast<size_t>(d->size.width()) * static_cast<size_t>(d->size.height()) * static_cast<size_t>(bpp);
+    }
+    total += hardwareFrameEstimateBytes(d.data());
+    return total;
 }
 
 } // namespace editor

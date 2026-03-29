@@ -10,12 +10,16 @@
 #include <QImage>
 #include <QMutex>
 #include <QObject>
-#include <QThread>
-#include <QWaitCondition>
+#include <QVector>
 #include <functional>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
+#include <set>
+#include <thread>
+#include <vector>
 
 // FFmpeg forward declarations (actual includes in .cpp)
 extern "C" {
@@ -32,6 +36,12 @@ struct SwsContext;
 
 namespace editor {
 
+enum class DecodeRequestKind : int {
+    Visible = 0,
+    Prefetch = 1,
+    Preload = 2,
+};
+
 // ============================================================================
 // DecodeRequest - Single frame decode request
 // ============================================================================
@@ -40,6 +50,8 @@ struct DecodeRequest {
     QString filePath;
     int64_t frameNumber;
     int priority;  // Higher = more urgent (0-255)
+    DecodeRequestKind kind = DecodeRequestKind::Visible;
+    uint64_t generation = 0;
     QDeadlineTimer deadline;
     std::function<void(FrameHandle)> callback;
     qint64 submittedAt;
@@ -58,8 +70,12 @@ struct VideoStreamInfo {
     QSize frameSize;
     int64_t bitrate = 0;
     QString codecName;
+    QString decodePath;
+    QString interopPath;
+    QString requestedDecodeMode;
     bool hasAudio = false;
     bool hasAlpha = false;
+    bool hardwareAccelerated = false;
     bool isValid = false;
 };
 
@@ -79,6 +95,8 @@ public:
     
     // Decode specific frame (blocking)
     FrameHandle decodeFrame(int64_t frameNumber);
+    QVector<FrameHandle> decodeThroughFrame(int64_t targetFrame);
+    bool supportsSequenceBatchDecode() const { return m_isImageSequence && m_sequenceUsesWebp; }
     
     // Precise seek then decode
     FrameHandle seekAndDecode(int64_t frameNumber);
@@ -99,6 +117,11 @@ private:
     bool initHardwareAccel(const AVCodec* decoder);
     bool seekToKeyframe(int64_t targetFrame);
     bool loadStillImage();
+    bool loadImageSequence();
+    QImage loadCachedSequenceFrameImage(int64_t frameNumber);
+    void cacheSequenceFrameImage(int64_t frameNumber, const QImage& image);
+    void trimSequenceFrameCache();
+    QVector<FrameHandle> decodeForwardUntil(int64_t targetFrame, bool forceSeek);
     FrameHandle convertToFrame(AVFrame* avFrame, int64_t frameNumber);
     QImage convertAVFrameToImage(AVFrame* frame);
     
@@ -120,7 +143,14 @@ private:
     bool m_loggedAlphaProbe = false;
     bool m_reportedAlphaMismatch = false;
     bool m_isStillImage = false;
+    bool m_isImageSequence = false;
+    bool m_sequenceUsesWebp = false;
     QImage m_stillImage;
+    QStringList m_sequenceFramePaths;
+    QHash<int64_t, QImage> m_sequenceFrameCache;
+    QHash<int64_t, quint64> m_sequenceFrameCacheUseOrder;
+    size_t m_sequenceFrameCacheBytes = 0;
+    quint64 m_sequenceFrameUseCounter = 0;
     SwsContext* m_swsCtx = nullptr;
     AVFrame* m_convertFrame = nullptr;
     int m_swsSourceFormat = -1;
@@ -130,77 +160,6 @@ private:
     // Seek state
     int64_t m_lastDecodedFrame = -1;
     bool m_eof = false;
-};
-
-// ============================================================================
-// DecodeQueue - Thread-safe priority queue
-// ============================================================================
-class DecodeQueue {
-public:
-    static constexpr int kMaxSize = 128;
-    
-    bool enqueue(DecodeRequest req);
-    bool dequeue(DecodeRequest* out);
-    bool tryDequeue(DecodeRequest* out, int timeoutMs);
-    
-    void clear();
-    void removeForFile(const QString& path);
-    void removeForFileBefore(const QString& path, int64_t frameNumber);
-    int size() const;
-    bool isEmpty() const;
-    
-    void shutdown();
-    bool isShutdown() const { return m_shutdown.load(); }
-    
-private:
-    mutable QMutex m_mutex;
-    QWaitCondition m_condition;
-    std::deque<DecodeRequest> m_queue;
-    std::atomic<bool> m_shutdown{false};
-    
-    // Insert by priority (higher priority = earlier in queue)
-    void insertByPriority(const DecodeRequest& req);
-};
-
-// ============================================================================
-// DecoderWorker - Runs on background thread, processes decode requests
-// ============================================================================
-class DecoderWorker : public QObject {
-    Q_OBJECT
-public:
-    explicit DecoderWorker(DecodeQueue* queue, MemoryBudget* budget, QObject* parent = nullptr);
-    ~DecoderWorker();
-    
-    void start();
-    void stop();
-    bool isRunning() const { return m_running.load(); }
-    
-    // Statistics
-    int decodedFrameCount() const { return m_decodeCount.load(); }
-    int droppedFrameCount() const { return m_dropCount.load(); }
-    
-signals:
-    void frameDecoded(FrameHandle frame);
-    void decodeError(QString path, QString error);
-    
-public slots:
-    void run();
-    
-private:
-    DecoderContext* getOrCreateContext(const QString& path);
-    void evictOldestContext();
-    void processRequest(const DecodeRequest& req);
-    
-    DecodeQueue* m_queue = nullptr;
-    MemoryBudget* m_budget = nullptr;
-    QThread* m_thread = nullptr;
-    std::atomic<bool> m_running{false};
-    std::atomic<int> m_decodeCount{0};
-    std::atomic<int> m_dropCount{0};
-    
-    QMutex m_contextsMutex;
-    QHash<QString, DecoderContext*> m_contexts;
-    static constexpr int kMaxContexts = 4;  // Max concurrent files per worker
 };
 
 // ============================================================================
@@ -218,10 +177,16 @@ public:
     // Request a frame decode (non-blocking)
     // callback is invoked on the decoder thread - use QMetaObject::invokeMethod 
     // to get back to main thread if needed
+    uint64_t requestFrame(const QString& path,
+                          int64_t frameNumber,
+                          int priority,
+                          int timeoutMs,
+                          std::function<void(FrameHandle)> callback);
     uint64_t requestFrame(const QString& path, 
                           int64_t frameNumber,
                           int priority,
                           int timeoutMs,
+                          DecodeRequestKind kind,
                           std::function<void(FrameHandle)> callback);
     
     // Cancel pending requests
@@ -237,7 +202,7 @@ public:
     
     // Statistics
     int pendingRequestCount() const { return totalPendingRequests(); }
-    int workerCount() const { return m_workers.size(); }
+    int workerCount() const { return m_workerCount; }
     
     // Memory budget access
     MemoryBudget* memoryBudget() const { return m_budget; }
@@ -248,15 +213,27 @@ signals:
     void queuePressureChanged(int pendingCount);
     
 private:
+    struct LaneState;
+
     void setupTrimCallback();
     void trimCaches();
     int totalPendingRequests() const;
-    int queueIndexForPath(const QString& path) const;
-    DecodeQueue* queueForPath(const QString& path) const;
+    int laneIndexForRequest(const QString& path, int64_t frameNumber) const;
+    LaneState* laneForRequest(const QString& path, int64_t frameNumber) const;
+    std::vector<LaneState*> lanesForPath(const QString& path) const;
+    void startLane(LaneState* lane);
+    void stopLane(LaneState* lane);
+    void runLane(LaneState* lane);
+    void insertByPriority(std::deque<DecodeRequest>& queue, const DecodeRequest& req);
+    void collectSupersededRequests(const DecodeRequest& req,
+                                   std::deque<DecodeRequest>& queue,
+                                   QVector<std::function<void(FrameHandle)>>* droppedCallbacks);
     
     MemoryBudget* m_budget = nullptr;
-    QVector<DecodeQueue*> m_queues;
-    QVector<DecoderWorker*> m_workers;
+    int m_workerCount = 0;
+    std::vector<std::unique_ptr<LaneState>> m_lanes;
+    bool m_initialized = false;
+    bool m_shuttingDown = false;
     std::atomic<uint64_t> m_nextSequenceId{1};
     
     QMutex m_infoCacheMutex;

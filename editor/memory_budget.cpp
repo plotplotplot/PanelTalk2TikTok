@@ -141,24 +141,38 @@ double MemoryBudget::gpuPressure() const {
 }
 
 void MemoryBudget::checkPressure() {
-    QMutexLocker lock(&m_pressureMutex);
-    
     double cpuP = cpuPressure();
     double gpuP = gpuPressure();
-    
-    // Emit signals only on significant changes
-    if (std::abs(cpuP - m_lastCpuPressure) > 0.05) {
-        m_lastCpuPressure = cpuP;
+
+    bool emitCpuChanged = false;
+    bool emitGpuChanged = false;
+    bool requestTrim = false;
+
+    {
+        QMutexLocker lock(&m_pressureMutex);
+
+        if (std::abs(cpuP - m_lastCpuPressure) > 0.05) {
+            m_lastCpuPressure = cpuP;
+            emitCpuChanged = true;
+        }
+
+        if (std::abs(gpuP - m_lastGpuPressure) > 0.05) {
+            m_lastGpuPressure = gpuP;
+            emitGpuChanged = true;
+        }
+
+        requestTrim = cpuP > 0.85 || gpuP > 0.85;
+    }
+
+    if (emitCpuChanged) {
         emit cpuPressureChanged(cpuP);
     }
-    
-    if (std::abs(gpuP - m_lastGpuPressure) > 0.05) {
-        m_lastGpuPressure = gpuP;
+
+    if (emitGpuChanged) {
         emit gpuPressureChanged(gpuP);
     }
-    
-    // Request trim if under pressure
-    if (cpuP > 0.85 || gpuP > 0.85) {
+
+    if (requestTrim) {
         if (m_trimCallback) {
             m_trimCallback();
         }

@@ -5,19 +5,21 @@
 #include <QOpenGLBuffer>
 #include <QTimer>
 #include <QHash>
+#include <QJsonObject>
 #include <memory>
 #include <functional>
 
 // Include frame_handle first to avoid conflicts with forward declarations
 #include "frame_handle.h"
+#include "gl_frame_texture_shared.h"
 #include "editor_shared.h"
 #include "timeline_widget.h"
 #include "async_decoder.h"
 #include "timeline_cache.h"
+#include "playback_frame_pipeline.h"
 
 QT_BEGIN_NAMESPACE
 class QOpenGLShaderProgram;
-class QOpenGLTexture;
 QT_END_NAMESPACE
 
 using namespace editor;
@@ -35,10 +37,14 @@ public:
     void setSelectedClipId(const QString& clipId);
     void setTimelineClips(const QVector<TimelineClip>& clips);
     void setRenderSyncMarkers(const QVector<RenderSyncMarker>& markers);
+    void setExportRanges(const QVector<ExportRangeSegment>& ranges);
+    void beginBulkUpdate();
+    void endBulkUpdate();
     QString backendName() const;
     void setAudioMuted(bool muted);
     void setAudioVolume(qreal volume);
     void setOutputSize(const QSize& size);
+    void setHideOutsideOutputWindow(bool hide);
     void setBypassGrading(bool bypass);
     bool bypassGrading() const;
     bool audioMuted() const;
@@ -77,13 +83,6 @@ private:
         QRectF cornerHandle;
     };
 
-    struct TextureCacheEntry {
-        QOpenGLTexture* texture = nullptr;
-        qint64 decodeTimestamp = 0;
-        qint64 lastUsedMs = 0;
-        QSize size;
-    };
-
     enum class PreviewDragMode {
         None,
         Move,
@@ -104,8 +103,7 @@ private:
     bool usingCpuFallback() const;
     void ensurePipeline();
     void releaseGlResources();
-    QString textureCacheKey(const FrameHandle& frame) const;
-    QOpenGLTexture* textureForFrame(const FrameHandle& frame);
+    GLuint textureForFrame(const FrameHandle& frame);
     void trimTextureCache();
     bool isSampleWithinClip(const TimelineClip& clip, int64_t samplePosition) const;
     int64_t sourceSampleForPlaybackSample(const TimelineClip& clip, int64_t samplePosition) const;
@@ -124,6 +122,7 @@ private:
     void drawBackground(QPainter* painter);
     QList<TimelineClip> getActiveClips() const;
     void requestFramesForCurrentPosition();
+    void scheduleFrameRequest();
     void scheduleRepaint();
     void drawCompositedPreview(QPainter* painter, const QRect& safeRect,
                                const QList<TimelineClip>& activeClips);
@@ -144,6 +143,7 @@ private:
 
     std::unique_ptr<AsyncDecoder> m_decoder;
     std::unique_ptr<TimelineCache> m_cache;
+    std::unique_ptr<PlaybackFramePipeline> m_playbackPipeline;
     std::unique_ptr<QOpenGLShaderProgram> m_shaderProgram;
     QOpenGLBuffer m_quadBuffer;
 
@@ -159,18 +159,25 @@ private:
     QVector<RenderSyncMarker> m_renderSyncMarkers;
     QSet<QString> m_registeredClips;
     QTimer m_repaintTimer;
+    QTimer m_frameRequestTimer;
     qint64 m_lastFrameRequestMs = 0;
     qint64 m_lastFrameReadyMs = 0;
     qint64 m_lastPaintMs = 0;
     qint64 m_lastRepaintScheduleMs = 0;
     QString m_selectedClipId;
     QSize m_outputSize = QSize(1080, 1920);
+    bool m_hideOutsideOutputWindow = false;
     qreal m_previewZoom = 1.0;
     QPointF m_previewPanOffset;
     QHash<QString, PreviewOverlayInfo> m_overlayInfo;
     mutable QHash<QString, QVector<TranscriptSection>> m_transcriptSectionsCache;
-    QHash<QString, TextureCacheEntry> m_textureCache;
+    QHash<QString, editor::GlTextureCacheEntry> m_textureCache;
+    QHash<QString, FrameHandle> m_lastPresentedFrames;
+    mutable QJsonObject m_lastFrameSelectionStats;
     QVector<QString> m_paintOrder;
+    int m_bulkUpdateDepth = 0;
+    bool m_pendingFrameRequest = false;
+    bool m_frameRequestsArmed = false;
     PreviewDragMode m_dragMode = PreviewDragMode::None;
     QPointF m_dragOriginPos;
     QRectF m_dragOriginBounds;

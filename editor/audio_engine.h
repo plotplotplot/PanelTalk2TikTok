@@ -46,6 +46,22 @@ public:
         m_decodeCondition.notify_one();
     }
 
+    void setExportRanges(const QVector<ExportRangeSegment>& ranges) {
+        {
+            std::lock_guard<std::mutex> lock(m_exportRangesMutex);
+            m_exportRanges = ranges;
+        }
+    }
+
+    void setRenderSyncMarkers(const QVector<RenderSyncMarker>& markers) {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_renderSyncMarkers = markers;
+    }
+
+    void setSpeechFilterFadeSamples(int samples) {
+        m_speechFilterFadeSamples.store(qMax(0, samples), std::memory_order_release);
+    }
+
     bool initialize() {
         std::lock_guard<std::mutex> lock(m_stateMutex);
         if (m_initialized) {
@@ -151,6 +167,7 @@ public:
         {
             std::lock_guard<std::mutex> queueLock(m_queueMutex);
             m_pcmQueue.clear();
+            m_pcmChunkEndSamples.clear();
         }
         m_stateCondition.notify_all();
         m_decodeCondition.notify_one();
@@ -165,6 +182,7 @@ public:
         {
             std::lock_guard<std::mutex> queueLock(m_queueMutex);
             m_pcmQueue.clear();
+            m_pcmChunkEndSamples.clear();
         }
         {
             std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
@@ -185,6 +203,7 @@ public:
         {
             std::lock_guard<std::mutex> queueLock(m_queueMutex);
             m_pcmQueue.clear();
+            m_pcmChunkEndSamples.clear();
         }
         {
             std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
@@ -200,7 +219,7 @@ public:
     bool hasPlayableAudio() const {
         std::lock_guard<std::mutex> lock(m_stateMutex);
         for (const TimelineClip& clip : m_timelineClips) {
-            if (clip.hasAudio) {
+            if (clipAudioPlaybackEnabled(clip)) {
                 return true;
             }
         }
@@ -233,6 +252,8 @@ private:
 
     struct MixContext {
         QVector<TimelineClip> clips;
+        QVector<ExportRangeSegment> exportRanges;
+        QVector<RenderSyncMarker> renderSyncMarkers;
         bool muted = false;
         qreal volume = 0.8;
     };
@@ -245,9 +266,27 @@ private:
         return qMax<int64_t>(0, static_cast<int64_t>(std::floor((static_cast<double>(samples) * kTimelineFps) / m_sampleRate)));
     }
 
+    int64_t nextPlayableSampleAtOrAfter(int64_t samplePos,
+                                        const QVector<ExportRangeSegment>& ranges) const {
+        if (ranges.isEmpty()) {
+            return qMax<int64_t>(0, samplePos);
+        }
+        for (const ExportRangeSegment& range : ranges) {
+            const int64_t rangeStartSample = timelineFrameToSamples(range.startFrame);
+            const int64_t rangeEndSampleExclusive = timelineFrameToSamples(range.endFrame + 1);
+            if (samplePos < rangeStartSample) {
+                return rangeStartSample;
+            }
+            if (samplePos >= rangeStartSample && samplePos < rangeEndSampleExclusive) {
+                return samplePos;
+            }
+        }
+        return qMax<int64_t>(0, samplePos);
+    }
+
     void scheduleDecodesLocked(const QVector<TimelineClip>& clips) {
         for (const TimelineClip& clip : clips) {
-            if (!clip.hasAudio || clip.filePath.isEmpty()) {
+            if (!clipAudioPlaybackEnabled(clip) || clip.filePath.isEmpty()) {
                 continue;
             }
             if (m_audioCache.contains(clip.filePath) || m_pendingDecodeSet.contains(clip.filePath)) {
@@ -256,6 +295,70 @@ private:
             m_pendingDecodePaths.push_back(clip.filePath);
             m_pendingDecodeSet.insert(clip.filePath);
         }
+    }
+
+    // Calculate fade gain for a sample position considering export ranges.
+    // Uses sample distance from range boundaries for stable fades.
+    float calculateRangeFadeGain(int64_t samplePos, const QVector<ExportRangeSegment>& ranges,
+                                 int fadeSamples) const {
+        if (ranges.isEmpty() || fadeSamples <= 0) {
+            return 1.0f;
+        }
+
+        const ExportRangeSegment* currentRange = nullptr;
+        for (const auto& range : ranges) {
+            const int64_t rangeStartSample = timelineFrameToSamples(range.startFrame);
+            const int64_t rangeEndSampleExclusive = timelineFrameToSamples(range.endFrame + 1);
+            if (samplePos >= rangeStartSample && samplePos < rangeEndSampleExclusive) {
+                currentRange = &range;
+                break;
+            }
+        }
+
+        if (!currentRange) {
+            return 0.0f;
+        }
+
+        const int64_t rangeStartSample = timelineFrameToSamples(currentRange->startFrame);
+        const int64_t rangeEndSampleExclusive = timelineFrameToSamples(currentRange->endFrame + 1);
+        const int64_t samplesFromStart = samplePos - rangeStartSample;
+        const int64_t samplesToEnd = rangeEndSampleExclusive - samplePos;
+
+        float gain = 1.0f;
+        if (samplesFromStart < fadeSamples) {
+            gain = qMin(gain,
+                        static_cast<float>(samplesFromStart) / static_cast<float>(fadeSamples));
+        }
+        if (samplesToEnd < fadeSamples) {
+            gain = qMin(gain,
+                        static_cast<float>(samplesToEnd) / static_cast<float>(fadeSamples));
+        }
+        return qBound(0.0f, gain, 1.0f);
+    }
+
+    // Calculate fade gain for clip-to-clip crossfade
+    float calculateClipCrossfadeGain(int64_t samplePos, const TimelineClip& clip,
+                                      int64_t clipStartSample, int64_t clipEndSample,
+                                      int fadeSamples) const {
+        if (fadeSamples <= 0) {
+            return 1.0f;
+        }
+
+        float gain = 1.0f;
+
+        // Fade in at clip start
+        const int64_t samplesFromStart = samplePos - clipStartSample;
+        if (samplesFromStart >= 0 && samplesFromStart < fadeSamples) {
+            gain *= static_cast<float>(samplesFromStart) / static_cast<float>(fadeSamples);
+        }
+
+        // Fade out at clip end
+        const int64_t samplesToEnd = clipEndSample - samplePos;
+        if (samplesToEnd >= 0 && samplesToEnd < fadeSamples) {
+            gain *= static_cast<float>(samplesToEnd) / static_cast<float>(fadeSamples);
+        }
+
+        return qBound(0.0f, gain, 1.0f);
     }
 
     AudioClipCacheEntry decodeClipAudio(const QString& path) {
@@ -397,11 +500,16 @@ private:
         return m_audioCache.value(path);
     }
 
+    QVector<ExportRangeSegment> exportRangesCopy() const {
+        std::lock_guard<std::mutex> lock(m_exportRangesMutex);
+        return m_exportRanges;
+    }
+
     void mixChunk(const MixContext& context, float* output, int frames, int64_t chunkStartSample) {
         std::fill(output, output + frames * m_channelCount, 0.0f);
 
         for (const TimelineClip& clip : context.clips) {
-            if (!clip.hasAudio) {
+            if (!clipAudioPlaybackEnabled(clip)) {
                 continue;
             }
             const AudioClipCacheEntry audio = clipCacheForPathCopy(clip.filePath);
@@ -424,19 +532,39 @@ private:
 
             const int64_t mixStart = qMax<int64_t>(chunkStartSample, clipStartSample);
             const int64_t mixEnd = qMin<int64_t>(chunkEndSample, clipEndSample);
+            
             for (int64_t samplePos = mixStart; samplePos < mixEnd; ++samplePos) {
                 const int outFrame = static_cast<int>(samplePos - chunkStartSample);
-                const int inFrame = static_cast<int>(sourceInSample + (samplePos - clipStartSample));
+                const int64_t inFrame =
+                    sourceSampleForClipAtTimelineSample(clip, samplePos, context.renderSyncMarkers);
+                if (inFrame < 0 || inFrame >= (audio.samples.size() / m_channelCount)) {
+                    continue;
+                }
                 const int outIndex = outFrame * m_channelCount;
-                const int inIndex = inFrame * m_channelCount;
-                output[outIndex] += audio.samples[inIndex];
-                output[outIndex + 1] += audio.samples[inIndex + 1];
+                const int inIndex = static_cast<int>(inFrame * m_channelCount);
+                
+                // Calculate crossfade gain for this sample
+                float gain = 1.0f;
+                
+                // Apply speech filter range fade (if export ranges are set)
+                if (!context.exportRanges.isEmpty()) {
+                    gain *= calculateRangeFadeGain(samplePos,
+                                                   context.exportRanges,
+                                                   m_speechFilterFadeSamples.load(std::memory_order_acquire));
+                }
+                
+                // Apply clip crossfade at clip boundaries
+                gain *= calculateClipCrossfadeGain(samplePos, clip, clipStartSample, clipEndSample, 
+                                                    clip.fadeSamples > 0 ? clip.fadeSamples : m_defaultFadeSamples);
+                
+                output[outIndex] += audio.samples[inIndex] * gain;
+                output[outIndex + 1] += audio.samples[inIndex + 1] * gain;
             }
         }
 
-        const float gain = context.muted ? 0.0f : static_cast<float>(context.volume);
+        const float masterGain = context.muted ? 0.0f : static_cast<float>(context.volume);
         for (int i = 0; i < frames * m_channelCount; ++i) {
-            output[i] = qBound(-1.0f, output[i] * gain, 1.0f);
+            output[i] = qBound(-1.0f, output[i] * masterGain, 1.0f);
         }
     }
 
@@ -502,9 +630,11 @@ private:
                 if (!m_playing) {
                     continue;
                 }
-                chunkStartSample = m_timelineSampleCursor;
-                m_timelineSampleCursor += m_periodFrames;
                 context.clips = m_timelineClips;
+                context.exportRanges = exportRangesCopy();
+                context.renderSyncMarkers = m_renderSyncMarkers;
+                chunkStartSample = nextPlayableSampleAtOrAfter(m_timelineSampleCursor, context.exportRanges);
+                m_timelineSampleCursor = chunkStartSample + m_periodFrames;
                 context.muted = m_muted;
                 context.volume = m_volume;
             }
@@ -517,11 +647,11 @@ private:
 
             {
                 std::lock_guard<std::mutex> queueLock(m_queueMutex);
-                for (int16_t sample : pcmBuffer) {
-                    if (m_pcmQueue.size() >= m_maxQueuedSamples) {
-                        break;
+                if (m_pcmQueue.size() + static_cast<size_t>(pcmBuffer.size()) <= m_maxQueuedSamples) {
+                    for (int16_t sample : pcmBuffer) {
+                        m_pcmQueue.push_back(sample);
                     }
-                    m_pcmQueue.push_back(sample);
+                    m_pcmChunkEndSamples.push_back(chunkStartSample + m_periodFrames);
                 }
             }
             m_queueCondition.notify_all();
@@ -556,6 +686,7 @@ private:
             }
 
             bool hadAudio = false;
+            int64_t consumedChunkEndSample = -1;
             {
                 std::unique_lock<std::mutex> queueLock(m_queueMutex);
                 if (m_pcmQueue.size() < pcmBuffer.size()) {
@@ -570,6 +701,10 @@ private:
                     for (int i = 0; i < pcmBuffer.size(); ++i) {
                         pcmBuffer[i] = m_pcmQueue.front();
                         m_pcmQueue.pop_front();
+                    }
+                    if (!m_pcmChunkEndSamples.empty()) {
+                        consumedChunkEndSample = m_pcmChunkEndSamples.front();
+                        m_pcmChunkEndSamples.pop_front();
                     }
                     hadAudio = true;
                 }
@@ -608,22 +743,31 @@ private:
 
             if (!hadAudio) {
                 m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                if (consumedChunkEndSample >= 0) {
+                    m_audioClockSample.store(consumedChunkEndSample, std::memory_order_release);
+                } else {
+                    m_audioClockSample.fetch_add(m_periodFrames, std::memory_order_release);
+                }
             }
-            m_audioClockSample.fetch_add(m_periodFrames, std::memory_order_release);
             m_queueCondition.notify_all();
         }
     }
 
     mutable std::mutex m_stateMutex;
     mutable std::mutex m_queueMutex;
+    mutable std::mutex m_exportRangesMutex;
     std::condition_variable m_stateCondition;
     std::condition_variable m_decodeCondition;
     std::condition_variable m_queueCondition;
     QVector<TimelineClip> m_timelineClips;
+    QVector<RenderSyncMarker> m_renderSyncMarkers;
+    QVector<ExportRangeSegment> m_exportRanges;
     QHash<QString, AudioClipCacheEntry> m_audioCache;
     std::deque<QString> m_pendingDecodePaths;
     QSet<QString> m_pendingDecodeSet;
     std::deque<int16_t> m_pcmQueue;
+    std::deque<int64_t> m_pcmChunkEndSamples;
     std::thread m_decodeWorker;
     std::thread m_mixWorker;
     std::thread m_outputWorker;
@@ -643,6 +787,8 @@ private:
     static constexpr int m_mixLowWaterFrames = 2048;
     static constexpr int m_maxQueuedFrames = 8192;
     static constexpr size_t m_maxQueuedSamples = static_cast<size_t>(m_maxQueuedFrames * m_channelCount);
+    static constexpr int m_defaultFadeSamples = 250;  // Default fade duration for speech filter boundaries
+    std::atomic<int> m_speechFilterFadeSamples{m_defaultFadeSamples};
 };
 
 #else // !EDITOR_HAS_ALSA

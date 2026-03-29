@@ -2,6 +2,7 @@
 
 #include <QColor>
 #include <QImage>
+#include <QStringList>
 #include <QString>
 #include <QVector>
 
@@ -14,6 +15,11 @@ enum class ClipMediaType {
     Audio,
 };
 
+enum class MediaSourceKind {
+    File,
+    ImageSequence,
+};
+
 struct TimelineClip {
     struct TransformKeyframe {
         int64_t frame = 0;
@@ -22,7 +28,16 @@ struct TimelineClip {
         qreal rotation = 0.0;
         qreal scaleX = 1.0;
         qreal scaleY = 1.0;
-        bool interpolated = true;
+        bool linearInterpolation = true;
+    };
+
+    struct GradingKeyframe {
+        int64_t frame = 0;
+        qreal brightness = 0.0;
+        qreal contrast = 1.0;
+        qreal saturation = 1.0;
+        qreal opacity = 1.0;
+        bool linearInterpolation = true;
     };
 
     struct TranscriptOverlaySettings {
@@ -43,8 +58,10 @@ struct TimelineClip {
 
     QString id;
     QString filePath;
+    QString proxyPath;
     QString label;
     ClipMediaType mediaType = ClipMediaType::Unknown;
+    MediaSourceKind sourceKind = MediaSourceKind::File;
     bool hasAudio = false;
     int64_t sourceDurationFrames = 0;
     int64_t sourceInFrame = 0;
@@ -53,6 +70,9 @@ struct TimelineClip {
     int64_t startSubframeSamples = 0;
     int64_t durationFrames = 90;
     int trackIndex = 0;
+    qreal playbackRate = 1.0;
+    bool videoEnabled = true;
+    bool audioEnabled = true;
     QColor color;
     qreal brightness = 0.0;
     qreal contrast = 1.0;
@@ -64,8 +84,10 @@ struct TimelineClip {
     qreal baseScaleX = 1.0;
     qreal baseScaleY = 1.0;
     QVector<TransformKeyframe> transformKeyframes;
+    QVector<GradingKeyframe> gradingKeyframes;
     TranscriptOverlaySettings transcriptOverlay;
     int fadeSamples = 250;  // Crossfade with previous audio clip (0 = no fade)
+    bool locked = false;    // When true, prevents temporal adjustments
 };
 
 struct TimelineTrack {
@@ -92,9 +114,12 @@ struct RenderSyncMarker {
 
 struct MediaProbeResult {
     ClipMediaType mediaType = ClipMediaType::Unknown;
+    MediaSourceKind sourceKind = MediaSourceKind::File;
     bool hasAudio = false;
     bool hasVideo = false;
+    bool hasAlpha = false;
     int64_t durationFrames = 120;
+    QString codecName;
 };
 
 struct TranscriptWord {
@@ -129,6 +154,9 @@ constexpr int64_t kAudioNudgeSamples = (kAudioSampleRate * 25) / 1000;
 QString clipMediaTypeToString(ClipMediaType type);
 ClipMediaType clipMediaTypeFromString(const QString& value);
 QString clipMediaTypeLabel(ClipMediaType type);
+QString mediaSourceKindToString(MediaSourceKind kind);
+MediaSourceKind mediaSourceKindFromString(const QString& value);
+QString mediaSourceKindLabel(MediaSourceKind kind);
 
 QString renderSyncActionToString(RenderSyncAction action);
 RenderSyncAction renderSyncActionFromString(const QString& value);
@@ -136,6 +164,8 @@ QString renderSyncActionLabel(RenderSyncAction action);
 
 bool clipHasVisuals(const TimelineClip& clip);
 bool clipIsAudioOnly(const TimelineClip& clip);
+bool clipVisualPlaybackEnabled(const TimelineClip& clip);
+bool clipAudioPlaybackEnabled(const TimelineClip& clip);
 
 int64_t frameToSamples(int64_t frame);
 qreal samplesToFramePosition(int64_t samples);
@@ -144,22 +174,38 @@ int64_t clipSourceInSamples(const TimelineClip& clip);
 void normalizeSubframeTiming(int64_t& frame, int64_t& subframeSamples);
 void normalizeClipTiming(TimelineClip& clip);
 
-QString transformInterpolationLabel(bool interpolated);
+QString transformInterpolationLabel(bool linearInterpolation);
 qreal sanitizeScaleValue(qreal value);
 void normalizeClipTransformKeyframes(TimelineClip& clip);
+void normalizeClipGradingKeyframes(TimelineClip& clip);
 TimelineClip::TransformKeyframe evaluateClipKeyframeOffsetAtFrame(const TimelineClip& clip, int64_t timelineFrame);
 TimelineClip::TransformKeyframe evaluateClipTransformAtFrame(const TimelineClip& clip, int64_t timelineFrame);
 TimelineClip::TransformKeyframe evaluateClipTransformAtPosition(const TimelineClip& clip, qreal timelineFramePosition);
+TimelineClip::GradingKeyframe evaluateClipGradingAtFrame(const TimelineClip& clip, int64_t timelineFrame);
+TimelineClip::GradingKeyframe evaluateClipGradingAtPosition(const TimelineClip& clip, qreal timelineFramePosition);
 int64_t adjustedClipLocalFrameAtTimelineFrame(const TimelineClip& clip,
                                               int64_t localTimelineFrame,
                                               const QVector<RenderSyncMarker>& markers);
 int64_t sourceFrameForClipAtTimelinePosition(const TimelineClip& clip,
                                              qreal timelineFramePosition,
                                              const QVector<RenderSyncMarker>& markers);
+int64_t sourceSampleForClipAtTimelineSample(const TimelineClip& clip,
+                                            int64_t timelineSample,
+                                            const QVector<RenderSyncMarker>& markers);
 
 MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames = 120);
 QImage applyClipGrade(const QImage& source, const TimelineClip& clip);
+QImage applyClipGrade(const QImage& source, const TimelineClip::GradingKeyframe& grade);
+QString playbackProxyPathForClip(const TimelineClip& clip);
+QString playbackMediaPathForClip(const TimelineClip& clip);
+QString interactivePreviewMediaPathForClip(const TimelineClip& clip);
+bool isImageSequencePath(const QString& path);
+QStringList imageSequenceFramePaths(const QString& path);
+QString imageSequenceDisplayLabel(const QString& path);
 QString transcriptPathForClipFile(const QString& filePath);
+QString transcriptEditablePathForClipFile(const QString& filePath);
+QString transcriptWorkingPathForClipFile(const QString& filePath);
+bool ensureEditableTranscriptForClipFile(const QString& filePath, QString* editablePathOut = nullptr);
 QVector<TranscriptSection> loadTranscriptSections(const QString& transcriptPath);
 QString wrappedTranscriptSectionText(const QString& text, int maxCharsPerLine, int maxLines);
 TranscriptOverlayLayout layoutTranscriptSection(const TranscriptSection& section,
