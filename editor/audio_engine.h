@@ -9,18 +9,17 @@
 #include <QSet>
 #include <QVector>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
 
 extern "C" {
-#ifdef EDITOR_HAS_ALSA
-#include <alsa/asoundlib.h>
-#endif
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
@@ -30,7 +29,54 @@ extern "C" {
 #include <libswresample/swresample.h>
 }
 
-#ifdef EDITOR_HAS_ALSA
+#include <RtAudio.h>
+
+// Lock-free SPSC ring buffer for int16 audio samples.
+// Single producer (mix thread) writes, single consumer (RtAudio callback) reads.
+struct AudioRingBuffer {
+    static constexpr size_t kCapacity = 32768; // power of 2
+
+    size_t available() const {
+        return m_writePos.load(std::memory_order_acquire) -
+               m_readPos.load(std::memory_order_relaxed);
+    }
+
+    size_t space() const { return kCapacity - available(); }
+
+    size_t write(const int16_t* data, size_t count) {
+        const size_t avail = space();
+        count = std::min(count, avail);
+        const size_t wp = m_writePos.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < count; ++i)
+            m_buffer[(wp + i) & (kCapacity - 1)] = data[i];
+        m_writePos.store(wp + count, std::memory_order_release);
+        return count;
+    }
+
+    size_t read(int16_t* data, size_t count) {
+        const size_t avail = available();
+        count = std::min(count, avail);
+        const size_t rp = m_readPos.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < count; ++i)
+            data[i] = m_buffer[(rp + i) & (kCapacity - 1)];
+        m_readPos.store(rp + count, std::memory_order_release);
+        return count;
+    }
+
+    void clear() {
+        // Set readPos = writePos so the consumer sees an empty buffer.
+        // This is safe even if the consumer is concurrently reading: it will
+        // see available() == 0 on the next call. Resetting both to 0 would
+        // race because the consumer could see writePos=0 with readPos still
+        // at the old value, computing a negative (wrapped) available count.
+        m_readPos.store(m_writePos.load(std::memory_order_acquire), std::memory_order_release);
+    }
+
+private:
+    std::array<int16_t, kCapacity> m_buffer{};
+    std::atomic<size_t> m_readPos{0};
+    std::atomic<size_t> m_writePos{0};
+};
 
 class AudioEngine {
 public:
@@ -47,10 +93,8 @@ public:
     }
 
     void setExportRanges(const QVector<ExportRangeSegment>& ranges) {
-        {
-            std::lock_guard<std::mutex> lock(m_exportRangesMutex);
-            m_exportRanges = ranges;
-        }
+        std::lock_guard<std::mutex> lock(m_exportRangesMutex);
+        m_exportRanges = ranges;
     }
 
     void setRenderSyncMarkers(const QVector<RenderSyncMarker>& markers) {
@@ -68,30 +112,37 @@ public:
             return true;
         }
 
-        int err = snd_pcm_open(&m_pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
-        if (err < 0) {
-            qWarning() << "Failed to open ALSA playback device:" << snd_strerror(err);
+        try {
+            m_rtaudio = std::make_unique<rt::audio::RtAudio>();
+        } catch (const std::exception& e) {
+            qWarning() << "RtAudio creation failed:" << e.what();
             return false;
         }
 
-        err = snd_pcm_set_params(m_pcm,
-                                 SND_PCM_FORMAT_S16_LE,
-                                 SND_PCM_ACCESS_RW_INTERLEAVED,
-                                 m_channelCount,
-                                 m_sampleRate,
-                                 1,
-                                 100000);
-        if (err < 0) {
-            qWarning() << "Failed to configure ALSA playback device:" << snd_strerror(err);
-            snd_pcm_close(m_pcm);
-            m_pcm = nullptr;
+        if (m_rtaudio->getDeviceCount() == 0) {
+            qWarning() << "No audio output devices found";
+            m_rtaudio.reset();
+            return false;
+        }
+
+        rt::audio::RtAudio::StreamParameters params;
+        params.deviceId = m_rtaudio->getDefaultOutputDevice();
+        params.nChannels = m_channelCount;
+
+        unsigned int bufferFrames = m_periodFrames;
+        auto err = m_rtaudio->openStream(
+            &params, nullptr,
+            rt::audio::RTAUDIO_SINT16, m_sampleRate, &bufferFrames,
+            &AudioEngine::rtAudioCallback, this);
+        if (err != rt::audio::RTAUDIO_NO_ERROR) {
+            qWarning() << "RtAudio openStream failed";
+            m_rtaudio.reset();
             return false;
         }
 
         m_running = true;
         m_decodeWorker = std::thread([this]() { decodeLoop(); });
         m_mixWorker = std::thread([this]() { mixLoop(); });
-        m_outputWorker = std::thread([this]() { outputLoop(); });
         m_initialized = true;
         return true;
     }
@@ -105,30 +156,25 @@ public:
             m_running = false;
             m_playing = false;
         }
-        {
-            std::lock_guard<std::mutex> queueLock(m_queueMutex);
-            m_pcmQueue.clear();
-        }
         m_stateCondition.notify_all();
         m_decodeCondition.notify_all();
-        m_queueCondition.notify_all();
+        m_mixCondition.notify_all();
         if (m_decodeWorker.joinable()) {
             m_decodeWorker.join();
         }
         if (m_mixWorker.joinable()) {
             m_mixWorker.join();
         }
-        if (m_outputWorker.joinable()) {
-            m_outputWorker.join();
-        }
-        {
-            std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
-            if (m_pcm) {
-                snd_pcm_drop(m_pcm);
-                snd_pcm_close(m_pcm);
-                m_pcm = nullptr;
+        if (m_rtaudio) {
+            if (m_rtaudio->isStreamRunning()) {
+                m_rtaudio->stopStream();
             }
+            if (m_rtaudio->isStreamOpen()) {
+                m_rtaudio->closeStream();
+            }
+            m_rtaudio.reset();
         }
+        m_ringBuffer.clear();
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_initialized = false;
     }
@@ -161,17 +207,17 @@ public:
             std::lock_guard<std::mutex> lock(m_stateMutex);
             m_timelineSampleCursor = timelineFrameToSamples(startFrame);
             m_audioClockSample.store(m_timelineSampleCursor, std::memory_order_release);
+            m_ringBufferEndSample.store(m_timelineSampleCursor, std::memory_order_release);
             m_playing = true;
             scheduleDecodesLocked(m_timelineClips);
         }
-        {
-            std::lock_guard<std::mutex> queueLock(m_queueMutex);
-            m_pcmQueue.clear();
-            m_pcmChunkEndSamples.clear();
-        }
+        m_ringBuffer.clear();
         m_stateCondition.notify_all();
         m_decodeCondition.notify_one();
-        m_queueCondition.notify_all();
+        m_mixCondition.notify_all();
+        if (m_rtaudio && !m_rtaudio->isStreamRunning()) {
+            m_rtaudio->startStream();
+        }
     }
 
     void stop() {
@@ -179,41 +225,24 @@ public:
             std::lock_guard<std::mutex> lock(m_stateMutex);
             m_playing = false;
         }
-        {
-            std::lock_guard<std::mutex> queueLock(m_queueMutex);
-            m_pcmQueue.clear();
-            m_pcmChunkEndSamples.clear();
+        if (m_rtaudio && m_rtaudio->isStreamRunning()) {
+            m_rtaudio->stopStream();
         }
-        {
-            std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
-            if (m_pcm) {
-                snd_pcm_drop(m_pcm);
-                snd_pcm_prepare(m_pcm);
-            }
-        }
-        m_queueCondition.notify_all();
+        m_ringBuffer.clear();
+        m_mixCondition.notify_all();
     }
 
     void seek(int64_t frame) {
         {
             std::lock_guard<std::mutex> lock(m_stateMutex);
-            m_timelineSampleCursor = timelineFrameToSamples(frame);
-            m_audioClockSample.store(m_timelineSampleCursor, std::memory_order_release);
+            const int64_t sample = timelineFrameToSamples(frame);
+            m_timelineSampleCursor = sample;
+            m_audioClockSample.store(sample, std::memory_order_release);
+            m_ringBufferEndSample.store(sample, std::memory_order_release);
         }
-        {
-            std::lock_guard<std::mutex> queueLock(m_queueMutex);
-            m_pcmQueue.clear();
-            m_pcmChunkEndSamples.clear();
-        }
-        {
-            std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
-            if (m_pcm) {
-                snd_pcm_drop(m_pcm);
-                snd_pcm_prepare(m_pcm);
-            }
-        }
+        m_ringBuffer.clear();
         m_stateCondition.notify_all();
-        m_queueCondition.notify_all();
+        m_mixCondition.notify_all();
     }
 
     bool hasPlayableAudio() const {
@@ -227,15 +256,12 @@ public:
     }
 
     int64_t currentSample() const {
-        const int64_t submittedSample = m_audioClockSample.load(std::memory_order_acquire);
-        snd_pcm_sframes_t delayFrames = 0;
-        {
-            std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
-            if (!m_pcm || snd_pcm_delay(m_pcm, &delayFrames) < 0) {
-                return qMax<int64_t>(0, submittedSample);
-            }
+        const int64_t submitted = m_audioClockSample.load(std::memory_order_acquire);
+        long latencyFrames = 0;
+        if (m_rtaudio && m_rtaudio->isStreamOpen()) {
+            latencyFrames = m_rtaudio->getStreamLatency();
         }
-        return qMax<int64_t>(0, submittedSample - qMax<int64_t>(0, static_cast<int64_t>(delayFrames)));
+        return qMax<int64_t>(0, submitted - qMax<long>(0, latencyFrames));
     }
 
     int64_t currentFrame() const {
@@ -258,12 +284,43 @@ private:
         qreal volume = 0.8;
     };
 
+    // --- RtAudio callback (called from OS audio thread) ---
+
+    static int rtAudioCallback(void* outputBuffer, void* /*inputBuffer*/,
+                               unsigned int nFrames, double /*streamTime*/,
+                               rt::audio::RtAudioStreamStatus /*status*/, void* userData) {
+        auto* engine = static_cast<AudioEngine*>(userData);
+        auto* out = static_cast<int16_t*>(outputBuffer);
+        const size_t samplesNeeded = static_cast<size_t>(nFrames) * engine->m_channelCount;
+        const size_t read = engine->m_ringBuffer.read(out, samplesNeeded);
+
+        if (read > 0) {
+            engine->m_audioClockSample.store(
+                engine->m_ringBufferEndSample.load(std::memory_order_acquire),
+                std::memory_order_release);
+        }
+        // Fill remainder with silence on underrun
+        if (read < samplesNeeded) {
+            std::memset(out + read, 0, (samplesNeeded - read) * sizeof(int16_t));
+            engine->m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        // Signal mix thread that buffer was consumed. Use an atomic flag
+        // instead of condition_variable::notify_one() because this runs on
+        // the OS realtime audio thread — notify_one can acquire an internal
+        // mutex on some implementations, causing priority inversion.
+        engine->m_bufferConsumed.store(true, std::memory_order_release);
+        return 0;
+    }
+
+    // --- Sample math ---
+
     int64_t timelineFrameToSamples(int64_t frame) const {
         return frameToSamples(frame);
     }
 
     int64_t samplesToTimelineFrame(int64_t samples) const {
-        return qMax<int64_t>(0, static_cast<int64_t>(std::floor((static_cast<double>(samples) * kTimelineFps) / m_sampleRate)));
+        return qMax<int64_t>(0, static_cast<int64_t>(
+            std::floor((static_cast<double>(samples) * kTimelineFps) / m_sampleRate)));
     }
 
     int64_t nextPlayableSampleAtOrAfter(int64_t samplePos,
@@ -284,6 +341,8 @@ private:
         return qMax<int64_t>(0, samplePos);
     }
 
+    // --- Decode scheduling ---
+
     void scheduleDecodesLocked(const QVector<TimelineClip>& clips) {
         for (const TimelineClip& clip : clips) {
             if (!clipAudioPlaybackEnabled(clip) || clip.filePath.isEmpty()) {
@@ -297,8 +356,8 @@ private:
         }
     }
 
-    // Calculate fade gain for a sample position considering export ranges.
-    // Uses sample distance from range boundaries for stable fades.
+    // --- Gain calculations ---
+
     float calculateRangeFadeGain(int64_t samplePos, const QVector<ExportRangeSegment>& ranges,
                                  int fadeSamples) const {
         if (ranges.isEmpty() || fadeSamples <= 0) {
@@ -336,7 +395,6 @@ private:
         return qBound(0.0f, gain, 1.0f);
     }
 
-    // Calculate fade gain for clip-to-clip crossfade
     float calculateClipCrossfadeGain(int64_t samplePos, const TimelineClip& clip,
                                       int64_t clipStartSample, int64_t clipEndSample,
                                       int fadeSamples) const {
@@ -345,21 +403,18 @@ private:
         }
 
         float gain = 1.0f;
-
-        // Fade in at clip start
         const int64_t samplesFromStart = samplePos - clipStartSample;
         if (samplesFromStart >= 0 && samplesFromStart < fadeSamples) {
             gain *= static_cast<float>(samplesFromStart) / static_cast<float>(fadeSamples);
         }
-
-        // Fade out at clip end
         const int64_t samplesToEnd = clipEndSample - samplePos;
         if (samplesToEnd >= 0 && samplesToEnd < fadeSamples) {
             gain *= static_cast<float>(samplesToEnd) / static_cast<float>(fadeSamples);
         }
-
         return qBound(0.0f, gain, 1.0f);
     }
+
+    // --- FFmpeg full-file decode ---
 
     AudioClipCacheEntry decodeClipAudio(const QString& path) {
         AudioClipCacheEntry cache;
@@ -505,6 +560,8 @@ private:
         return m_exportRanges;
     }
 
+    // --- Mix engine ---
+
     void mixChunk(const MixContext& context, float* output, int frames, int64_t chunkStartSample) {
         std::fill(output, output + frames * m_channelCount, 0.0f);
 
@@ -523,8 +580,8 @@ private:
             if (clipAvailableSamples <= 0) {
                 continue;
             }
-            const int64_t clipEndSample = clipStartSample + qMin<int64_t>(clip.durationFrames * m_sampleRate / kTimelineFps,
-                                                                           clipAvailableSamples);
+            const int64_t clipEndSample = clipStartSample + qMin<int64_t>(
+                clip.durationFrames * m_sampleRate / kTimelineFps, clipAvailableSamples);
             const int64_t chunkEndSample = chunkStartSample + frames;
             if (chunkEndSample <= clipStartSample || chunkStartSample >= clipEndSample) {
                 continue;
@@ -532,7 +589,7 @@ private:
 
             const int64_t mixStart = qMax<int64_t>(chunkStartSample, clipStartSample);
             const int64_t mixEnd = qMin<int64_t>(chunkEndSample, clipEndSample);
-            
+
             for (int64_t samplePos = mixStart; samplePos < mixEnd; ++samplePos) {
                 const int outFrame = static_cast<int>(samplePos - chunkStartSample);
                 const int64_t inFrame =
@@ -542,21 +599,15 @@ private:
                 }
                 const int outIndex = outFrame * m_channelCount;
                 const int inIndex = static_cast<int>(inFrame * m_channelCount);
-                
-                // Calculate crossfade gain for this sample
+
                 float gain = 1.0f;
-                
-                // Apply speech filter range fade (if export ranges are set)
                 if (!context.exportRanges.isEmpty()) {
-                    gain *= calculateRangeFadeGain(samplePos,
-                                                   context.exportRanges,
-                                                   m_speechFilterFadeSamples.load(std::memory_order_acquire));
+                    gain *= calculateRangeFadeGain(samplePos, context.exportRanges,
+                        m_speechFilterFadeSamples.load(std::memory_order_acquire));
                 }
-                
-                // Apply clip crossfade at clip boundaries
-                gain *= calculateClipCrossfadeGain(samplePos, clip, clipStartSample, clipEndSample, 
-                                                    clip.fadeSamples > 0 ? clip.fadeSamples : m_defaultFadeSamples);
-                
+                gain *= calculateClipCrossfadeGain(samplePos, clip, clipStartSample, clipEndSample,
+                    clip.fadeSamples > 0 ? clip.fadeSamples : m_defaultFadeSamples);
+
                 output[outIndex] += audio.samples[inIndex] * gain;
                 output[outIndex + 1] += audio.samples[inIndex + 1] * gain;
             }
@@ -567,6 +618,8 @@ private:
             output[i] = qBound(-1.0f, output[i] * masterGain, 1.0f);
         }
     }
+
+    // --- Worker threads ---
 
     void decodeLoop() {
         while (true) {
@@ -599,8 +652,7 @@ private:
         QVector<int16_t> pcmBuffer(m_periodFrames * m_channelCount);
 
         while (true) {
-            MixContext context;
-            int64_t chunkStartSample = 0;
+            // Wait until playing
             {
                 std::unique_lock<std::mutex> lock(m_stateMutex);
                 m_stateCondition.wait(lock, [this]() {
@@ -609,13 +661,14 @@ private:
                 if (!m_running) {
                     break;
                 }
-                lock.unlock();
             }
 
+            // Wait until ring buffer needs more data
             {
-                std::unique_lock<std::mutex> queueLock(m_queueMutex);
-                m_queueCondition.wait(queueLock, [this]() {
-                    return !m_running || !m_playing || queuedFramesLocked() <= m_mixLowWaterFrames;
+                std::unique_lock<std::mutex> lock(m_mixMutex);
+                m_mixCondition.wait(lock, [this]() {
+                    return !m_running || !m_playing ||
+                           m_ringBuffer.available() < static_cast<size_t>(m_mixLowWaterSamples);
                 });
                 if (!m_running) {
                     break;
@@ -625,6 +678,8 @@ private:
                 }
             }
 
+            MixContext context;
+            int64_t chunkStartSample = 0;
             {
                 std::lock_guard<std::mutex> lock(m_stateMutex);
                 if (!m_playing) {
@@ -645,174 +700,47 @@ private:
                 pcmBuffer[i] = static_cast<int16_t>(mixBuffer[i] * 32767.0f);
             }
 
-            {
-                std::lock_guard<std::mutex> queueLock(m_queueMutex);
-                if (m_pcmQueue.size() + static_cast<size_t>(pcmBuffer.size()) <= m_maxQueuedSamples) {
-                    for (int16_t sample : pcmBuffer) {
-                        m_pcmQueue.push_back(sample);
-                    }
-                    m_pcmChunkEndSamples.push_back(chunkStartSample + m_periodFrames);
-                }
-            }
-            m_queueCondition.notify_all();
+            m_ringBuffer.write(pcmBuffer.constData(), static_cast<size_t>(pcmBuffer.size()));
+            m_ringBufferEndSample.store(chunkStartSample + m_periodFrames, std::memory_order_release);
         }
     }
 
-    int queuedFramesLocked() const {
-        return static_cast<int>(m_pcmQueue.size() / m_channelCount);
-    }
-
-    void outputLoop() {
-        QVector<int16_t> pcmBuffer(m_periodFrames * m_channelCount);
-        QVector<int16_t> silenceBuffer(m_periodFrames * m_channelCount, 0);
-
-        while (true) {
-            bool playing = false;
-            {
-                std::lock_guard<std::mutex> lock(m_stateMutex);
-                if (!m_running) {
-                    break;
-                }
-                playing = m_playing;
-            }
-
-            if (!playing) {
-                std::unique_lock<std::mutex> lock(m_stateMutex);
-                m_stateCondition.wait(lock, [this]() { return !m_running || m_playing; });
-                if (!m_running) {
-                    break;
-                }
-                continue;
-            }
-
-            bool hadAudio = false;
-            int64_t consumedChunkEndSample = -1;
-            {
-                std::unique_lock<std::mutex> queueLock(m_queueMutex);
-                if (m_pcmQueue.size() < pcmBuffer.size()) {
-                    m_queueCondition.wait_for(queueLock, std::chrono::milliseconds(10), [this, &pcmBuffer]() {
-                        return !m_running || !m_playing || m_pcmQueue.size() >= pcmBuffer.size();
-                    });
-                }
-                if (!m_running) {
-                    break;
-                }
-                if (m_pcmQueue.size() >= pcmBuffer.size()) {
-                    for (int i = 0; i < pcmBuffer.size(); ++i) {
-                        pcmBuffer[i] = m_pcmQueue.front();
-                        m_pcmQueue.pop_front();
-                    }
-                    if (!m_pcmChunkEndSamples.empty()) {
-                        consumedChunkEndSample = m_pcmChunkEndSamples.front();
-                        m_pcmChunkEndSamples.pop_front();
-                    }
-                    hadAudio = true;
-                }
-            }
-
-            const int16_t* writePtr = hadAudio ? pcmBuffer.constData() : silenceBuffer.constData();
-            int framesRemaining = m_periodFrames;
-            while (framesRemaining > 0 && m_running) {
-                snd_pcm_sframes_t written = 0;
-                {
-                    std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
-                    written = snd_pcm_writei(m_pcm, writePtr, framesRemaining);
-                }
-                if (written == -EPIPE) {
-                    m_underrunCount.fetch_add(1, std::memory_order_relaxed);
-                    std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
-                    snd_pcm_prepare(m_pcm);
-                    continue;
-                }
-                if (written < 0) {
-                    int recovered = 0;
-                    {
-                        std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
-                        recovered = snd_pcm_recover(m_pcm, static_cast<int>(written), 1);
-                    }
-                    if (recovered < 0) {
-                        m_underrunCount.fetch_add(1, std::memory_order_relaxed);
-                        std::lock_guard<std::mutex> pcmLock(m_pcmMutex);
-                        snd_pcm_prepare(m_pcm);
-                    }
-                    continue;
-                }
-                framesRemaining -= static_cast<int>(written);
-                writePtr += written * m_channelCount;
-            }
-
-            if (!hadAudio) {
-                m_underrunCount.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                if (consumedChunkEndSample >= 0) {
-                    m_audioClockSample.store(consumedChunkEndSample, std::memory_order_release);
-                } else {
-                    m_audioClockSample.fetch_add(m_periodFrames, std::memory_order_release);
-                }
-            }
-            m_queueCondition.notify_all();
-        }
-    }
+    // --- Member variables ---
 
     mutable std::mutex m_stateMutex;
-    mutable std::mutex m_queueMutex;
     mutable std::mutex m_exportRangesMutex;
+    std::mutex m_mixMutex;
     std::condition_variable m_stateCondition;
     std::condition_variable m_decodeCondition;
-    std::condition_variable m_queueCondition;
+    std::condition_variable m_mixCondition;
+
     QVector<TimelineClip> m_timelineClips;
     QVector<RenderSyncMarker> m_renderSyncMarkers;
     QVector<ExportRangeSegment> m_exportRanges;
     QHash<QString, AudioClipCacheEntry> m_audioCache;
     std::deque<QString> m_pendingDecodePaths;
     QSet<QString> m_pendingDecodeSet;
-    std::deque<int16_t> m_pcmQueue;
-    std::deque<int64_t> m_pcmChunkEndSamples;
+
     std::thread m_decodeWorker;
     std::thread m_mixWorker;
-    std::thread m_outputWorker;
-    snd_pcm_t* m_pcm = nullptr;
-    mutable std::mutex m_pcmMutex;
+
+    std::unique_ptr<rt::audio::RtAudio> m_rtaudio;
+    AudioRingBuffer m_ringBuffer;
+    std::atomic<int64_t> m_ringBufferEndSample{0};
+
     bool m_initialized = false;
-    bool m_running = false;
-    bool m_playing = false;
+    std::atomic<bool> m_running{false};
+    std::atomic<bool> m_playing{false};
     bool m_muted = false;
     qreal m_volume = 0.8;
     int64_t m_timelineSampleCursor = 0;
     std::atomic<int64_t> m_audioClockSample{0};
     std::atomic<int> m_underrunCount{0};
+
     static constexpr int m_sampleRate = 48000;
     static constexpr int m_channelCount = 2;
     static constexpr int m_periodFrames = 1024;
-    static constexpr int m_mixLowWaterFrames = 2048;
-    static constexpr int m_maxQueuedFrames = 8192;
-    static constexpr size_t m_maxQueuedSamples = static_cast<size_t>(m_maxQueuedFrames * m_channelCount);
-    static constexpr int m_defaultFadeSamples = 250;  // Default fade duration for speech filter boundaries
+    static constexpr int m_mixLowWaterSamples = 2048 * 2; // samples (frames * channels)
+    static constexpr int m_defaultFadeSamples = 250;
     std::atomic<int> m_speechFilterFadeSamples{m_defaultFadeSamples};
 };
-
-#else // !EDITOR_HAS_ALSA
-
-// Stub AudioEngine for platforms without ALSA (macOS, Windows).
-// Preserves the full public API so all call sites compile unchanged.
-class AudioEngine {
-public:
-    AudioEngine() = default;
-    ~AudioEngine() { shutdown(); }
-
-    void setTimelineClips(const QVector<TimelineClip>&) {}
-    bool initialize() { return false; }
-    void shutdown() {}
-    void setMuted(bool) {}
-    void setVolume(qreal) {}
-    bool muted() const { return false; }
-    int volumePercent() const { return 0; }
-    void start(int64_t) {}
-    void stop() {}
-    void seek(int64_t) {}
-    bool hasPlayableAudio() const { return false; }
-    int64_t currentSample() const { return 0; }
-    int64_t currentFrame() const { return 0; }
-};
-
-#endif // EDITOR_HAS_ALSA

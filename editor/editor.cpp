@@ -56,6 +56,10 @@ EditorWindow::EditorWindow(quint16 controlPort)
     auto *splitter = new QSplitter(Qt::Horizontal, central);
     splitter->setObjectName(QStringLiteral("layout.main_splitter"));
     splitter->setChildrenCollapsible(false);
+    splitter->setHandleWidth(6);
+    splitter->setStyleSheet(QStringLiteral(
+        "QSplitter::handle { background: #1e2a36; }"
+        "QSplitter::handle:hover { background: #3a5068; }"));
     rootLayout->addWidget(splitter);
 
     qDebug() << "[STARTUP] Building explorer pane...";
@@ -200,6 +204,21 @@ EditorWindow::EditorWindow(quint16 controlPort)
         if (m_timeline && m_timeline->splitSelectedClipAtFrame(m_timeline->currentFrame())) {
             m_inspectorPane->refresh();
         }
+    });
+    auto *razorShortcut = new QShortcut(QKeySequence(QStringLiteral("B")), this);
+    connect(razorShortcut, &QShortcut::activated, this, [this]() {
+        if (shouldBlockGlobalEditorShortcuts()) return;
+        if (!m_timeline) return;
+        m_timeline->setToolMode(
+            m_timeline->toolMode() == TimelineWidget::ToolMode::Razor
+                ? TimelineWidget::ToolMode::Select
+                : TimelineWidget::ToolMode::Razor);
+    });
+    auto *escRazorShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), this);
+    connect(escRazorShortcut, &QShortcut::activated, this, [this]() {
+        if (shouldBlockGlobalEditorShortcuts()) return;
+        if (m_timeline && m_timeline->toolMode() != TimelineWidget::ToolMode::Select)
+            m_timeline->setToolMode(TimelineWidget::ToolMode::Select);
     });
     auto *deleteShortcut = new QShortcut(QKeySequence::Delete, this);
     connect(deleteShortcut, &QShortcut::activated, this, [this]() {
@@ -434,6 +453,25 @@ EditorWindow::EditorWindow(quint16 controlPort)
             [this]() { pushHistorySnapshot(); }});
     m_outputTab->wire();
 
+    // Background color picker
+    connect(m_inspectorPane->backgroundColorButton(), &QPushButton::clicked, this, [this]() {
+        const QColor chosen = QColorDialog::getColor(m_backgroundColor, this,
+            QStringLiteral("Background Color"));
+        if (chosen.isValid()) {
+            m_backgroundColor = chosen;
+            auto *btn = m_inspectorPane->backgroundColorButton();
+            btn->setText(chosen.name());
+            btn->setStyleSheet(
+                QStringLiteral("QPushButton { background: %1; color: %2; "
+                    "border: 1px solid #2e3b4a; border-radius: 4px; padding: 4px 8px; }")
+                    .arg(chosen.name(),
+                         chosen.lightness() > 128 ? QStringLiteral("#000000")
+                                                   : QStringLiteral("#ffffff")));
+            m_preview->setBackgroundColor(m_backgroundColor);
+            scheduleSaveState();
+        }
+    });
+
     m_profileTab = std::make_unique<ProfileTab>(
         ProfileTab::Widgets{m_profileSummaryTable, m_profileBenchmarkButton},
         ProfileTab::Dependencies{
@@ -499,6 +537,44 @@ EditorWindow::EditorWindow(quint16 controlPort)
             {}});
     m_gradingTab->wire();
 
+    m_titlesTab = std::make_unique<TitlesTab>(
+        TitlesTab::Widgets{
+            m_inspectorPane->titlesInspectorClipLabel(),
+            m_inspectorPane->titlesInspectorDetailsLabel(),
+            m_inspectorPane->titleKeyframeTable(),
+            m_inspectorPane->titleTextEdit(),
+            m_inspectorPane->titleXSpin(),
+            m_inspectorPane->titleYSpin(),
+            m_inspectorPane->titleFontSizeSpin(),
+            m_inspectorPane->titleOpacitySpin(),
+            m_inspectorPane->titleFontCombo(),
+            m_inspectorPane->titleBoldCheck(),
+            m_inspectorPane->titleItalicCheck(),
+            m_inspectorPane->titleAutoScrollCheck(),
+            m_inspectorPane->addTitleKeyframeButton(),
+            m_inspectorPane->removeTitleKeyframeButton(),
+            m_inspectorPane->titleCenterHorizontalButton(),
+            m_inspectorPane->titleCenterVerticalButton()},
+        TitlesTab::Dependencies{
+            [this]() { return m_timeline ? m_timeline->selectedClip() : nullptr; },
+            [this]() { return m_timeline ? m_timeline->selectedClip() : nullptr; },
+            [this](const QString& id, const std::function<void(TimelineClip&)>& updater) {
+                return m_timeline->updateClipById(id, updater);
+            },
+            [this](const TimelineClip& clip) { return clip.filePath; },
+            [this](const TimelineClip& clip) { return clipHasVisuals(clip); },
+            [this]() { scheduleSaveState(); },
+            [this]() { pushHistorySnapshot(); },
+            [this]() { m_inspectorPane->refresh(); },
+            [this]() { m_preview->setTimelineClips(m_timeline->clips()); },
+            [this]() -> int64_t { return m_timeline ? m_timeline->currentFrame() : 0; },
+            [this]() -> int64_t { return m_timeline && m_timeline->selectedClip() ? m_timeline->selectedClip()->startFrame : 0; },
+            [this]() -> QString { return m_timeline ? m_timeline->selectedClipId() : QString(); },
+            [this](int64_t frame) { setCurrentFrame(frame); },
+            {},
+            {}});
+    m_titlesTab->wire();
+
     m_videoKeyframeTab = std::make_unique<VideoKeyframeTab>(
         VideoKeyframeTab::Widgets{
             m_keyframesInspectorClipLabel, m_keyframesInspectorDetailsLabel,
@@ -531,6 +607,7 @@ EditorWindow::EditorWindow(quint16 controlPort)
     // Connect inspector pane refresh to tabs
     connect(m_inspectorPane, &InspectorPane::refreshRequested, this, [this]() {
         m_gradingTab->refresh();
+        m_titlesTab->refresh();
         refreshSyncInspector();
         m_transcriptTab->refresh();
         refreshClipInspector();
@@ -705,12 +782,17 @@ void EditorWindow::openTranscriptionWindow(const QString &filePath, const QStrin
     dialog->show();
 }
 
-QString EditorWindow::defaultProxyOutputPath(const TimelineClip &clip, const MediaProbeResult *knownProbe) const
+QString EditorWindow::defaultProxyOutputPath(const TimelineClip &clip, const MediaProbeResult *knownProbe,
+                                              ProxyFormat format) const
 {
     const QFileInfo sourceInfo(clip.filePath);
-    MediaProbeResult fallbackProbe;
-    const MediaProbeResult &probe = knownProbe ? *knownProbe : fallbackProbe;
-    const QString suffix = QStringLiteral("mov");
+    if (format == ProxyFormat::ImageSequence) {
+        // Image sequence proxy: a directory named <basename>.proxy/ containing JPEG frames
+        return sourceInfo.dir().absoluteFilePath(
+            QStringLiteral("%1.proxy").arg(sourceInfo.completeBaseName()));
+    }
+    const QString suffix = (format == ProxyFormat::H264) ? QStringLiteral("mp4")
+                                                         : QStringLiteral("mov");
     return sourceInfo.dir().absoluteFilePath(
         QStringLiteral("%1.proxy.%2").arg(sourceInfo.completeBaseName(), suffix));
 }
@@ -777,7 +859,7 @@ void EditorWindow::createProxyForClip(const QString &clipId)
     const QString probePath = imageSequenceProxy ? sequenceFrames.constFirst() : clip->filePath;
     const MediaProbeResult sourceProbe = probeMediaFile(probePath, clip->durationFrames);
     const QString existingProxyPath = playbackProxyPathForClip(*clip);
-    const QString outputPath = defaultProxyOutputPath(*clip, &sourceProbe);
+    const QString outputPath = defaultProxyOutputPath(*clip, &sourceProbe, ProxyFormat::ImageSequence);
     const QString overwriteTarget = !existingProxyPath.isEmpty() ? existingProxyPath : outputPath;
     
     if (QFileInfo::exists(overwriteTarget))
@@ -804,6 +886,20 @@ void EditorWindow::createProxyForClip(const QString &clipId)
     auto *title = new QLabel(QStringLiteral("ffmpeg proxy for %1").arg(QDir::toNativeSeparators(clip->filePath)), dialog);
     title->setWordWrap(true);
     layout->addWidget(title);
+
+    auto *formatRow = new QHBoxLayout;
+    formatRow->setContentsMargins(0, 0, 0, 0);
+    formatRow->addWidget(new QLabel(QStringLiteral("Format:"), dialog));
+    auto *formatCombo = new QComboBox(dialog);
+    formatCombo->addItem(QStringLiteral("Image Sequence (JPEG)"), static_cast<int>(ProxyFormat::ImageSequence));
+    formatCombo->addItem(QStringLiteral("H.264 (MP4)"), static_cast<int>(ProxyFormat::H264));
+#ifndef __APPLE__
+    formatCombo->addItem(QStringLiteral("Motion JPEG (MOV)"), static_cast<int>(ProxyFormat::MJPEG));
+#endif
+    formatCombo->setCurrentIndex(0);
+    formatRow->addWidget(formatCombo);
+    formatRow->addStretch(1);
+    layout->addLayout(formatRow);
 
     auto *output = new QPlainTextEdit(dialog);
     output->setReadOnly(true);
@@ -868,30 +964,72 @@ void EditorWindow::createProxyForClip(const QString &clipId)
     }
     else
     {
+        const auto selectedFormat = static_cast<ProxyFormat>(
+            formatCombo->currentData().toInt());
+
         arguments << QStringLiteral("-i") << QFileInfo(clip->filePath).absoluteFilePath()
-                  << QStringLiteral("-map") << QStringLiteral("0:v:0")
-                  << QStringLiteral("-map") << QStringLiteral("0:a?");
+                  << QStringLiteral("-map") << QStringLiteral("0:v:0");
+
+        // Image sequences are video-only — no audio stream mapping.
+        // For video containers, map the first audio stream.
+        if (selectedFormat != ProxyFormat::ImageSequence) {
+#ifdef __APPLE__
+            arguments << QStringLiteral("-map") << QStringLiteral("0:a:0?");
+#else
+            arguments << QStringLiteral("-map") << QStringLiteral("0:a?");
+#endif
+        }
+#ifdef __APPLE__
+        arguments << QStringLiteral("-ignore_unknown");
+#endif
     }
-    
+
+    const auto proxyFormat = static_cast<ProxyFormat>(
+        formatCombo->currentData().toInt());
+    const QString finalOutputPath = defaultProxyOutputPath(*clip, &sourceProbe, proxyFormat);
+
     const bool alphaProxy = sourceProbe.hasAlpha;
-    if (alphaProxy)
+    if (proxyFormat == ProxyFormat::ImageSequence)
     {
-        arguments << QStringLiteral("-c:v") << QStringLiteral("png")
-                  << QStringLiteral("-pix_fmt") << QStringLiteral("rgba");
+        // Image sequence proxy: extract frames as numbered JPEG files into a directory.
+        // The directory serves as an image-sequence clip in the editor.
+        const QDir outDir(finalOutputPath);
+        if (!outDir.exists()) {
+            QDir().mkpath(finalOutputPath);
+        }
+        arguments << QStringLiteral("-vf") << QStringLiteral("scale='min(1280,iw)':-2");
+        if (alphaProxy) {
+            arguments << QStringLiteral("-pix_fmt") << QStringLiteral("rgba")
+                      << QStringLiteral("%1/frame_%06d.png").arg(QDir(finalOutputPath).absolutePath());
+        } else {
+            arguments << QStringLiteral("-q:v") << QStringLiteral("3")
+                      << QStringLiteral("%1/frame_%06d.jpg").arg(QDir(finalOutputPath).absolutePath());
+        }
     }
     else
     {
-        arguments << QStringLiteral("-vf") << QStringLiteral("scale='min(1280,iw)':-2")
-                  << QStringLiteral("-c:v") << QStringLiteral("mjpeg")
-                  << QStringLiteral("-q:v") << QStringLiteral("3")
-                  << QStringLiteral("-pix_fmt") << QStringLiteral("yuvj420p");
+        if (alphaProxy) {
+            arguments << QStringLiteral("-c:v") << QStringLiteral("png")
+                      << QStringLiteral("-pix_fmt") << QStringLiteral("rgba");
+        } else if (proxyFormat == ProxyFormat::H264) {
+            arguments << QStringLiteral("-vf") << QStringLiteral("scale='min(1280,iw)':-2")
+                      << QStringLiteral("-c:v") << QStringLiteral("libx264")
+                      << QStringLiteral("-crf") << QStringLiteral("18")
+                      << QStringLiteral("-preset") << QStringLiteral("ultrafast")
+                      << QStringLiteral("-pix_fmt") << QStringLiteral("yuv420p");
+        } else {
+            // MJPEG
+            arguments << QStringLiteral("-vf") << QStringLiteral("scale='min(1280,iw)':-2")
+                      << QStringLiteral("-c:v") << QStringLiteral("mjpeg")
+                      << QStringLiteral("-q:v") << QStringLiteral("3")
+                      << QStringLiteral("-pix_fmt") << QStringLiteral("yuvj420p");
+        }
+        if (!imageSequenceProxy) {
+            arguments << QStringLiteral("-c:a") << QStringLiteral("pcm_s16le")
+                      << QStringLiteral("-b:a") << QStringLiteral("1536k");
+        }
+        arguments << QFileInfo(finalOutputPath).absoluteFilePath();
     }
-    if (!imageSequenceProxy)
-    {
-        arguments << QStringLiteral("-c:a") << QStringLiteral("pcm_s16le")
-                  << QStringLiteral("-b:a") << QStringLiteral("1536k");
-    }
-    arguments << QFileInfo(outputPath).absoluteFilePath();
 
     const auto appendOutput = [output, autoScrollBox](const QString &text)
     {
@@ -911,7 +1049,7 @@ void EditorWindow::createProxyForClip(const QString &clipId)
     connect(process, &QProcess::errorOccurred, dialog, [appendOutput](QProcess::ProcessError error)
             { appendOutput(QStringLiteral("\n[process error] %1\n").arg(static_cast<int>(error))); });
     connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), dialog,
-            [this, clipId, outputPath, existingProxyPath, appendOutput, sequenceListPath = sequenceListFile ? sequenceListFile->fileName() : QString()](int exitCode, QProcess::ExitStatus exitStatus)
+            [this, clipId, outputPath = finalOutputPath, existingProxyPath, appendOutput, sequenceListPath = sequenceListFile ? sequenceListFile->fileName() : QString()](int exitCode, QProcess::ExitStatus exitStatus)
             {
                 appendOutput(QStringLiteral("\n[process finished] exitCode=%1 status=%2\n")
                                  .arg(exitCode)
@@ -1035,6 +1173,11 @@ QWidget *EditorWindow::buildEditorPane()
         if (m_audioEngine) m_audioEngine->setVolume(value / 100.0);
         m_inspectorPane->refresh();
     });
+    connect(pane->razorButton(), &QToolButton::toggled, this, [this](bool checked) {
+        if (m_timeline)
+            m_timeline->setToolMode(checked ? TimelineWidget::ToolMode::Razor
+                                            : TimelineWidget::ToolMode::Select);
+    });
 
     m_timeline->seekRequested = [this](int64_t frame) { setCurrentFrame(frame); };
     m_timeline->clipsChanged = [this]() {
@@ -1065,6 +1208,7 @@ QWidget *EditorWindow::buildEditorPane()
         m_outputTab->refresh();
         m_profileTab->refresh();
         m_gradingTab->refresh();
+        m_titlesTab->refresh();
         m_videoKeyframeTab->refresh();
         m_inspectorPane->refresh();
     };
@@ -1096,6 +1240,45 @@ QWidget *EditorWindow::buildEditorPane()
     };
     m_timeline->deleteProxyRequested = [this](const QString &clipId) {
         deleteProxyForClip(clipId);
+    };
+    m_timeline->scaleToFillRequested = [this](const QString &clipId) {
+        if (!m_timeline) return;
+        const TimelineClip *clip = nullptr;
+        for (const TimelineClip &c : m_timeline->clips()) {
+            if (c.id == clipId) { clip = &c; break; }
+        }
+        if (!clip || !clipHasVisuals(*clip)) return;
+
+        // Probe the source media to get its resolution
+        const QString mediaPath = playbackMediaPathForClip(*clip);
+        const MediaProbeResult probe = probeMediaFile(mediaPath, clip->durationFrames);
+        if (!probe.hasVideo || probe.frameSize.isEmpty()) return;
+
+        const QSize outputSize = m_preview->outputSize();
+        if (outputSize.isEmpty()) return;
+
+        // Calculate the scale that makes the frame fill the output canvas.
+        // fitRect uses KeepAspectRatio (fit inside). We want KeepAspectRatioByExpanding (fill).
+        // fillScale = max(outW/srcW, outH/srcH) / min(outW/srcW, outH/srcH)
+        const qreal fitScaleX = static_cast<qreal>(outputSize.width()) / probe.frameSize.width();
+        const qreal fitScaleY = static_cast<qreal>(outputSize.height()) / probe.frameSize.height();
+        const qreal fillScale = qMax(fitScaleX, fitScaleY) / qMin(fitScaleX, fitScaleY);
+
+        m_timeline->updateClipById(clipId, [fillScale](TimelineClip &c) {
+            c.baseScaleX = fillScale;
+            c.baseScaleY = fillScale;
+            c.baseTranslationX = 0.0;
+            c.baseTranslationY = 0.0;
+            normalizeClipTransformKeyframes(c);
+        });
+        m_preview->setTimelineClips(m_timeline->clips());
+        m_inspectorPane->refresh();
+        scheduleSaveState();
+        pushHistorySnapshot();
+    };
+    m_timeline->toolModeChanged = [this]() {
+        m_editorPane->razorButton()->setChecked(
+            m_timeline->toolMode() == TimelineWidget::ToolMode::Razor);
     };
     m_preview->selectionRequested = [this](const QString &clipId) {
         if (m_timeline) m_timeline->setSelectedClipId(clipId);
@@ -1143,6 +1326,31 @@ QWidget *EditorWindow::buildEditorPane()
             if (clip.mediaType == ClipMediaType::Audio && clip.transcriptOverlay.enabled) {
                 clip.transcriptOverlay.translationX = translationX;
                 clip.transcriptOverlay.translationY = translationY;
+                return;
+            }
+            // Title clips: write directly to titleKeyframes (their own coordinate system)
+            if (clip.mediaType == ClipMediaType::Title) {
+                const int64_t localFrame = qBound<int64_t>(0, currentFrame - clip.startFrame,
+                    qMax<int64_t>(0, clip.durationFrames - 1));
+                bool replaced = false;
+                for (auto &kf : clip.titleKeyframes) {
+                    if (kf.frame == localFrame) {
+                        kf.translationX = translationX;
+                        kf.translationY = translationY;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced && !clip.titleKeyframes.isEmpty()) {
+                    // Update the nearest keyframe at or before current frame
+                    int bestIdx = 0;
+                    for (int i = 0; i < clip.titleKeyframes.size(); ++i) {
+                        if (clip.titleKeyframes[i].frame <= localFrame) bestIdx = i;
+                    }
+                    clip.titleKeyframes[bestIdx].translationX = translationX;
+                    clip.titleKeyframes[bestIdx].translationY = translationY;
+                }
+                normalizeClipTitleKeyframes(clip);
                 return;
             }
             if (!clipHasVisuals(clip)) return;
@@ -1444,7 +1652,8 @@ void EditorWindow::applyStateJson(const QJsonObject &root)
         if (!value.isObject()) continue;
         TimelineClip clip = clipFromJson(value.toObject());
         if (clip.trackIndex < 0) clip.trackIndex = loadedClips.size();
-        if (!clip.filePath.isEmpty()) loadedClips.push_back(clip);
+        if (!clip.filePath.isEmpty() || clip.mediaType == ClipMediaType::Title)
+            loadedClips.push_back(clip);
     }
 
     const QJsonArray tracks = root.value(QStringLiteral("tracks")).toArray();
@@ -2494,10 +2703,12 @@ void EditorWindow::setCurrentPlaybackSample(int64_t samplePosition, bool syncAud
         syncTranscriptTableToPlayhead();
         syncKeyframeTableToPlayhead();
         syncGradingTableToPlayhead();
+        m_titlesTab->syncTableToPlayhead();
     } else {
         m_inspectorPane->refresh();
         syncKeyframeTableToPlayhead();
         syncGradingTableToPlayhead();
+        m_titlesTab->syncTableToPlayhead();
     }
     scheduleSaveState();
 }
@@ -2569,8 +2780,21 @@ bool zeroCopyPreferredEnvironmentDetected() {
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
-    QApplication::setApplicationName(QStringLiteral("QRhi Editor"));
+    QApplication::setApplicationName(QStringLiteral("PanelTalkEditor"));
     qRegisterMetaType<editor::FrameHandle>();
+
+    // Single instance enforcement via lock file
+    const QString lockPath = QDir::tempPath() + QStringLiteral("/PanelTalkEditor.lock");
+    QLockFile lockFile(lockPath);
+    lockFile.setStaleLockTime(0);
+    if (!lockFile.tryLock(100)) {
+        qint64 pid = 0;
+        QString hostname, appname;
+        lockFile.getLockInfo(&pid, &hostname, &appname);
+        fprintf(stderr, "Another instance is already running (pid %lld). Exiting.\n",
+                static_cast<long long>(pid));
+        return 1;
+    }
 
     if (!zeroCopyPreferredEnvironmentDetected()) {
         qWarning().noquote() << QStringLiteral(

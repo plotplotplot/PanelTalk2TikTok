@@ -670,6 +670,12 @@ bool DecoderContext::initHardwareAccel(const AVCodec* decoder) {
     // Professional playback stacks probe platform-appropriate hardware paths
     // and avoid display-dependent backends in headless environments.
     static const AVHWDeviceType kPreferredDevices[] = {
+#ifdef __APPLE__
+        AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+#elif defined(_WIN32)
+        AV_HWDEVICE_TYPE_D3D11VA,
+        AV_HWDEVICE_TYPE_DXVA2,
+#endif
         AV_HWDEVICE_TYPE_CUDA,
         AV_HWDEVICE_TYPE_VAAPI,
     };
@@ -924,6 +930,11 @@ bool DecoderContext::seekToKeyframe(int64_t targetFrame) {
 }
 
 FrameHandle DecoderContext::convertToFrame(AVFrame* avFrame, int64_t frameNumber) {
+    // Zero-copy hardware frame path: only viable when CUDA GL interop is available.
+    // On macOS (VideoToolbox) the hw frames are NV12 CVPixelBuffers which cannot be
+    // directly mapped into GL textures without CUDA, so we must fall through to the
+    // CPU transfer path below.
+#ifdef EDITOR_HAS_CUDA
     if (avFrame->format == m_hwPixFmt &&
         m_hwPixFmt != AV_PIX_FMT_NONE &&
         (debugDecodePreference() == DecodePreference::HardwareZeroCopy ||
@@ -939,6 +950,7 @@ FrameHandle DecoderContext::convertToFrame(AVFrame* avFrame, int64_t frameNumber
             }
         }
     }
+#endif
 
     QImage image = convertAVFrameToImage(avFrame);
     if (image.isNull()) {

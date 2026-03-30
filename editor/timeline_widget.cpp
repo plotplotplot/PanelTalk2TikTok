@@ -1,4 +1,5 @@
 #include "timeline_widget.h"
+#include "titles.h"
 
 #include <QApplication>
 #include <QClipboard>
@@ -414,6 +415,25 @@ bool TimelineWidget::splitSelectedClipAtFrame(int64_t frame) {
     }
 
     return false;
+}
+
+bool TimelineWidget::splitClipAtFrame(const QString& clipId, int64_t frame) {
+    const QString previousSelection = m_selectedClipId;
+    m_selectedClipId = clipId;
+    const bool result = splitSelectedClipAtFrame(frame);
+    if (!result) {
+        m_selectedClipId = previousSelection;
+    }
+    return result;
+}
+
+void TimelineWidget::setToolMode(ToolMode mode) {
+    if (m_toolMode == mode) return;
+    m_toolMode = mode;
+    m_razorHoverFrame = -1;
+    setCursor(mode == ToolMode::Razor ? Qt::CrossCursor : Qt::ArrowCursor);
+    if (toolModeChanged) toolModeChanged();
+    update();
 }
 
 void TimelineWidget::sortClips() {
@@ -1341,6 +1361,10 @@ TimelineWidget::ClipDragMode TimelineWidget::clipDragModeAt(const TimelineClip& 
 }
 
 void TimelineWidget::updateHoverCursor(const QPoint& pos) {
+    if (m_toolMode == ToolMode::Razor) {
+        setCursor(clipIndexAt(pos) >= 0 ? Qt::CrossCursor : Qt::ArrowCursor);
+        return;
+    }
     if (trackDividerAt(pos) >= 0) {
         setCursor(Qt::SizeVerCursor);
         return;
@@ -1623,6 +1647,12 @@ void TimelineWidget::mousePressEvent(QMouseEvent* event) {
             return;
         }
         const int hitIndex = clipIndexAt(event->position().toPoint());
+        if (hitIndex >= 0 && m_toolMode == ToolMode::Razor) {
+            const int64_t clickFrame = frameFromX(event->position().x());
+            splitClipAtFrame(m_clips[hitIndex].id, clickFrame);
+            update();
+            return;
+        }
         if (hitIndex >= 0) {
             setSelectedClipId(m_clips[hitIndex].id);
             if (!m_clips[hitIndex].locked) {
@@ -1674,6 +1704,14 @@ void TimelineWidget::mouseMoveEvent(QMouseEvent* event) {
                        .arg(clipFrame));
     } else {
         setToolTip(QString());
+    }
+
+    if (m_toolMode == ToolMode::Razor) {
+        const int64_t hoverFrame = frameFromX(event->position().x());
+        if (m_razorHoverFrame != hoverFrame) {
+            m_razorHoverFrame = hoverFrame;
+            update();
+        }
     }
 
     if (m_exportRangeDragMode != ExportRangeDragMode::None && (event->buttons() & Qt::LeftButton)) {
@@ -1818,6 +1856,10 @@ void TimelineWidget::leaveEvent(QEvent* event) {
         m_hoveredClipId.clear();
         update();
     }
+    if (m_razorHoverFrame >= 0) {
+        m_razorHoverFrame = -1;
+        update();
+    }
     setToolTip(QString());
     QWidget::leaveEvent(event);
 }
@@ -1937,12 +1979,17 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
     skipRenderFrameAction->setEnabled(hasTargetClip);
     clearRenderSyncAction->setEnabled(currentSyncMarker != nullptr);
 
+    menu.addSeparator();
+    QAction* addTitleClipAction = menu.addAction(QStringLiteral("Add Title Clip"));
+
     QAction* nudgeLeftAction = nullptr;
     QAction* nudgeRightAction = nullptr;
+    QAction* splitClipAction = nullptr;
     QAction* deleteAction = nullptr;
     QAction* copyClipNameAction = nullptr;
     QAction* gradingAction = nullptr;
     QAction* resetGradingAction = nullptr;
+    QAction* scaleToFillAction = nullptr;
     QAction* propertiesAction = nullptr;
     QAction* transcribeAction = nullptr;
     QAction* createProxyAction = nullptr;
@@ -1957,10 +2004,36 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
         nudgeRightAction = menu.addAction(
             audioOnly ? QStringLiteral("Nudge +25ms\tAlt+Right") : QStringLiteral("Nudge +1 Frame\tAlt+Right"));
         menu.addSeparator();
+        splitClipAction = menu.addAction(QStringLiteral("Split Clip At Playhead\tCtrl+B"));
+        {
+            const auto& c = m_clips[clipIndex];
+            splitClipAction->setEnabled(
+                !c.locked &&
+                m_currentFrame > c.startFrame &&
+                m_currentFrame < c.startFrame + c.durationFrames);
+        }
+        menu.addSeparator();
         deleteAction = menu.addAction(QStringLiteral("Delete"));
         copyClipNameAction = menu.addAction(QStringLiteral("Copy Clip Name"));
         gradingAction = menu.addAction(QStringLiteral("Grading..."));
         resetGradingAction = menu.addAction(QStringLiteral("Reset Grading"));
+        auto *speedMenu = menu.addMenu(QStringLiteral("Playback Speed"));
+        static const qreal kSpeeds[] = { 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0 };
+        for (qreal s : kSpeeds) {
+            const QString label = (qAbs(s - 1.0) < 0.001)
+                ? QStringLiteral("1x (Normal)")
+                : QStringLiteral("%1x").arg(s, 0, 'g', 3);
+            QAction *a = speedMenu->addAction(label);
+            a->setCheckable(true);
+            a->setChecked(qAbs(m_clips[clipIndex].playbackRate - s) < 0.001);
+            a->setData(s);
+        }
+        speedMenu->setEnabled(!m_clips[clipIndex].locked);
+        scaleToFillAction = menu.addAction(QStringLiteral("Scale to Fill Preview"));
+        scaleToFillAction->setEnabled(
+            clipHasVisuals(m_clips[clipIndex]) &&
+            m_clips[clipIndex].mediaType != ClipMediaType::Title &&
+            !m_clips[clipIndex].locked);
         transcribeAction = menu.addAction(QStringLiteral("Transcribe"));
         const QString detectedProxyPath = playbackProxyPathForClip(m_clips[clipIndex]);
         createProxyAction = menu.addAction(
@@ -1989,6 +2062,21 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
 
     QAction* selected = menu.exec(event->globalPos());
     if (!selected) return;
+
+    if (selected == addTitleClipAction) {
+        const int64_t insertFrame = frameFromX(event->pos().x());
+        const int track = trackIndexAt(event->pos());
+        const int targetTrack = track >= 0 ? track : (m_tracks.isEmpty() ? 0 : m_tracks.size());
+        TimelineClip titleClip = createDefaultTitleClip(insertFrame, targetTrack);
+        m_clips.push_back(titleClip);
+        normalizeClipTiming(m_clips.last());
+        normalizeTrackIndices();
+        sortClips();
+        setSelectedClipId(titleClip.id);
+        if (clipsChanged) clipsChanged();
+        update();
+        return;
+    }
 
     if (selected == setExportStartAction) {
         if (m_exportRanges.isEmpty()) {
@@ -2071,6 +2159,11 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
         return;
     }
 
+    if (selected == splitClipAction) {
+        splitSelectedClipAtFrame(m_currentFrame);
+        return;
+    }
+
     if (selected == deleteAction) {
         if (clipIndex >= 0) {
             setSelectedClipId(m_clips[clipIndex].id);
@@ -2105,6 +2198,50 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* event) {
         normalizeClipGradingKeyframes(clip);
         if (clipsChanged) clipsChanged();
         update();
+        return;
+    }
+
+    if (selected && selected->data().isValid()) {
+        bool ok = false;
+        const qreal speed = selected->data().toDouble(&ok);
+        if (ok && speed > 0.0 && clipIndex >= 0) {
+            TimelineClip& clip = m_clips[clipIndex];
+            const qreal oldRate = qBound<qreal>(0.001, clip.playbackRate, 100.0);
+            const qreal newRate = qBound<qreal>(0.001, speed, 100.0);
+            if (qAbs(oldRate - newRate) > 0.0001) {
+                const int64_t oldDuration = clip.durationFrames;
+                // Scale duration inversely with speed change: 2x speed = half duration
+                const int64_t newDuration = qMax<int64_t>(1,
+                    static_cast<int64_t>(std::round(
+                        static_cast<qreal>(oldDuration) * oldRate / newRate)));
+                const int64_t delta = oldDuration - newDuration;
+                clip.playbackRate = newRate;
+                clip.durationFrames = newDuration;
+                normalizeClipTiming(clip);
+                // Ripple: shift all later clips on the same track left to fill the gap
+                if (delta != 0) {
+                    const int64_t clipEnd = clip.startFrame + newDuration;
+                    for (int i = 0; i < m_clips.size(); ++i) {
+                        if (i == clipIndex) continue;
+                        if (m_clips[i].trackIndex == clip.trackIndex &&
+                            m_clips[i].startFrame >= clip.startFrame + oldDuration - 1) {
+                            m_clips[i].startFrame -= delta;
+                            normalizeClipTiming(m_clips[i]);
+                        }
+                    }
+                }
+                sortClips();
+            }
+            if (clipsChanged) clipsChanged();
+            update();
+            return;
+        }
+    }
+
+    if (selected == scaleToFillAction) {
+        if (scaleToFillRequested && clipIndex >= 0) {
+            scaleToFillRequested(m_clips[clipIndex].id);
+        }
         return;
     }
 
@@ -2457,9 +2594,16 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
             painter.drawRoundedRect(rightHandle, 2, 2);
             painter.setPen(QColor(QStringLiteral("#f4f7fb")));
         }
-        QString clipTitle = audioOnly
-            ? QStringLiteral("AUDIO  %1").arg(clip.label)
-            : clip.label;
+        QString clipTitle;
+        if (clip.mediaType == ClipMediaType::Title) {
+            const QString titleText = clip.titleKeyframes.isEmpty()
+                ? QStringLiteral("Title") : clip.titleKeyframes.constFirst().text;
+            clipTitle = QStringLiteral("T  %1").arg(titleText);
+        } else if (audioOnly) {
+            clipTitle = QStringLiteral("AUDIO  %1").arg(clip.label);
+        } else {
+            clipTitle = clip.label;
+        }
         if (clip.locked) {
             clipTitle = QStringLiteral("🔒 %1").arg(clipTitle);
         }
@@ -2468,6 +2612,9 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
         }
         if (!audioEnabled && clip.hasAudio) {
             clipTitle = QStringLiteral("Muted  %1").arg(clipTitle);
+        }
+        if (qAbs(clip.playbackRate - 1.0) > 0.001) {
+            clipTitle = QStringLiteral("%1  %2x").arg(clipTitle).arg(clip.playbackRate, 0, 'g', 3);
         }
         painter.drawText(clipRect.adjusted(10, 0, -10, 0),
                         Qt::AlignLeft | Qt::AlignVCenter,
@@ -2530,6 +2677,20 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
             painter.drawRoundedRect(frameBadgeRect, 9, 9);
             painter.setPen(QColor(QStringLiteral("#d7f2ff")));
             painter.drawText(frameBadgeRect, Qt::AlignCenter, frameBadgeText);
+
+            if (qAbs(clip.playbackRate - 1.0) > 0.001) {
+                const QString speedText = QStringLiteral("SPEED %1x").arg(clip.playbackRate, 0, 'g', 3);
+                const int speedBadgeWidth = badgeMetrics.horizontalAdvance(speedText) + 18;
+                const QRect speedBadgeRect(clipRect.right() - speedBadgeWidth - 8,
+                                           frameBadgeRect.bottom() + 6,
+                                           speedBadgeWidth,
+                                           badgeHeight);
+                painter.setPen(Qt::NoPen);
+                painter.setBrush(QColor(QStringLiteral("#3a1f4c")));
+                painter.drawRoundedRect(speedBadgeRect, 9, 9);
+                painter.setPen(QColor(QStringLiteral("#e8cfff")));
+                painter.drawText(speedBadgeRect, Qt::AlignCenter, speedText);
+            }
         }
 
     }
@@ -2544,6 +2705,14 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
         const int x = xFromFrame(m_snapIndicatorFrame);
         painter.setPen(QPen(QColor(QStringLiteral("#ffe082")), 2, Qt::DashLine));
         painter.drawLine(x, ruler.top() + 4, x, tracks.bottom() - 2);
+    }
+
+    if (m_toolMode == ToolMode::Razor && m_razorHoverFrame >= 0) {
+        const int razorX = xFromFrame(m_razorHoverFrame);
+        if (razorX >= content.left() && razorX <= content.right()) {
+            painter.setPen(QPen(QColor(QStringLiteral("#a0e0ff")), 2, Qt::DashLine));
+            painter.drawLine(razorX, ruler.top(), razorX, tracks.bottom());
+        }
     }
 
     if (m_trackDropInGap && m_trackDropIndex >= 0 && (m_draggedClipIndex >= 0 || m_dropFrame >= 0)) {

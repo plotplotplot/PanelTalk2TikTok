@@ -72,6 +72,23 @@ public:
     QPushButton *addVideoKeyframeButton() const { return m_addVideoKeyframeButton; }
     QPushButton *removeVideoKeyframeButton() const { return m_removeVideoKeyframeButton; }
 
+    QLabel *titlesInspectorClipLabel() const { return m_titlesInspectorClipLabel; }
+    QLabel *titlesInspectorDetailsLabel() const { return m_titlesInspectorDetailsLabel; }
+    QTableWidget *titleKeyframeTable() const { return m_titleKeyframeTable; }
+    QLineEdit *titleTextEdit() const { return m_titleTextEdit; }
+    QDoubleSpinBox *titleXSpin() const { return m_titleXSpin; }
+    QDoubleSpinBox *titleYSpin() const { return m_titleYSpin; }
+    QDoubleSpinBox *titleFontSizeSpin() const { return m_titleFontSizeSpin; }
+    QDoubleSpinBox *titleOpacitySpin() const { return m_titleOpacitySpin; }
+    QFontComboBox *titleFontCombo() const { return m_titleFontCombo; }
+    QCheckBox *titleBoldCheck() const { return m_titleBoldCheck; }
+    QCheckBox *titleItalicCheck() const { return m_titleItalicCheck; }
+    QCheckBox *titleAutoScrollCheck() const { return m_titleAutoScrollCheck; }
+    QPushButton *addTitleKeyframeButton() const { return m_addTitleKeyframeButton; }
+    QPushButton *removeTitleKeyframeButton() const { return m_removeTitleKeyframeButton; }
+    QPushButton *titleCenterHorizontalButton() const { return m_titleCenterHorizontalButton; }
+    QPushButton *titleCenterVerticalButton() const { return m_titleCenterVerticalButton; }
+
     QLabel *audioInspectorClipLabel() const { return m_audioInspectorClipLabel; }
     QLabel *audioInspectorDetailsLabel() const { return m_audioInspectorDetailsLabel; }
 
@@ -104,6 +121,7 @@ public:
     QLabel *outputRangeSummaryLabel() const { return m_outputRangeSummaryLabel; }
     QCheckBox *renderUseProxiesCheckBox() const { return m_renderUseProxiesCheckBox; }
     QPushButton *renderButton() const { return m_renderButton; }
+    QPushButton *backgroundColorButton() const { return m_backgroundColorButton; }
 
     QCheckBox *speechFilterEnabledCheckBox() const { return m_speechFilterEnabledCheckBox; }
     QSpinBox *transcriptPrependMsSpin() const { return m_transcriptPrependMsSpin; }
@@ -118,6 +136,7 @@ signals:
 private:
     QWidget *buildPane();
     QWidget *buildGradingTab();
+    QWidget *buildTitlesTab();
     QWidget *buildSyncTab();
     QWidget *buildKeyframesTab();
     QWidget *buildTranscriptTab();
@@ -164,6 +183,23 @@ private:
     QPushButton *m_addVideoKeyframeButton = nullptr;
     QPushButton *m_removeVideoKeyframeButton = nullptr;
 
+    QLabel *m_titlesInspectorClipLabel = nullptr;
+    QLabel *m_titlesInspectorDetailsLabel = nullptr;
+    QTableWidget *m_titleKeyframeTable = nullptr;
+    QLineEdit *m_titleTextEdit = nullptr;
+    QDoubleSpinBox *m_titleXSpin = nullptr;
+    QDoubleSpinBox *m_titleYSpin = nullptr;
+    QDoubleSpinBox *m_titleFontSizeSpin = nullptr;
+    QDoubleSpinBox *m_titleOpacitySpin = nullptr;
+    QFontComboBox *m_titleFontCombo = nullptr;
+    QCheckBox *m_titleBoldCheck = nullptr;
+    QCheckBox *m_titleItalicCheck = nullptr;
+    QCheckBox *m_titleAutoScrollCheck = nullptr;
+    QPushButton *m_addTitleKeyframeButton = nullptr;
+    QPushButton *m_removeTitleKeyframeButton = nullptr;
+    QPushButton *m_titleCenterHorizontalButton = nullptr;
+    QPushButton *m_titleCenterVerticalButton = nullptr;
+
     QLabel *m_audioInspectorClipLabel = nullptr;
     QLabel *m_audioInspectorDetailsLabel = nullptr;
 
@@ -209,6 +245,7 @@ private:
     QLabel *m_outputRangeSummaryLabel = nullptr;
     QCheckBox *m_renderUseProxiesCheckBox = nullptr;
     QPushButton *m_renderButton = nullptr;
+    QPushButton *m_backgroundColorButton = nullptr;
 
     QCheckBox *m_speechFilterEnabledCheckBox = nullptr;
     QSpinBox *m_transcriptPrependMsSpin = nullptr;

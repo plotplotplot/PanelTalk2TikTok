@@ -86,17 +86,145 @@ public:
         return QFileIconProvider::icon(info);
     }
 };
+
+#ifdef __APPLE__
+// macOS-native thumbnail via AVAssetImageGenerator (VideoToolbox-accelerated).
+// Runs on the worker thread — no GUI calls.
+static QImage macOSVideoThumbnail(const QString &filePath)
+{
+    QProcess proc;
+    // Use qlmanage (Quick Look) to generate a thumbnail — fast, hardware-accelerated,
+    // supports all formats macOS knows about. Output goes to a temp dir.
+    const QString tempDir = QDir::tempPath();
+    proc.start(QStringLiteral("qlmanage"),
+               {QStringLiteral("-t"), QStringLiteral("-s"), QStringLiteral("480"),
+                QStringLiteral("-o"), tempDir, filePath});
+    proc.waitForFinished(3000);
+    if (proc.exitCode() != 0)
+        return {};
+    // qlmanage writes <filename>.png in the output dir
+    const QString baseName = QFileInfo(filePath).fileName();
+    const QString thumbPath = tempDir + QLatin1Char('/') + baseName + QStringLiteral(".png");
+    QImage image(thumbPath);
+    QFile::remove(thumbPath);
+    return image;
+}
+#endif
+
+} // anonymous namespace
+
+void ThumbnailWorker::generateThumbnail(const QString &filePath, const QString &cacheKey)
+{
+    QImage image;
+
+#ifdef __APPLE__
+    image = macOSVideoThumbnail(filePath);
+#endif
+
+    // Fallback to FFmpeg decode if native method failed or not available
+    if (image.isNull()) {
+        // Use the ExplorerPane's static decode — but we can't call it from here
+        // since we don't have an ExplorerPane pointer. Instead, do inline FFmpeg decode.
+        const MediaProbeResult probe = probeMediaFile(filePath);
+        if (probe.mediaType == ClipMediaType::Image) {
+            image = QImage(filePath);
+        } else if (probe.mediaType == ClipMediaType::Video) {
+            AVFormatContext *formatCtx = nullptr;
+            if (avformat_open_input(&formatCtx, QFile::encodeName(filePath).constData(),
+                                     nullptr, nullptr) >= 0 &&
+                avformat_find_stream_info(formatCtx, nullptr) >= 0)
+            {
+                int vidIdx = -1;
+                for (unsigned i = 0; i < formatCtx->nb_streams; ++i) {
+                    if (formatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                        vidIdx = static_cast<int>(i);
+                        break;
+                    }
+                }
+                if (vidIdx >= 0) {
+                    const AVCodec *dec = avcodec_find_decoder(
+                        formatCtx->streams[vidIdx]->codecpar->codec_id);
+                    AVCodecContext *ctx = dec ? avcodec_alloc_context3(dec) : nullptr;
+                    if (ctx &&
+                        avcodec_parameters_to_context(ctx, formatCtx->streams[vidIdx]->codecpar) >= 0 &&
+                        avcodec_open2(ctx, dec, nullptr) >= 0)
+                    {
+                        AVPacket *pkt = av_packet_alloc();
+                        AVFrame *frm = av_frame_alloc();
+                        AVFrame *rgba = av_frame_alloc();
+                        SwsContext *sws = nullptr;
+                        while (av_read_frame(formatCtx, pkt) >= 0 && image.isNull()) {
+                            if (pkt->stream_index == vidIdx &&
+                                avcodec_send_packet(ctx, pkt) >= 0) {
+                                while (avcodec_receive_frame(ctx, frm) >= 0 && image.isNull()) {
+                                    if (frm->width > 0 && frm->height > 0) {
+                                        sws = sws_getCachedContext(sws,
+                                            frm->width, frm->height,
+                                            static_cast<AVPixelFormat>(frm->format),
+                                            frm->width, frm->height,
+                                            AV_PIX_FMT_RGBA, SWS_BILINEAR,
+                                            nullptr, nullptr, nullptr);
+                                        if (sws) {
+                                            av_frame_unref(rgba);
+                                            rgba->format = AV_PIX_FMT_RGBA;
+                                            rgba->width = frm->width;
+                                            rgba->height = frm->height;
+                                            if (av_frame_get_buffer(rgba, 32) >= 0 &&
+                                                av_frame_make_writable(rgba) >= 0) {
+                                                sws_scale(sws, frm->data, frm->linesize,
+                                                          0, frm->height, rgba->data, rgba->linesize);
+                                                QImage tmp(rgba->data[0], frm->width, frm->height,
+                                                           rgba->linesize[0], QImage::Format_RGBA8888);
+                                                image = tmp.copy();
+                                            }
+                                        }
+                                    }
+                                    av_frame_unref(frm);
+                                }
+                            }
+                            av_packet_unref(pkt);
+                        }
+                        sws_freeContext(sws);
+                        av_frame_free(&rgba);
+                        av_frame_free(&frm);
+                        av_packet_free(&pkt);
+                    }
+                    avcodec_free_context(&ctx);
+                }
+            }
+            avformat_close_input(&formatCtx);
+        }
+    }
+
+    emit thumbnailReady(filePath, cacheKey, image);
 }
 
 ExplorerPane::ExplorerPane(QWidget *parent)
     : QWidget(parent)
 {
+    setMinimumWidth(160);
+
+    // Background thumbnail thread
+    m_thumbnailThread = new QThread(this);
+    m_thumbnailWorker = new ThumbnailWorker;
+    m_thumbnailWorker->moveToThread(m_thumbnailThread);
+    connect(m_thumbnailWorker, &ThumbnailWorker::thumbnailReady,
+            this, &ExplorerPane::onThumbnailReady, Qt::QueuedConnection);
+    connect(m_thumbnailThread, &QThread::finished, m_thumbnailWorker, &QObject::deleteLater);
+    m_thumbnailThread->start();
+
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
     layout->addWidget(buildUi());
 
     setExplorerRootPath(QDir::currentPath(), false);
+}
+
+ExplorerPane::~ExplorerPane()
+{
+    m_thumbnailThread->quit();
+    m_thumbnailThread->wait();
 }
 
 void ExplorerPane::setPreviewWindow(PreviewWindow *preview)
@@ -677,23 +805,27 @@ QPixmap ExplorerPane::previewPixmapForFile(const QString &filePath) const
         return pixmap;
     }
 
+    // Video thumbnails are generated asynchronously.
+    // Request generation if not already pending.
+    if (!m_pendingThumbnails.contains(cacheKey))
+    {
+        m_pendingThumbnails.insert(cacheKey);
+        QMetaObject::invokeMethod(m_thumbnailWorker, "generateThumbnail",
+                                  Qt::QueuedConnection,
+                                  Q_ARG(QString, filePath),
+                                  Q_ARG(QString, cacheKey));
+    }
+    return {};
+}
+
+// Decode the first video frame into a QImage. Thread-safe (no Qt GUI calls).
+QImage ExplorerPane::decodeVideoThumbnail(const QString &filePath) const
+{
     const MediaProbeResult probe = probeMediaFile(filePath);
     if (probe.mediaType == ClipMediaType::Image)
     {
-        const QString imagePath = filePath;
-        if (imagePath.isEmpty())
-        {
-            return {};
-        }
-        QImage image(imagePath);
-        const QPixmap pixmap = image.isNull() ? QPixmap() : QPixmap::fromImage(image);
-        if (!pixmap.isNull())
-        {
-            m_previewPixmapCache.insert(cacheKey, pixmap);
-        }
-        return pixmap;
+        return QImage(filePath);
     }
-
     if (probe.mediaType != ClipMediaType::Video)
     {
         return {};
@@ -755,7 +887,7 @@ QPixmap ExplorerPane::previewPixmapForFile(const QString &filePath) const
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
     AVFrame *rgbaFrame = av_frame_alloc();
-    QPixmap pixmap;
+    QImage result;
 
     if (!packet || !frame || !rgbaFrame)
     {
@@ -769,32 +901,22 @@ QPixmap ExplorerPane::previewPixmapForFile(const QString &filePath) const
 
     SwsContext *sws = nullptr;
 
-    auto decodeFrame = [&](AVFrame *decodedFrame)
+    auto decodeFirstFrame = [&](AVFrame *decodedFrame)
     {
         if (decodedFrame->width <= 0 || decodedFrame->height <= 0)
-        {
             return;
-        }
 
-        sws = sws_getCachedContext(
-            sws,
-            decodedFrame->width,
-            decodedFrame->height,
+        sws = sws_getCachedContext(sws,
+            decodedFrame->width, decodedFrame->height,
             static_cast<AVPixelFormat>(decodedFrame->format),
-            decodedFrame->width,
-            decodedFrame->height,
-            AV_PIX_FMT_RGBA,
-            SWS_BILINEAR,
-            nullptr,
-            nullptr,
-            nullptr);
-
+            decodedFrame->width, decodedFrame->height,
+            AV_PIX_FMT_RGBA, SWS_BILINEAR,
+            nullptr, nullptr, nullptr);
         if (!sws)
-        {
             return;
-        }
 
-        if (rgbaFrame->width != decodedFrame->width || rgbaFrame->height != decodedFrame->height ||
+        if (rgbaFrame->width != decodedFrame->width ||
+            rgbaFrame->height != decodedFrame->height ||
             rgbaFrame->format != AV_PIX_FMT_RGBA)
         {
             av_frame_unref(rgbaFrame);
@@ -802,57 +924,41 @@ QPixmap ExplorerPane::previewPixmapForFile(const QString &filePath) const
             rgbaFrame->width = decodedFrame->width;
             rgbaFrame->height = decodedFrame->height;
             if (av_frame_get_buffer(rgbaFrame, 32) < 0)
-            {
-                av_frame_unref(rgbaFrame);
                 return;
-            }
         }
-
         if (av_frame_make_writable(rgbaFrame) < 0)
-        {
             return;
-        }
 
-        sws_scale(
-            sws,
-            decodedFrame->data,
-            decodedFrame->linesize,
-            0,
-            decodedFrame->height,
-            rgbaFrame->data,
-            rgbaFrame->linesize);
+        sws_scale(sws, decodedFrame->data, decodedFrame->linesize,
+                   0, decodedFrame->height, rgbaFrame->data, rgbaFrame->linesize);
 
-        QImage image(rgbaFrame->data[0],
-                     decodedFrame->width,
-                     decodedFrame->height,
-                     rgbaFrame->linesize[0],
-                     QImage::Format_RGBA8888);
-        pixmap = QPixmap::fromImage(image.copy());
+        QImage image(rgbaFrame->data[0], decodedFrame->width, decodedFrame->height,
+                     rgbaFrame->linesize[0], QImage::Format_RGBA8888);
+        result = image.copy();
     };
 
-    while (av_read_frame(formatCtx, packet) >= 0 && pixmap.isNull())
+    while (av_read_frame(formatCtx, packet) >= 0 && result.isNull())
     {
-        if (packet->stream_index == videoStreamIndex && avcodec_send_packet(codecCtx, packet) >= 0)
+        if (packet->stream_index == videoStreamIndex &&
+            avcodec_send_packet(codecCtx, packet) >= 0)
         {
             while (avcodec_receive_frame(codecCtx, frame) >= 0)
             {
-                decodeFrame(frame);
+                decodeFirstFrame(frame);
                 av_frame_unref(frame);
-                if (!pixmap.isNull())
-                {
+                if (!result.isNull())
                     break;
-                }
             }
         }
         av_packet_unref(packet);
     }
 
-    if (pixmap.isNull())
+    if (result.isNull())
     {
         avcodec_send_packet(codecCtx, nullptr);
-        while (avcodec_receive_frame(codecCtx, frame) >= 0 && pixmap.isNull())
+        while (avcodec_receive_frame(codecCtx, frame) >= 0 && result.isNull())
         {
-            decodeFrame(frame);
+            decodeFirstFrame(frame);
             av_frame_unref(frame);
         }
     }
@@ -864,28 +970,36 @@ QPixmap ExplorerPane::previewPixmapForFile(const QString &filePath) const
     avcodec_free_context(&codecCtx);
     avformat_close_input(&formatCtx);
 
-    if (!pixmap.isNull())
-    {
-        m_previewPixmapCache.insert(cacheKey, pixmap);
-    }
-
-    return pixmap;
+    return result;
 }
 
 void ExplorerPane::hideExplorerHoverPreview()
 {
+    m_hoverFilePath.clear();
     if (m_explorerHoverPreview)
     {
         m_explorerHoverPreview->hide();
     }
 }
 
+void ExplorerPane::onThumbnailReady(const QString &filePath, const QString &cacheKey, const QImage &image)
+{
+    m_pendingThumbnails.remove(cacheKey);
+    if (image.isNull())
+        return;
+    m_previewPixmapCache.insert(cacheKey, QPixmap::fromImage(image));
+    // If we're still hovering the same file, show the preview now
+    if (m_hoverFilePath == filePath)
+        showExplorerHoverPreview(filePath);
+}
+
 void ExplorerPane::showExplorerHoverPreview(const QString &filePath)
 {
+    m_hoverFilePath = filePath;
     const QPixmap source = previewPixmapForFile(filePath);
     if (source.isNull())
     {
-        hideExplorerHoverPreview();
+        // Async request is in flight — don't hide, just wait
         return;
     }
 

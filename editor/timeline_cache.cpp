@@ -1102,9 +1102,21 @@ void TimelineCache::dropStaleRequestsForPlayhead(int64_t playheadFrame) {
         }
     }
 
-    // Do not mutate the decoder queue here. Stale requests are dropped at the
-    // cache layer by removing their pending callbacks above; any already-queued
-    // decode can finish harmlessly and will find no waiting visible listener.
+    // Also purge stale requests from the physical decoder queue so the single
+    // lane serving this file does not waste time decoding frames the playhead
+    // has already passed. Without this, a single-file H.264 workload (one lane)
+    // accumulates hundreds of stale decode requests that block the current frame.
+    if (m_decoder) {
+        QMutexLocker lock(&m_clipsMutex);
+        for (auto it = activeLocalFrames.cbegin(); it != activeLocalFrames.cend(); ++it) {
+            const auto clipIt = m_clips.find(it.key());
+            if (clipIt == m_clips.end() || clipIt->decodePath.isEmpty()) {
+                continue;
+            }
+            const int64_t keepFromFrame = qMax<int64_t>(0, it.value() - 2);
+            m_decoder->cancelForFileBefore(clipIt->decodePath, keepFromFrame);
+        }
+    }
 }
 
 void TimelineCache::scheduleImmediateLeadPrefetch(const ClipInfo& info, int64_t canonicalFrame) {

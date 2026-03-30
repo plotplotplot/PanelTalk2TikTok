@@ -13,6 +13,13 @@ enum class ClipMediaType {
     Image,
     Video,
     Audio,
+    Title,
+};
+
+enum class ProxyFormat {
+    ImageSequence,  // JPEG frames in a directory (default — best compatibility)
+    H264,           // H.264 in MOV/MP4 (small files, needs sequential decode)
+    MJPEG,          // Motion JPEG in MOV (intra-frame, Linux only)
 };
 
 enum class MediaSourceKind {
@@ -40,6 +47,24 @@ struct TimelineClip {
         bool linearInterpolation = true;
     };
 
+    struct TitleKeyframe {
+        int64_t frame = 0;
+        QString text;
+        qreal translationX = 0.0;
+        qreal translationY = 0.0;
+        qreal fontSize = 48.0;
+        qreal opacity = 1.0;
+        #ifdef __APPLE__
+        QString fontFamily = QStringLiteral("Helvetica Neue");
+#else
+        QString fontFamily = QStringLiteral("DejaVu Sans");
+#endif
+        bool bold = true;
+        bool italic = false;
+        QColor color = QColor(QStringLiteral("#ffffff"));
+        bool linearInterpolation = true;
+    };
+
     struct TranscriptOverlaySettings {
         bool enabled = false;
         bool autoScroll = false;
@@ -49,7 +74,11 @@ struct TimelineClip {
         qreal boxHeight = 220.0;
         int maxLines = 2;
         int maxCharsPerLine = 28;
+        #ifdef __APPLE__
+        QString fontFamily = QStringLiteral("Helvetica Neue");
+#else
         QString fontFamily = QStringLiteral("DejaVu Sans");
+#endif
         int fontPointSize = 42;
         bool bold = true;
         bool italic = false;
@@ -85,6 +114,7 @@ struct TimelineClip {
     qreal baseScaleY = 1.0;
     QVector<TransformKeyframe> transformKeyframes;
     QVector<GradingKeyframe> gradingKeyframes;
+    QVector<TitleKeyframe> titleKeyframes;
     TranscriptOverlaySettings transcriptOverlay;
     int fadeSamples = 250;  // Crossfade with previous audio clip (0 = no fade)
     bool locked = false;    // When true, prevents temporal adjustments
@@ -120,6 +150,7 @@ struct MediaProbeResult {
     bool hasAlpha = false;
     int64_t durationFrames = 120;
     QString codecName;
+    QSize frameSize;
 };
 
 struct TranscriptWord {
@@ -145,6 +176,12 @@ struct TranscriptOverlayLayout {
     bool truncatedTop = false;
     bool truncatedBottom = false;
 };
+
+#ifdef __APPLE__
+inline const QString kDefaultFontFamily = QStringLiteral("Helvetica Neue");
+#else
+inline const QString kDefaultFontFamily = QStringLiteral("DejaVu Sans");
+#endif
 
 constexpr int kTimelineFps = 30;
 constexpr int kAudioSampleRate = 48000;
@@ -178,6 +215,7 @@ QString transformInterpolationLabel(bool linearInterpolation);
 qreal sanitizeScaleValue(qreal value);
 void normalizeClipTransformKeyframes(TimelineClip& clip);
 void normalizeClipGradingKeyframes(TimelineClip& clip);
+void normalizeClipTitleKeyframes(TimelineClip& clip);
 TimelineClip::TransformKeyframe evaluateClipKeyframeOffsetAtFrame(const TimelineClip& clip, int64_t timelineFrame);
 TimelineClip::TransformKeyframe evaluateClipTransformAtFrame(const TimelineClip& clip, int64_t timelineFrame);
 TimelineClip::TransformKeyframe evaluateClipTransformAtPosition(const TimelineClip& clip, qreal timelineFramePosition);

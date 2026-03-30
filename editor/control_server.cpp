@@ -6,6 +6,7 @@
 #include <QBuffer>
 #include <QCoreApplication>
 #include <QContextMenuEvent>
+#include <QDateTime>
 #include <QEvent>
 #include <QHash>
 #include <QJsonArray>
@@ -373,6 +374,20 @@ private:
             return;
         }
 
+        if (request.method == QStringLiteral("GET") && request.url.path() == QStringLiteral("/version")) {
+            const qint64 uptimeMs = QDateTime::currentMSecsSinceEpoch() - m_startTimeMs;
+            writeJson(socket, 200, QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("build_time"), QStringLiteral(EDITOR_BUILD_TIME)},
+                {QStringLiteral("commit"), QStringLiteral(EDITOR_GIT_COMMIT)},
+                {QStringLiteral("dirty"), EDITOR_GIT_DIRTY},
+                {QStringLiteral("current_time"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
+                {QStringLiteral("uptime_seconds"), uptimeMs / 1000},
+                {QStringLiteral("pid"), static_cast<qint64>(QCoreApplication::applicationPid())}
+            });
+            return;
+        }
+
         if (request.method == QStringLiteral("GET") && request.url.path() == QStringLiteral("/playhead")) {
             const QJsonObject snapshot = fastSnapshot();
             writeJson(socket, 200, QJsonObject{
@@ -665,6 +680,7 @@ private:
     std::unique_ptr<QTcpServer> m_server;
     QHash<QTcpSocket*, QByteArray> m_buffers;
     quint16 m_listenPort = 0;
+    qint64 m_startTimeMs = QDateTime::currentMSecsSinceEpoch();
 };
 
 } // namespace

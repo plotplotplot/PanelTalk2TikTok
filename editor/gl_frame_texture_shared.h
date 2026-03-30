@@ -8,7 +8,9 @@
 #include <QString>
 #include <QtGui/qopengl.h>
 
+#ifdef EDITOR_HAS_CUDA
 #include <cuda.h>
+#endif
 
 namespace editor {
 
@@ -19,8 +21,10 @@ struct GlTextureCacheEntry {
     qint64 lastUsedMs = 0;
     QSize size;
     bool usesYuvTextures = false;
+#ifdef EDITOR_HAS_CUDA
     CUgraphicsResource cudaYResource = nullptr;
     CUgraphicsResource cudaUvResource = nullptr;
+#endif
 };
 
 bool frameUsesCudaZeroCopyCandidate(const FrameHandle& frame);

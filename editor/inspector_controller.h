@@ -15,7 +15,7 @@ public:
 
     QString clipLabelForId(const QString &clipId) const;
     QColor clipColorForId(const QString &clipId) const;
-    bool parseSyncActionText(const QString &text, editor::RenderSyncAction *actionOut) const;
+    bool parseSyncActionText(const QString &text, RenderSyncAction *actionOut) const;
     void refreshSyncInspector();
     void refreshTranscriptInspector();
 

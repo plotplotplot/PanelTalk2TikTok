@@ -119,6 +119,8 @@ QString clipMediaTypeToString(ClipMediaType type) {
         return QStringLiteral("video");
     case ClipMediaType::Audio:
         return QStringLiteral("audio");
+    case ClipMediaType::Title:
+        return QStringLiteral("title");
     case ClipMediaType::Unknown:
     default:
         return QStringLiteral("unknown");
@@ -129,6 +131,7 @@ ClipMediaType clipMediaTypeFromString(const QString& value) {
     if (value == QStringLiteral("image")) return ClipMediaType::Image;
     if (value == QStringLiteral("video")) return ClipMediaType::Video;
     if (value == QStringLiteral("audio")) return ClipMediaType::Audio;
+    if (value == QStringLiteral("title")) return ClipMediaType::Title;
     return ClipMediaType::Unknown;
 }
 
@@ -140,6 +143,8 @@ QString clipMediaTypeLabel(ClipMediaType type) {
         return QStringLiteral("Video");
     case ClipMediaType::Audio:
         return QStringLiteral("Audio");
+    case ClipMediaType::Title:
+        return QStringLiteral("Title");
     case ClipMediaType::Unknown:
     default:
         return QStringLiteral("Unknown");
@@ -203,6 +208,7 @@ QString renderSyncActionLabel(RenderSyncAction action) {
 bool clipHasVisuals(const TimelineClip& clip) {
     return clip.mediaType == ClipMediaType::Image ||
            clip.mediaType == ClipMediaType::Video ||
+           clip.mediaType == ClipMediaType::Title ||
            clip.sourceKind == MediaSourceKind::ImageSequence;
 }
 
@@ -346,6 +352,26 @@ void normalizeClipGradingKeyframes(TimelineClip& clip) {
         clip.saturation = clip.gradingKeyframes.constFirst().saturation;
         clip.opacity = clip.gradingKeyframes.constFirst().opacity;
     }
+}
+
+void normalizeClipTitleKeyframes(TimelineClip& clip) {
+    std::sort(clip.titleKeyframes.begin(), clip.titleKeyframes.end(),
+              [](const TimelineClip::TitleKeyframe& a, const TimelineClip::TitleKeyframe& b) {
+                  return a.frame < b.frame;
+              });
+
+    QVector<TimelineClip::TitleKeyframe> normalized;
+    normalized.reserve(clip.titleKeyframes.size());
+    const int64_t maxFrame = qMax<int64_t>(0, clip.durationFrames - 1);
+    for (TimelineClip::TitleKeyframe keyframe : clip.titleKeyframes) {
+        keyframe.frame = qBound<int64_t>(0, keyframe.frame, maxFrame);
+        if (!normalized.isEmpty() && normalized.constLast().frame == keyframe.frame) {
+            normalized.last() = keyframe;
+        } else {
+            normalized.push_back(keyframe);
+        }
+    }
+    clip.titleKeyframes = normalized;
 }
 
 TimelineClip::TransformKeyframe evaluateClipKeyframeOffsetAtFrame(const TimelineClip& clip, int64_t timelineFrame) {
@@ -620,6 +646,9 @@ MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames)
             result.codecName = QStringLiteral("image_sequence");
             QImage firstImage(sequenceFrames.constFirst());
             result.hasAlpha = !firstImage.isNull() && firstImage.hasAlphaChannel();
+            if (!firstImage.isNull()) {
+                result.frameSize = firstImage.size();
+            }
         }
         return result;
     }
@@ -648,6 +677,10 @@ MediaProbeResult probeMediaFile(const QString& filePath, int64_t fallbackFrames)
             }
             if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
                 result.hasVideo = true;
+                if (result.frameSize.isEmpty() &&
+                    stream->codecpar->width > 0 && stream->codecpar->height > 0) {
+                    result.frameSize = QSize(stream->codecpar->width, stream->codecpar->height);
+                }
                 if (result.codecName.isEmpty()) {
                     result.codecName = QString::fromUtf8(avcodec_get_name(stream->codecpar->codec_id));
                 }
@@ -738,6 +771,19 @@ QString playbackProxyPathForClip(const TimelineClip& clip) {
 
     const QString baseName = sourceInfo.completeBaseName();
     const QDir sourceDir = sourceInfo.dir();
+
+    // Check for image sequence proxy directory first (preferred format)
+    const QStringList seqDirCandidates = {
+        baseName + QStringLiteral(".proxy"),
+        baseName + QStringLiteral("_proxy"),
+    };
+    for (const QString& dirName : seqDirCandidates) {
+        const QString dirPath = sourceDir.filePath(dirName);
+        if (isImageSequencePath(dirPath)) {
+            return dirPath;
+        }
+    }
+
     const QStringList candidateNames = {
         baseName + QStringLiteral(".proxy.mov"),
         baseName + QStringLiteral(".proxy.mp4"),

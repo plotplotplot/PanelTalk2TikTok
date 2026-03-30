@@ -40,13 +40,17 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/hwcontext.h>
+#ifdef EDITOR_HAS_CUDA
 #include <libavutil/hwcontext_cuda.h>
+#endif
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
 
+#ifdef EDITOR_HAS_CUDA
 #include <cuda.h>
 #include <cudaGL.h>
+#endif
 
 namespace {
 constexpr int kRenderAudioSampleRate = 48000;

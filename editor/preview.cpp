@@ -2,6 +2,7 @@
 #include "frame_handle.h"
 #include "async_decoder.h"
 #include "timeline_cache.h"
+#include "titles.h"
 #include "playback_frame_pipeline.h"
 #include "memory_budget.h"
 #include "gpu_compositor.h"
@@ -331,7 +332,7 @@ PreviewWindow::PreviewWindow(QWidget* parent)
     : QOpenGLWidget(parent)
     , m_quadBuffer(QOpenGLBuffer::VertexBuffer)
 {
-    setMinimumSize(640, 360);
+    setMinimumSize(320, 180);
     setMouseTracking(true);
     m_lastPaintMs = nowMs();
     m_repaintTimer.setSingleShot(true);
@@ -568,6 +569,12 @@ void PreviewWindow::setHideOutsideOutputWindow(bool hide) {
     scheduleRepaint();
 }
 
+void PreviewWindow::setBackgroundColor(const QColor& color) {
+    if (m_backgroundColor == color) return;
+    m_backgroundColor = color;
+    scheduleRepaint();
+}
+
 void PreviewWindow::setBypassGrading(bool bypass) {
     if (m_bypassGrading == bypass) {
         return;
@@ -770,6 +777,7 @@ void PreviewWindow::paintEvent(QPaintEvent* event) {
 }
 
 void PreviewWindow::initializeGL() {
+    m_glInitialized = true;
     initializeOpenGLFunctions();
     glDisable(GL_DEPTH_TEST);
     glEnable(GL_BLEND);
@@ -879,14 +887,15 @@ void PreviewWindow::paintGL() {
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 
-    const float phase = static_cast<float>(m_currentFrame % 180) / 179.0f;
-    const float clipFactor = qBound(0.0f, static_cast<float>(m_clipCount) / 8.0f, 1.0f);
-    const float motion = m_playing ? phase : 0.25f;
     glViewport(0, 0, width() * devicePixelRatio(), height() * devicePixelRatio());
-    glClearColor(0.08f + 0.12f * motion,
-                 0.08f + 0.10f * clipFactor,
-                 0.10f + 0.16f * (1.0f - motion),
-                 1.0f);
+    if (m_clipCount > 0) {
+        glClearColor(m_backgroundColor.redF(), m_backgroundColor.greenF(),
+                     m_backgroundColor.blueF(), 1.0f);
+    } else {
+        const float phase = static_cast<float>(m_currentFrame % 180) / 179.0f;
+        const float motion = m_playing ? phase : 0.25f;
+        glClearColor(0.08f + 0.12f * motion, 0.08f, 0.10f + 0.16f * (1.0f - motion), 1.0f);
+    }
     glClear(GL_COLOR_BUFFER_BIT);
 
     QList<TimelineClip> activeClips = getActiveClips();
@@ -899,6 +908,17 @@ void PreviewWindow::paintGL() {
     renderCompositedPreviewGL(compositeRect, activeClips, drewAnyFrame, waitingForFrame);
     drawCompositedPreviewOverlay(&painter, safeRect, compositeRect, activeClips, drewAnyFrame, waitingForFrame);
     drawPreviewChrome(&painter, safeRect, activeClips.size());
+
+    // Self-reschedule so the repaint loop never stalls.
+    // m_repaintTimer is single-shot — without this, the timer dies after each paint.
+    // During playback: always reschedule for continuous animation.
+    // When paused: reschedule if there are pending decode requests, so newly
+    // decoded frames appear without requiring an external event.
+    if (m_playing ||
+        (m_cache && m_cache->pendingVisibleRequestCount() > 0) ||
+        (m_decoder && m_decoder->pendingRequestCount() > 0)) {
+        scheduleRepaint();
+    }
 }
 
 void PreviewWindow::mousePressEvent(QMouseEvent* event) {
@@ -1278,6 +1298,11 @@ void PreviewWindow::ensurePipeline() {
 }
 
 void PreviewWindow::releaseGlResources() {
+    if (!m_glInitialized || !context() || !context()->isValid()) {
+        m_textureCache.clear();
+        m_shaderProgram.reset();
+        return;
+    }
     for (auto it = m_textureCache.begin(); it != m_textureCache.end(); ++it) {
         editor::destroyGlTextureEntry(&it.value());
     }
@@ -1439,6 +1464,9 @@ void PreviewWindow::renderCompositedPreviewGL(const QRect& compositeRect,
     for (const TimelineClip& clip : activeClips) {
         if (!clipVisualPlaybackEnabled(clip)) {
             continue;
+        }
+        if (clip.mediaType == ClipMediaType::Title) {
+            continue; // Title clips are drawn as text overlays, not decoded frames
         }
         if (!m_bypassGrading) {
             const TimelineClip::GradingKeyframe grade =
@@ -1649,16 +1677,51 @@ void PreviewWindow::drawCompositedPreviewOverlay(QPainter* painter,
         }
     }
 
+    // Draw title overlays for title clips at the current playhead
+    for (const TimelineClip& clip : activeClips) {
+        if (clip.mediaType == ClipMediaType::Title && !clip.titleKeyframes.isEmpty()) {
+            const int64_t localFrame = qMax<int64_t>(0,
+                m_currentFrame - clip.startFrame);
+            const EvaluatedTitle title = evaluateTitleAtLocalFrame(clip, localFrame);
+            drawTitleOverlay(painter, compositeRect, title, m_outputSize);
+
+            // Register overlay bounds so the title is draggable in the preview
+            if (title.valid && !title.text.isEmpty()) {
+                const qreal sx = m_outputSize.width() > 0
+                    ? static_cast<qreal>(compositeRect.width()) / m_outputSize.width() : 1.0;
+                const qreal sy = m_outputSize.height() > 0
+                    ? static_cast<qreal>(compositeRect.height()) / m_outputSize.height() : 1.0;
+                QFont font(title.fontFamily);
+                font.setPointSizeF(title.fontSize * qMin(sx, sy));
+                font.setBold(title.bold);
+                font.setItalic(title.italic);
+                const QFontMetricsF fm(font);
+                const qreal textWidth = fm.horizontalAdvance(title.text);
+                const qreal textHeight = fm.height();
+                const qreal cx = compositeRect.center().x() + title.x * sx;
+                const qreal cy = compositeRect.center().y() + title.y * sy;
+                const QRectF bounds(cx - textWidth / 2.0 - 4, cy - textHeight / 2.0 - 4,
+                                    textWidth + 8, textHeight + 8);
+                PreviewOverlayInfo info;
+                info.bounds = bounds;
+                m_overlayInfo.insert(clip.id, info);
+                m_paintOrder.push_back(clip.id);
+            }
+        }
+    }
+
     for (const TimelineClip& clip : activeClips) {
         const PreviewOverlayInfo info = m_overlayInfo.value(clip.id);
         if (clip.id == m_selectedClipId && info.bounds.isValid()) {
             painter->setPen(QPen(QColor(QStringLiteral("#fff4c2")), 2.0));
             painter->setBrush(Qt::NoBrush);
             painter->drawRect(info.bounds);
-            painter->setBrush(QColor(QStringLiteral("#fff4c2")));
-            painter->drawRect(info.rightHandle);
-            painter->drawRect(info.bottomHandle);
-            painter->drawRect(info.cornerHandle);
+            if (info.rightHandle.isValid()) {
+                painter->setBrush(QColor(QStringLiteral("#fff4c2")));
+                painter->drawRect(info.rightHandle);
+                painter->drawRect(info.bottomHandle);
+                painter->drawRect(info.cornerHandle);
+            }
         }
     }
 
@@ -1755,6 +1818,9 @@ void PreviewWindow::requestFramesForCurrentPosition() {
     }
 
     for (const TimelineClip* clip : activeClips) {
+        if (clip->mediaType == ClipMediaType::Title) {
+            continue; // Title clips render as text overlays, no frame decode needed
+        }
         const int64_t localFrame = sourceFrameForSample(*clip, m_currentSample);
         const bool usePlaybackPipeline = false;
         const bool usePlaybackBuffer =
@@ -1866,6 +1932,9 @@ void PreviewWindow::drawCompositedPreview(QPainter* painter, const QRect& safeRe
     QJsonArray clipSelections;
 
     for (const TimelineClip& clip : activeClips) {
+        if (clip.mediaType == ClipMediaType::Title) {
+            continue; // Title clips are drawn as text overlays below
+        }
         const int64_t localFrame = sourceFrameForSample(clip, m_currentSample);
         const bool usePlaybackPipeline = false;
         const bool usePlaybackBuffer =
@@ -2008,10 +2077,53 @@ void PreviewWindow::drawCompositedPreview(QPainter* painter, const QRect& safeRe
             drawTranscriptOverlay(painter, clip, compositeRect);
         }
     }
+    // Draw title overlays and register their bounds for drag interaction
+    for (const TimelineClip& clip : activeClips) {
+        if (clip.mediaType == ClipMediaType::Title && !clip.titleKeyframes.isEmpty()) {
+            const int64_t localFrame = qMax<int64_t>(0, m_currentFrame - clip.startFrame);
+            const EvaluatedTitle title = evaluateTitleAtLocalFrame(clip, localFrame);
+            drawTitleOverlay(painter, compositeRect, title, m_outputSize);
+            if (title.valid && !title.text.isEmpty()) {
+                const qreal sx = m_outputSize.width() > 0
+                    ? static_cast<qreal>(compositeRect.width()) / m_outputSize.width() : 1.0;
+                const qreal sy = m_outputSize.height() > 0
+                    ? static_cast<qreal>(compositeRect.height()) / m_outputSize.height() : 1.0;
+                QFont font(title.fontFamily);
+                font.setPointSizeF(title.fontSize * qMin(sx, sy));
+                font.setBold(title.bold);
+                font.setItalic(title.italic);
+                const QFontMetricsF fm(font);
+                const qreal textWidth = fm.horizontalAdvance(title.text);
+                const qreal textHeight = fm.height();
+                const qreal cx = compositeRect.center().x() + title.x * sx;
+                const qreal cy = compositeRect.center().y() + title.y * sy;
+                PreviewOverlayInfo info;
+                info.bounds = QRectF(cx - textWidth / 2.0 - 4, cy - textHeight / 2.0 - 4,
+                                     textWidth + 8, textHeight + 8);
+                m_overlayInfo.insert(clip.id, info);
+                m_paintOrder.push_back(clip.id);
+            }
+        }
+    }
+    // Draw selection handles for all clips with overlay info
+    for (const TimelineClip& clip : activeClips) {
+        const PreviewOverlayInfo info = m_overlayInfo.value(clip.id);
+        if (clip.id == m_selectedClipId && info.bounds.isValid()) {
+            painter->setPen(QPen(QColor(QStringLiteral("#fff4c2")), 2.0));
+            painter->setBrush(Qt::NoBrush);
+            painter->drawRect(info.bounds);
+            if (info.rightHandle.isValid()) {
+                painter->setBrush(QColor(QStringLiteral("#fff4c2")));
+                painter->drawRect(info.rightHandle);
+                painter->drawRect(info.bottomHandle);
+                painter->drawRect(info.cornerHandle);
+            }
+        }
+    }
     if (m_hideOutsideOutputWindow) {
         painter->setClipping(false);
     }
-    
+
     painter->restore();
 }
 
@@ -2214,6 +2326,16 @@ QString PreviewWindow::clipIdAtPosition(const QPointF& position) const {
 TimelineClip::TransformKeyframe PreviewWindow::evaluateTransformForSelectedClip() const {
     for (const TimelineClip& clip : m_clips) {
         if (clip.id == m_selectedClipId) {
+            // Title clips use their own coordinate system in titleKeyframes
+            if (clip.mediaType == ClipMediaType::Title) {
+                const int64_t localFrame = qMax<int64_t>(0,
+                    static_cast<int64_t>(m_currentFramePosition) - clip.startFrame);
+                const EvaluatedTitle title = evaluateTitleAtLocalFrame(clip, localFrame);
+                TimelineClip::TransformKeyframe kf;
+                kf.translationX = title.x;
+                kf.translationY = title.y;
+                return kf;
+            }
             return evaluateClipTransformAtPosition(clip, m_currentFramePosition);
         }
     }

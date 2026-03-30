@@ -28,6 +28,7 @@ public:
     QLabel *audioNowPlayingLabel() const { return m_audioNowPlayingLabel; }
     QLabel *statusBadge() const { return m_statusBadge; }
     QLabel *previewInfo() const { return m_previewInfo; }
+    QToolButton *razorButton() const { return m_razorButton; }
 
 signals:
     void playClicked();
@@ -44,6 +45,7 @@ private:
     QPushButton *m_playButton = nullptr;
     QToolButton *m_startButton = nullptr;
     QToolButton *m_endButton = nullptr;
+    QToolButton *m_razorButton = nullptr;
     QSlider *m_seekSlider = nullptr;
     QLabel *m_timecodeLabel = nullptr;
     QToolButton *m_audioMuteButton = nullptr;

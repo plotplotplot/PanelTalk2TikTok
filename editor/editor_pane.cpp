@@ -23,12 +23,16 @@ EditorPane::EditorPane(QWidget *parent)
             "QSlider::handle:horizontal { background: #ff6f61; width: 14px; margin: -5px 0; border-radius: 7px; }"));
 
     auto *layout = new QVBoxLayout(this);
-    layout->setContentsMargins(18, 18, 18, 18);
+    layout->setContentsMargins(4, 4, 4, 4);
     layout->setSpacing(0);
 
     auto *verticalSplitter = new QSplitter(Qt::Vertical, this);
     verticalSplitter->setObjectName(QStringLiteral("layout.editor_splitter"));
     verticalSplitter->setChildrenCollapsible(false);
+    verticalSplitter->setHandleWidth(6);
+    verticalSplitter->setStyleSheet(QStringLiteral(
+        "QSplitter::handle { background: #1e2a36; }"
+        "QSplitter::handle:hover { background: #3a5068; }"));
     layout->addWidget(verticalSplitter, 1);
 
     auto *previewFrame = new QFrame;
@@ -44,7 +48,7 @@ EditorPane::EditorPane(QWidget *parent)
     m_preview = new PreviewWindow;
     m_preview->setObjectName(QStringLiteral("preview.window"));
     m_preview->setFocusPolicy(Qt::StrongFocus);
-    m_preview->setMinimumSize(640, 360);
+    m_preview->setMinimumSize(320, 180);
     m_preview->setOutputSize(QSize(1080, 1920));
 
     auto *overlay = new QWidget;
@@ -125,11 +129,21 @@ EditorPane::EditorPane(QWidget *parent)
 
     m_audioNowPlayingLabel = new QLabel(QStringLiteral("Audio idle"));
     m_audioNowPlayingLabel->setObjectName(QStringLiteral("transport.audio_status"));
-    m_audioNowPlayingLabel->setMinimumWidth(180);
+    m_audioNowPlayingLabel->setMinimumWidth(80);
+
+    m_razorButton = new QToolButton(transport);
+    m_razorButton->setObjectName(QStringLiteral("transport.razor"));
+    m_razorButton->setText(QStringLiteral("Razor"));
+    m_razorButton->setCheckable(true);
+    m_razorButton->setToolTip(QStringLiteral("Razor tool (B) \u2014 click to split clips"));
+    m_razorButton->setStyleSheet(QStringLiteral(
+        "QToolButton:checked { background: #3a4d63; border-color: #a0e0ff; color: #a0e0ff; }"));
 
     transportLayout->addWidget(m_startButton);
     transportLayout->addWidget(m_playButton);
     transportLayout->addWidget(m_endButton);
+    transportLayout->addSpacing(12);
+    transportLayout->addWidget(m_razorButton);
     transportLayout->addWidget(m_seekSlider, 1);
     transportLayout->addWidget(m_timecodeLabel);
     transportLayout->addWidget(m_audioMuteButton);

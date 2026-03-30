@@ -174,7 +174,7 @@ void TranscriptTab::applyOverlayFromInspector(bool pushHistory)
             : 220.0;
         clip.transcriptOverlay.fontFamily = m_widgets.transcriptFontFamilyCombo
             ? m_widgets.transcriptFontFamilyCombo->currentFont().family()
-            : QStringLiteral("DejaVu Sans");
+            : kDefaultFontFamily;
         clip.transcriptOverlay.fontPointSize = m_widgets.transcriptFontSizeSpin
             ? m_widgets.transcriptFontSizeSpin->value()
             : 42;

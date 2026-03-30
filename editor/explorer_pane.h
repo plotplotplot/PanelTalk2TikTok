@@ -7,6 +7,10 @@
 #include <QPixmap>
 #include <QHash>
 #include <QPoint>
+#include <QThread>
+#include <QMutex>
+#include <QImage>
+#include <QSet>
 
 class QFileSystemModel;
 class QTreeView;
@@ -18,12 +22,27 @@ class QToolButton;
 class QStackedWidget;
 class PreviewWindow;
 
+// Background worker for generating video thumbnails without blocking the UI.
+class ThumbnailWorker final : public QObject
+{
+    Q_OBJECT
+public:
+    explicit ThumbnailWorker(QObject *parent = nullptr) : QObject(parent) {}
+
+public slots:
+    void generateThumbnail(const QString &filePath, const QString &cacheKey);
+
+signals:
+    void thumbnailReady(const QString &filePath, const QString &cacheKey, const QImage &image);
+};
+
 class ExplorerPane final : public QWidget
 {
     Q_OBJECT
 
 public:
     explicit ExplorerPane(QWidget *parent = nullptr);
+    ~ExplorerPane() override;
 
     void setPreviewWindow(PreviewWindow *preview);
     void setInitialRootPath(const QString &path);
@@ -50,8 +69,10 @@ private:
     void chooseExplorerRoot();
 
     QPixmap previewPixmapForFile(const QString &filePath) const;
+    QImage decodeVideoThumbnail(const QString &filePath) const;
     void showExplorerHoverPreview(const QString &filePath);
     void hideExplorerHoverPreview();
+    void onThumbnailReady(const QString &filePath, const QString &cacheKey, const QImage &image);
 
     QWidget *buildUi();
     QWidget *buildTreePage();
@@ -73,6 +94,10 @@ private:
     QString m_currentRootPath;
     QString m_galleryFolderPath;
     mutable QHash<QString, QPixmap> m_previewPixmapCache;
+    mutable QSet<QString> m_pendingThumbnails;
+    QThread *m_thumbnailThread = nullptr;
+    ThumbnailWorker *m_thumbnailWorker = nullptr;
+    QString m_hoverFilePath;
     QPoint m_treeDragStartPos;
     QPoint m_galleryDragStartPos;
 };

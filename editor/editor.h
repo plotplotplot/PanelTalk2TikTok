@@ -14,10 +14,13 @@
 #include "profile_tab.h"
 #include "transcript_tab.h"
 #include "grading_tab.h"
+#include "titles_tab.h"
 #include "video_keyframe_tab.h"
 
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <QColorDialog>
+#include <QLockFile>
 #include <QComboBox>
 #include <QDoubleSpinBox>
 #include <QElapsedTimer>
@@ -61,7 +64,8 @@ private:
     void openTranscriptionWindow(const QString &filePath, const QString &label);
 
     QString defaultProxyOutputPath(const TimelineClip &clip,
-                                   const MediaProbeResult *knownProbe = nullptr) const;
+                                   const MediaProbeResult *knownProbe = nullptr,
+                                   ProxyFormat format = ProxyFormat::ImageSequence) const;
     QString clipFileInfoSummary(const QString &filePath,
                                 const MediaProbeResult *knownProbe = nullptr) const;
     void createProxyForClip(const QString &clipId);
@@ -277,6 +281,7 @@ private:
     std::unique_ptr<AudioEngine> m_audioEngine;
     std::unique_ptr<TranscriptTab> m_transcriptTab;
     std::unique_ptr<GradingTab> m_gradingTab;
+    std::unique_ptr<TitlesTab> m_titlesTab;
     std::unique_ptr<VideoKeyframeTab> m_videoKeyframeTab;
     std::unique_ptr<OutputTab> m_outputTab;
     std::unique_ptr<ProfileTab> m_profileTab;
@@ -295,6 +300,7 @@ private:
     bool m_pendingSaveAfterLoad = false;
     bool m_restoringHistory = false;
 
+    QColor m_backgroundColor = QColor(Qt::black);
     int64_t m_absolutePlaybackSample = 0;
     int64_t m_filteredPlaybackSample = 0;
     QTimer m_transcriptClickSeekTimer;

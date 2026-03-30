@@ -32,6 +32,8 @@
 class TimelineWidget final : public QWidget {
     Q_OBJECT
 public:
+    enum class ToolMode { Select, Razor };
+
     explicit TimelineWidget(QWidget* parent = nullptr);
 
     void setCurrentFrame(int64_t frame);
@@ -56,7 +58,11 @@ public:
     bool updateClipById(const QString& clipId, const std::function<void(TimelineClip&)>& updater);
     bool deleteSelectedClip();
     bool splitSelectedClipAtFrame(int64_t frame);
+    bool splitClipAtFrame(const QString& clipId, int64_t frame);
     bool nudgeSelectedClip(int direction);
+
+    void setToolMode(ToolMode mode);
+    ToolMode toolMode() const { return m_toolMode; }
     bool updateTrackByIndex(int trackIndex, const std::function<void(TimelineTrack&)>& updater);
     bool updateTrackVisualEnabled(int trackIndex, bool enabled);
     bool updateTrackAudioEnabled(int trackIndex, bool enabled);
@@ -89,6 +95,8 @@ public:
     std::function<void(const QString&)> createProxyRequested;
     std::function<void(const QString&)> deleteProxyRequested;
     std::function<void()> exportRangeChanged;
+    std::function<void()> toolModeChanged;
+    std::function<void(const QString&)> scaleToFillRequested;
 
 protected:
     void dragEnterEvent(QDragEnterEvent* event) override;
@@ -117,6 +125,7 @@ private:
         Start,
         End,
     };
+
 
     static constexpr int kDefaultTrackHeight = 44;
     static constexpr int kMinTrackHeight = 28;
@@ -235,4 +244,6 @@ private:
     QVector<RenderSyncMarker> m_renderSyncMarkers;
     ExportRangeDragMode m_exportRangeDragMode = ExportRangeDragMode::None;
     int m_exportRangeDragSegmentIndex = -1;
+    ToolMode m_toolMode = ToolMode::Select;
+    int64_t m_razorHoverFrame = -1;
 };

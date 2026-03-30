@@ -10,3 +10,6 @@
 [submodule "sam3"]
 	path = sam3
 	url = https://github.com/facebookresearch/sam3
+[submodule "editor/rtaudio"]
+	path = editor/rtaudio
+	url = https://github.com/thestk/rtaudio.git

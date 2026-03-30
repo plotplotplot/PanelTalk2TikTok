@@ -64,6 +64,24 @@ QJsonObject clipToJson(const TimelineClip &clip)
             gradingKeyframes.push_back(keyframeObj);
         }
         obj[QStringLiteral("gradingKeyframes")] = gradingKeyframes;
+        QJsonArray titleKeyframes;
+        for (const TimelineClip::TitleKeyframe &keyframe : clip.titleKeyframes)
+        {
+            QJsonObject keyframeObj;
+            keyframeObj[QStringLiteral("frame")] = static_cast<qint64>(keyframe.frame);
+            keyframeObj[QStringLiteral("text")] = keyframe.text;
+            keyframeObj[QStringLiteral("translationX")] = keyframe.translationX;
+            keyframeObj[QStringLiteral("translationY")] = keyframe.translationY;
+            keyframeObj[QStringLiteral("fontSize")] = keyframe.fontSize;
+            keyframeObj[QStringLiteral("opacity")] = keyframe.opacity;
+            keyframeObj[QStringLiteral("fontFamily")] = keyframe.fontFamily;
+            keyframeObj[QStringLiteral("bold")] = keyframe.bold;
+            keyframeObj[QStringLiteral("italic")] = keyframe.italic;
+            keyframeObj[QStringLiteral("color")] = keyframe.color.name(QColor::HexArgb);
+            keyframeObj[QStringLiteral("linearInterpolation")] = keyframe.linearInterpolation;
+            titleKeyframes.push_back(keyframeObj);
+        }
+        obj[QStringLiteral("titleKeyframes")] = titleKeyframes;
         QJsonObject transcriptOverlayObj;
         transcriptOverlayObj[QStringLiteral("enabled")] = clip.transcriptOverlay.enabled;
         transcriptOverlayObj[QStringLiteral("autoScroll")] = clip.transcriptOverlay.autoScroll;
@@ -197,7 +215,7 @@ TimelineClip clipFromJson(const QJsonObject &obj)
         clip.transcriptOverlay.maxCharsPerLine =
             qMax(1, transcriptOverlayObj.value(QStringLiteral("maxCharsPerLine")).toInt(28));
         clip.transcriptOverlay.fontFamily =
-            transcriptOverlayObj.value(QStringLiteral("fontFamily")).toString(QStringLiteral("DejaVu Sans"));
+            transcriptOverlayObj.value(QStringLiteral("fontFamily")).toString(kDefaultFontFamily);
         clip.transcriptOverlay.fontPointSize =
             qMax(8, transcriptOverlayObj.value(QStringLiteral("fontPointSize")).toInt(42));
         clip.transcriptOverlay.bold = transcriptOverlayObj.value(QStringLiteral("bold")).toBool(true);
@@ -206,8 +224,28 @@ TimelineClip clipFromJson(const QJsonObject &obj)
             QColor(transcriptOverlayObj.value(QStringLiteral("textColor")).toString(QStringLiteral("#ffffffff")));
         clip.fadeSamples = qMax(0, obj.value(QStringLiteral("fadeSamples")).toInt(250));
         clip.locked = obj.value(QStringLiteral("locked")).toBool(false);
+        const QJsonArray titleKeyframesArr = obj.value(QStringLiteral("titleKeyframes")).toArray();
+        for (const QJsonValue &value : titleKeyframesArr)
+        {
+            if (!value.isObject()) continue;
+            const QJsonObject keyframeObj = value.toObject();
+            TimelineClip::TitleKeyframe keyframe;
+            keyframe.frame = keyframeObj.value(QStringLiteral("frame")).toVariant().toLongLong();
+            keyframe.text = keyframeObj.value(QStringLiteral("text")).toString();
+            keyframe.translationX = keyframeObj.value(QStringLiteral("translationX")).toDouble(0.0);
+            keyframe.translationY = keyframeObj.value(QStringLiteral("translationY")).toDouble(0.0);
+            keyframe.fontSize = keyframeObj.value(QStringLiteral("fontSize")).toDouble(48.0);
+            keyframe.opacity = keyframeObj.value(QStringLiteral("opacity")).toDouble(1.0);
+            keyframe.fontFamily = keyframeObj.value(QStringLiteral("fontFamily")).toString(kDefaultFontFamily);
+            keyframe.bold = keyframeObj.value(QStringLiteral("bold")).toBool(true);
+            keyframe.italic = keyframeObj.value(QStringLiteral("italic")).toBool(false);
+            keyframe.color = QColor(keyframeObj.value(QStringLiteral("color")).toString(QStringLiteral("#ffffffff")));
+            keyframe.linearInterpolation = keyframeObj.value(QStringLiteral("linearInterpolation")).toBool(true);
+            clip.titleKeyframes.push_back(keyframe);
+        }
         normalizeClipTransformKeyframes(clip);
         normalizeClipGradingKeyframes(clip);
+        normalizeClipTitleKeyframes(clip);
         return clip;
     }
 

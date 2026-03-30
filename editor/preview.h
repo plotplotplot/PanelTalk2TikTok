@@ -46,6 +46,8 @@ public:
     void setOutputSize(const QSize& size);
     void setHideOutsideOutputWindow(bool hide);
     void setBypassGrading(bool bypass);
+    void setBackgroundColor(const QColor& color);
+    QSize outputSize() const { return m_outputSize; }
     bool bypassGrading() const;
     bool audioMuted() const;
     int audioVolumePercent() const;
@@ -147,6 +149,8 @@ private:
     std::unique_ptr<QOpenGLShaderProgram> m_shaderProgram;
     QOpenGLBuffer m_quadBuffer;
 
+    bool m_glInitialized = false;
+    QColor m_backgroundColor = QColor(Qt::black);
     bool m_playing = false;
     bool m_audioMuted = false;
     qreal m_audioVolume = 0.8;
